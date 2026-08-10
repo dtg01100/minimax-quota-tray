@@ -292,6 +292,40 @@ let lastGoodAt = 0;
 // state in the menu; we still show the last good data with a stale tag.
 let isOffline = false;
 let _menuItems = null;
+// Tracks the most-pressing state from the previous successful refresh,
+// so we can fire a notification when the state gets worse. null on startup
+// means "no prior state" — the first refresh won't notify.
+let _lastBucket = null;
+
+const BUCKET_RANK = { normal: 0, warning: 1, throttled: 2 };
+function bucketFor(pct, throttled) {
+  if (throttled || pct <= 0) return 'throttled';
+  if (pct <= 100 - config.thresholds.red ||
+      pct <= 100 - config.thresholds.yellow) return 'warning';
+  return 'normal';
+}
+function primaryBucket(windows) {
+  if (!windows || windows.length === 0) return null;
+  const p = windows[0];
+  return bucketFor(p.remaining_pct, p.throttled);
+}
+
+function notify(title, body, urgency) {
+  try {
+    const args = [
+      'notify-send',
+      '-a', 'minimax-quota-tray',
+      '-h', `string:x-canonical-private-synchronous:${title}`,
+    ];
+    if (urgency) args.push('-u', urgency);
+    args.push(title, body);
+    const proc = new Gio.Subprocess({ argv: args, flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE });
+    proc.init(null);
+    proc.wait_async(null, () => {});
+  } catch (e) {
+    printerr(`minimax-quota: notify failed: ${e.message}`);
+  }
+}
 
 // Adaptive polling: faster when remaining is low, slower when high,
 // exponential backoff after errors, jitter to avoid synchronized load.
@@ -344,14 +378,27 @@ const RING_CIRCUMFERENCE = 2 * Math.PI * 9;  // r=9, matches the SVG ring
 
 // We render the dynamic ring SVG into $XDG_RUNTIME_DIR and pass that path to
 // set_icon_full. AppIndicator accepts absolute paths.
+//
+// Layout: background ring (full circle, faded) + foreground arc (the
+// remaining %, full color, round caps) + inner dot. The faded background
+// fills the gap so the foreground cap reads as a rounded terminus instead
+// of a flat dasharray cut.
 function renderRingSvg(remainingPct, color) {
   const clamped = Math.max(0, Math.min(100, remainingPct));
   const arc = (RING_CIRCUMFERENCE * clamped) / 100;
   const rest = RING_CIRCUMFERENCE - arc;
+  // Round caps add ~half a stroke-width to each visible end, so the
+  // foreground arc visually overshoots its dasharray length. We shave
+  // the dasharray by half a stroke so the round end aligns with the
+  // 12-o'clock start point when pct=100, and the tail sits cleanly when
+  // pct<100.
+  const halfStroke = 1.25;
+  const fgArc = Math.max(0, arc - halfStroke);
+  const fgRest = RING_CIRCUMFERENCE - fgArc;
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" width="22" height="22">
-  <circle cx="11" cy="11" r="9" fill="${color}" fill-opacity="0.18"/>
+  <circle cx="11" cy="11" r="9" fill="none" stroke="${color}" stroke-width="2.5" stroke-opacity="0.25"/>
   <circle cx="11" cy="11" r="9" fill="none" stroke="${color}" stroke-width="2.5" stroke-linecap="round"
-          stroke-dasharray="${arc.toFixed(2)} ${rest.toFixed(2)}" transform="rotate(-90 11 11)"/>
+          stroke-dasharray="${fgArc.toFixed(2)} ${fgRest.toFixed(2)}" transform="rotate(-90 11 11)"/>
   <circle cx="11" cy="11" r="3.5" fill="${color}"/>
 </svg>
 `;
@@ -567,6 +614,28 @@ function refresh() {
       updateMenu({ windows });
       consecutiveFailures = 0;
       const cur = windows[0];
+
+      // Threshold notification: only when state gets worse, and not on the
+      // first successful refresh (no prior state to compare against).
+      const newBucket = primaryBucket(windows);
+      if (_lastBucket !== null &&
+          BUCKET_RANK[newBucket] > BUCKET_RANK[_lastBucket]) {
+        if (newBucket === 'throttled') {
+          notify(
+            `${config.plans[config.plan].label} — throttled`,
+            `Quota exhausted. The menu shows when it resets.`,
+            'critical',
+          );
+        } else if (newBucket === 'warning') {
+          notify(
+            `${config.plans[config.plan].label} — running low`,
+            `Remaining dropped below ${100 - config.thresholds.yellow}%.`,
+            'normal',
+          );
+        }
+      }
+      _lastBucket = newBucket;
+
       scheduleNext(cur ? cur.remaining_pct : null);
     })
     .catch((err) => {

@@ -283,6 +283,10 @@ let consecutiveFailures = 0;
 // with an annotation instead).
 let lastGoodWindows = null;
 let lastGoodAt = 0;
+// True when Gio.NetworkMonitor reports the system is offline. When true,
+// we skip polling entirely (no point hitting the API) and surface the
+// state in the menu; we still show the last good data with a stale tag.
+let isOffline = false;
 let _menuItems = null;
 
 // Adaptive polling: faster when remaining is low, slower when high,

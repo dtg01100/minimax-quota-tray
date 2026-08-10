@@ -317,8 +317,16 @@ function scheduleNext(remainingPct) {
   });
 }
 
-function setChip({ windows, error, fetching }) {
+function setChip({ windows, error, fetching, offline }) {
   const planLabel = (config.plans[config.plan] && config.plans[config.plan].label) || 'MiniMax';
+  if (offline) {
+    // Show last cached % (if any) with the network-offline icon and a · suffix.
+    const cur = lastGoodWindows ? lastGoodWindows.find((w) => w.id === '5h') : null;
+    const pct = cur ? cur.remaining_pct : 0;
+    indicator.set_icon_full('network-offline-symbolic', '');
+    indicator.set_label(`${planLabel} ${pct} ·`, `${planLabel} 0%`);
+    return;
+  }
   if (error) {
     // Keep showing the last known % (with warning icon + " !" suffix) when
     // we have cached data, so a transient API error doesn't blind the user.
@@ -413,7 +421,7 @@ function buildMenu() {
   return menu;
 }
 
-function updateMenu({ windows, error, lastGood, lastGoodAt }) {
+function updateMenu({ windows, error, lastGood, lastGoodAt, offline }) {
   if (!_menuItems) return;
   const planCfg = config.plans[config.plan] || config.plans.coding_plan;
 
@@ -465,6 +473,9 @@ function updateMenu({ windows, error, lastGood, lastGoodAt }) {
     const staleNote = stale ? ' (showing cached data)' : '';
     _menuItems.error.set_label(`  ⚠ Error: ${error}${staleNote}`);
     _menuItems.error.show();
+  } else if (offline) {
+    _menuItems.error.set_label('  ⚠ Offline — local network unavailable (showing cached data)');
+    _menuItems.error.show();
   } else {
     _menuItems.error.hide();
   }
@@ -472,6 +483,12 @@ function updateMenu({ windows, error, lastGood, lastGoodAt }) {
 
 function refresh() {
   if (isFetching) return;
+  if (isOffline) {
+    // Don't hit the API — just update the UI to reflect the offline state.
+    setChip({ offline: true });
+    updateMenu({ offline: true });
+    return;
+  }
   isFetching = true;
   setChip({ fetching: true });
   const planCfg = config.plans[config.plan] || config.plans.coding_plan;

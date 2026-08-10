@@ -2,8 +2,7 @@
 
 A standalone GNOME Shell tray indicator for MiniMax API quota. Supports
 both the **Coding Plan** and the **Token Plan** via your own API key.
-Talks directly to the MiniMax API — no Hermes, no other agent, no
-plugin system.
+Talks directly to the MiniMax API — no agent or plugin system required.
 
 ![Menu preview](menu.txt)
 

@@ -37,6 +37,20 @@ install -d "$HOME/.config/systemd/user"
 install -m 0644 "$ROOT/minimax-quota.service" "$SERVICE_DEST"
 echo "installed: $SERVICE_DEST"
 
+# Install status icons into the hicolor theme so the AppIndicator can resolve
+# them by name without absolute paths.
+if [ -d "$ROOT/icons" ]; then
+  install -d "$HOME/.local/share/icons/hicolor/scalable/apps"
+  for f in "$ROOT"/icons/*.svg; do
+    install -m 0644 "$f" "$HOME/.local/share/icons/hicolor/scalable/apps/"
+  done
+  # Refresh the icon cache if the tool is available; otherwise most desktops
+  # will pick the icons up on demand.
+  command -v gtk-update-icon-cache >/dev/null 2>&1 \
+    && gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+  echo "installed icons: $(ls "$ROOT"/icons/*.svg | wc -l) into ~/.local/share/icons/hicolor/scalable/apps/"
+fi
+
 # First-run config (don't clobber an existing one)
 if [ ! -f "$CONFIG_DEST" ]; then
   install -d "$CONFIG_DIR"

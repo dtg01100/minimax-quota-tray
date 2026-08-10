@@ -15,8 +15,6 @@
       "label": "Token Plan"
     }
   },
-  "icon_name": "appointment-soon-symbolic",
-  "warning_icon": "dialog-warning-symbolic",
   "thresholds": {
     "yellow": 60,
     "red": 85

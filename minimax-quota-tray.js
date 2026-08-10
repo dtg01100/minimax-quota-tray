@@ -53,8 +53,6 @@ const DEFAULT_CONFIG = {
       label: 'Token Plan',
     },
   },
-  icon_name: '',
-  warning_icon: 'dialog-warning-symbolic',
   thresholds: { yellow: 60, red: 85 },
 };
 
@@ -327,6 +325,17 @@ function scheduleNext(remainingPct) {
   });
 }
 
+// Status icons (shipped in icons/, installed by install.sh into the hicolor
+// theme). One solid circle per state — no text in the tray, color carries
+// the signal and the menu carries the detail.
+const ICON = {
+  normal:    'quota-normal',
+  warning:   'quota-warning',
+  throttled: 'quota-throttled',
+  offline:   'quota-offline',
+  error:     'quota-error',
+};
+
 function setChip({ windows, error, fetching, offline }) {
   const planLabel = (config.plans[config.plan] && config.plans[config.plan].label) || 'MiniMax';
   // The "primary" window — its remaining_pct drives the chip. By convention,
@@ -334,40 +343,37 @@ function setChip({ windows, error, fetching, offline }) {
   // whichever window represents the most pressing quota (e.g. the rolling
   // 5h interval) first in the array.
   const primary = (windows || lastGoodWindows)?.[0] || null;
+
+  // Pick an icon name based on the most pressing state. Order matters:
+  // offline > throttled > error > warning > normal.
+  let iconName;
   if (offline) {
-    // Show last cached % (if any) with the network-offline icon and a · suffix.
-    const pct = primary ? primary.remaining_pct : 0;
-    indicator.set_icon_full('network-offline-symbolic', '');
-    indicator.set_label(`${planLabel} ${pct} ·`, `${planLabel} 0%`);
-    return;
+    iconName = ICON.offline;
+  } else if (primary && primary.throttled) {
+    iconName = ICON.throttled;
+  } else if (error && !primary) {
+    iconName = ICON.error;
+  } else if (primary) {
+    const remainingPct = primary.remaining_pct;
+    iconName =
+      remainingPct <= 100 - config.thresholds.red    ? ICON.warning :
+      remainingPct <= 100 - config.thresholds.yellow ? ICON.warning :
+                                                        ICON.normal;
+  } else {
+    iconName = ICON.normal;
   }
-  if (error) {
-    // Keep showing the last known % so a transient API error doesn't blind
-    // the user. Icon: warning only if the cached data is itself throttled
-    // (0%) or we have no cache at all — otherwise a brief API blip would
-    // make a healthy tray look throttled. Label gets a " !" suffix to
-    // signal the data is stale.
-    if (primary) {
-      const pct = primary.remaining_pct;
-      const iconName = primary.throttled ? config.warning_icon : config.icon_name;
-      indicator.set_icon_full(iconName, '');
-      indicator.set_label(`${planLabel} ${pct} !`, `${planLabel} 0%`);
-    } else {
-      indicator.set_icon_full(config.warning_icon, '');
-      indicator.set_label(`${planLabel} !`, `${planLabel} 0%`);
-    }
-    return;
-  }
-  const remainingPct = primary ? primary.remaining_pct : 0;
-  const iconName =
-    remainingPct <= 100 - config.thresholds.red          ? config.warning_icon :
-    remainingPct <= 100 - config.thresholds.yellow       ? config.warning_icon :
-                                                            config.icon_name;
-  const label = fetching
-    ? planLabel
-    : `${planLabel} ${remainingPct}%`;
+
   indicator.set_icon_full(iconName, '');
-  indicator.set_label(label, `${planLabel} 0%`);
+  // No text label — the menu carries detail. The accessible label is still
+  // set so screen readers / panel tooltips can announce the state.
+  const accessible = error
+    ? `${planLabel} — stale data`
+    : offline
+    ? `${planLabel} — offline`
+    : primary
+    ? `${planLabel} — ${primary.remaining_pct}% remaining`
+    : `${planLabel}`;
+  indicator.set_label('', accessible);
 }
 
 function makeBarMenuItem() {
@@ -602,7 +608,7 @@ function main() {
 
   indicator = AyatanaAppIndicator3.Indicator.new(
     'minimax-quota',
-    config.icon_name,
+    ICON.normal,
     AyatanaAppIndicator3.IndicatorCategory.SYSTEM_SERVICES,
   );
   indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE);

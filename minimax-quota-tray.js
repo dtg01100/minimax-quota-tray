@@ -36,7 +36,11 @@ const KEY_PATH = `${CONFIG_DIR}/key`;  // legacy — auto-migrated to keyring on
 
 const DEFAULT_CONFIG = {
   plan: 'coding_plan',
-  refresh_seconds: 60,
+  // Polling cadence (adaptive; see nextIntervalSeconds below).
+  // 120s baseline matches peer usage indicators (was 60s, too aggressive).
+  refresh_seconds: 120,
+  refresh_min_seconds: 15,          // floor for fast/urgent polls
+  refresh_max_backoff_seconds: 600, // cap on exponential error backoff
   plans: {
     coding_plan: {
       endpoint: 'https://api.minimax.io/v1/api/openplatform/coding_plan/remains',
@@ -266,6 +270,38 @@ let config, apiKey, indicator;
 let isFetching = false;
 let _menuItems = null;
 
+// Adaptive polling: faster when remaining is low, slower when high,
+// exponential backoff after errors, jitter to avoid synchronized load.
+// Cadence: 120s baseline / 60s fast (< 40% remaining) / 30s urgent
+// (< 15% remaining) / up to 600s after repeated failures.
+function nextIntervalSeconds(remainingPct) {
+  let base = config.refresh_seconds;
+  if (remainingPct != null) {
+    if (remainingPct < 100 - config.thresholds.red) {
+      base = config.refresh_seconds / 4;  // urgent
+    } else if (remainingPct < 100 - config.thresholds.yellow) {
+      base = config.refresh_seconds / 2;  // fast
+    }
+  }
+  base = Math.max(config.refresh_min_seconds ?? 15, base);
+  if (consecutiveFailures > 0) {
+    base = Math.min(
+      config.refresh_max_backoff_seconds ?? 600,
+      base * Math.pow(2, consecutiveFailures),
+    );
+  }
+  base += Math.random() * 5;  // 0..5s jitter
+  return base;
+}
+
+function scheduleNext(remainingPct) {
+  const ms = Math.max(1000, Math.floor(nextIntervalSeconds(remainingPct) * 1000));
+  GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+    refresh();
+    return GLib.SOURCE_REMOVE;  // refresh() re-schedules itself
+  });
+}
+
 function setChip({ windows, error, fetching }) {
   const planLabel = (config.plans[config.plan] && config.plans[config.plan].label) || 'MiniMax';
   if (error) {
@@ -410,10 +446,15 @@ function refresh() {
       const windows = parsePayload(payload);
       setChip({ windows });
       updateMenu({ windows });
+      consecutiveFailures = 0;
+      const cur = windows.find((w) => w.id === '5h');
+      scheduleNext(cur ? cur.remaining_pct : null);
     })
     .catch((err) => {
       setChip({ error: err.message });
       updateMenu({ error: err.message });
+      consecutiveFailures++;
+      scheduleNext(null);
     })
     .finally(() => { isFetching = false; });
 }
@@ -509,11 +550,6 @@ function main() {
   } else {
     refresh();
   }
-
-  GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, config.refresh_seconds, () => {
-    refresh();
-    return GLib.SOURCE_CONTINUE;
-  });
 
   Gtk.main();
 }

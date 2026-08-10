@@ -97,6 +97,12 @@ optionally purges your config dir and the stored key from GNOME Keyring.
 - `thresholds` — the warning icon swap fires when **used** % exceeds these
   (i.e., yellow at 60% used, red at 85% used). The chip label always shows
   **remaining** %.
+- **Polling cadence** — `refresh_seconds` is the baseline (default 120s, peer-aligned).
+  The actual interval is adaptive: when remaining quota drops below the
+  yellow threshold, polls speed up to `refresh_seconds / 2`; below the
+  red threshold, `refresh_seconds / 4`. After consecutive errors, the
+  interval backs off exponentially up to `refresh_max_backoff_seconds`
+  (default 600). Each poll also has 0-5s of jitter to spread load.
 
 ## How it works
 

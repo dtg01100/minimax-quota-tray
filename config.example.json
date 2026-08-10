@@ -1,6 +1,8 @@
 {
   "plan": "coding_plan",
-  "refresh_seconds": 60,
+  "refresh_seconds": 120,
+  "refresh_min_seconds": 15,
+  "refresh_max_backoff_seconds": 600,
   "plans": {
     "coding_plan": {
       "endpoint": "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",

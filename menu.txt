@@ -1,0 +1,12 @@
+Plan: Coding Plan
+  5h: 95% left · resets in 4h 32m
+  ████████████████████░░
+  weekly: 100% left · resets in 6d 8h
+  ███████████████████████
+  ⚠ Throttled
+  ───
+  Refresh now
+  Open dashboard
+  Set API Key…
+  ───
+  Quit

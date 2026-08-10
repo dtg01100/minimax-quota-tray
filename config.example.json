@@ -1,0 +1,22 @@
+{
+  "plan": "coding_plan",
+  "refresh_seconds": 60,
+  "plans": {
+    "coding_plan": {
+      "endpoint": "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
+      "dashboard_url": "https://api.minimax.chat/user-center/payment/balance",
+      "label": "Coding Plan"
+    },
+    "token_plan": {
+      "endpoint": "https://api.minimax.io/v1/token_plan/remains",
+      "dashboard_url": "https://platform.minimax.io/user-center/payment/token-plan",
+      "label": "Token Plan"
+    }
+  },
+  "icon_name": "appointment-soon-symbolic",
+  "warning_icon": "dialog-warning-symbolic",
+  "thresholds": {
+    "yellow": 60,
+    "red": 85
+  }
+}

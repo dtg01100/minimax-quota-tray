@@ -1,0 +1,16 @@
+[Unit]
+Description=MiniMax Quota Tray Indicator
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/gjs -m %h/.local/bin/minimax-quota-tray.js
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_SESSION_TYPE=wayland
+Environment=XDG_CURRENT_DESKTOP=GNOME
+
+[Install]
+WantedBy=default.target

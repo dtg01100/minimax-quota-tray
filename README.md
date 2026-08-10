@@ -148,6 +148,211 @@ shelled out; reads use `Secret.password_lookup_sync` directly.
   — the GNOME Keyring daemon isn't reachable. Check that
   `gnome-keyring-daemon --components=secrets` is running.
 
+## Porting to another provider
+
+The tray infrastructure (AppIndicator, keyring, adaptive polling, stale-on-error
+fallback, offline detection) is provider-agnostic. Only the HTTP/JSON surface
+is MiniMax-specific. This section maps every provider-specific touchpoint so
+you can fork this into a tray for any quota-aware API.
+
+### What's already configurable (no code change)
+
+You can repoint the tray at any HTTPS endpoint that returns JSON, as long as
+the shape matches what the parser expects (see below). Everything else is
+config-driven:
+
+- `plans.<id>.endpoint` — full URL to GET
+- `plans.<id>.dashboard_url` — opened by the **Open dashboard** menu item
+- `plans.<id>.label` — shown in the chip and menu header
+- `thresholds`, `refresh_seconds`, `refresh_min_seconds`,
+  `refresh_max_backoff_seconds`, `icon_name`, `warning_icon`
+
+You can rename or add plan IDs freely in `config.json`; the `plan` field picks
+the active one.
+
+### What requires code changes
+
+All provider-specific code lives in two short sections of
+`minimax-quota-tray.js`. Everything else (tray UI, keyring, scheduler,
+network monitor) stays as-is.
+
+#### 1. Auth header — `fetchQuota()` (around line 172)
+
+```js
+message.request_headers.append('Authorization', `Bearer ${apiKey}`);
+```
+
+Common alternatives:
+
+| Provider            | Header                              |
+| ------------------- | ----------------------------------- |
+| OpenAI / Anthropic  | `Authorization: Bearer <key>`       |
+| Google Gemini       | `x-goog-api-key: <key>`             |
+| Mistral             | `Authorization: Bearer <key>`       |
+| Custom (header)     | `x-api-key: <key>`                  |
+| Custom (query)      | append `?key=<key>` to the endpoint |
+
+If you need more than one header per request, append more
+`request_headers.append(...)` calls. If the provider uses cookies/session
+auth, skip the keyring entirely and load the token from a file or env var in
+`loadApiKey()`.
+
+#### 2. Response parser — `parsePayload()` and `parseWindow()` (lines 199–224)
+
+This is the only piece tightly coupled to MiniMax's JSON shape. The MiniMax
+`/remains` endpoint returns:
+
+```json
+{
+  "model_remains": [
+    {
+      "model_name": "general",
+      "current_interval_total_count": 500,
+      "current_interval_usage_count": 25,
+      "current_interval_remaining_percent": 95,
+      "remains_time": 16320000,
+      "current_interval_status": 1,
+      "current_weekly_total_count": 5000,
+      "current_weekly_usage_count": 0,
+      "current_weekly_remaining_percent": 100,
+      "weekly_remains_time": 561600000,
+      "current_weekly_status": 1
+    }
+  ]
+}
+```
+
+`parseWindow()` reads the `current_interval_*` / `current_weekly_*` fields and
+produces the array of "windows" the UI consumes:
+
+```js
+{
+  id: '5h',                // unique within the windows array; used to look up by .id
+  label: '5h',             // (currently unused by the UI; keep it descriptive)
+  total: 500,              // for sanity / future display
+  used: 25,
+  remaining_pct: 95,       // 0..100; drives chip + bar
+  resetAt: <ms epoch>,     // absolute time; drives "resets in X" countdown
+  throttled: false,        // optional; flips the ⚠ Throttled menu line
+}
+```
+
+To port, rewrite these two functions to map your provider's payload into the
+same window shape. Rules:
+
+- **Always return 1–2 windows** (the UI is laid out for a short-window +
+  long-window pair). Hide a window by returning `null` from `parsePayload()`
+  for it, or by returning an array with one entry and adding a `.find((w) =>
+  w.id === 'weekly')` guard in `updateMenu()`.
+- **`id` must be `'5h'` for the chip** — `setChip()` looks up
+  `windows.find((w) => w.id === '5h')` to pick the percentage shown in the
+  top-bar label. Rename consistently in `parseWindow()` and `setChip()`.
+- **`remaining_pct` is the source of truth.** If your provider returns
+  `used`/`total` instead, compute `100 * (1 - used/total)` here.
+- **`resetAt` is an absolute ms-since-epoch.** If your provider gives a
+  duration ("resets in 3h 20m"), do `Date.now() + durationMs` here.
+- **`throttled` is optional** — set it to `true` when the provider signals
+  rate-limit state, or just omit it and the ⚠ line stays hidden.
+
+The UI hardcodes the menu labels `5h:` and `weekly:` (search `updateMenu()`
+for those literals). If your windows aren't a 5-hour interval + a weekly
+window, either rename the labels to match what your provider exposes
+(e.g. `daily:` / `monthly:`), or change the literals in `updateMenu()` to
+match the new `id` values.
+
+#### 3. Multiple plans in one payload — `parsePayload()`
+
+If your provider returns several "plans" or "tiers" in one response (as
+MiniMax does with `model_remains` keyed by `model_name`), pick the entry
+yourself:
+
+```js
+const entry = entries.find((e) => e.model_name === 'general') || entries[0];
+```
+
+Replace `'general'` with whatever tag identifies the bucket you want to
+display. To support choosing between buckets at runtime, expose them as
+separate `plans.<id>` entries in `config.json` (different endpoints) — the
+existing `plan` selector already does this.
+
+### Optional: rename the binary + service + keyring entry
+
+If you fork this for a different provider, three names are worth updating so
+the two can coexist on one machine (the keyring schema, in particular, is
+global per user):
+
+| What                          | Where                                             |
+| ----------------------------- | ------------------------------------------------- |
+| Script filename               | `minimax-quota-tray.js` → e.g. `openai-quota.js`  |
+| systemd unit                  | `minimax-quota.service`                           |
+| Config dir                    | `~/.config/minimax-quota/`                        |
+| Keyring schema name           | `org.dlafreniere.minimax-quota`                   |
+| Keyring `application` attr    | `minimax-quota`                                   |
+| Keyring item label            | `MiniMax API Key`                                 |
+
+Change them in: the script's `KEY_SCHEMA`, `KEY_ATTRIBUTES`, `KEY_LABEL`,
+`CONFIG_DIR`/`CONFIG_PATH`; the `ExecStart=` line in the `.service` unit;
+and `install.sh` / `uninstall.sh` (the paths and `secret-tool` argv). Pick
+a single provider-specific token (e.g. `openai-quota`) and use it
+consistently across all six — that's what keeps multiple forks from
+stomping on each other's keyring entries.
+
+### Worked example: porting to a hypothetical `/v1/usage` endpoint
+
+Suppose Provider X exposes:
+
+```
+GET https://api.provider.com/v1/usage
+Authorization: Bearer <key>
+→ { "daily": { "limit": 1000, "used": 120, "reset_in_ms": 7200000 },
+    "monthly": { "limit": 30000, "used": 4500, "reset_in_ms": 2592000000 } }
+```
+
+`config.json`:
+
+```json
+{
+  "plan": "primary",
+  "plans": {
+    "primary": {
+      "endpoint": "https://api.provider.com/v1/usage",
+      "dashboard_url": "https://provider.com/dashboard",
+      "label": "Provider X"
+    }
+  }
+}
+```
+
+`fetchQuota()`: already uses Bearer — no change if Provider X is the same.
+
+`parsePayload()` rewrite (drop-in replacement for lines 219–224):
+
+```js
+function parsePayload(payload) {
+  if (!payload.daily) throw new Error('Provider X returned no daily window');
+  const makeWindow = (key, id, label) => {
+    const w = payload[key];
+    return {
+      id, label,
+      total: Number(w.limit) || 0,
+      used:  Number(w.used)  || 0,
+      remaining_pct: Math.max(0, Math.min(100, 100 * (1 - w.used / w.limit))),
+      resetAt: Date.now() + Number(w.reset_in_ms || 0),
+      throttled: false,
+    };
+  };
+  return [makeWindow('daily',   '5h', '5h'),     // id='5h' so chip lookup works
+          makeWindow('monthly', 'weekly', 'weekly')];
+}
+```
+
+And in `updateMenu()`, change the two label literals from `5h:` and
+`weekly:` to whatever you want them to read in the menu (`daily:`,
+`monthly:`). The chip stays correct because it only uses `remaining_pct`,
+not the label.
+
+That's it — no other code in the project needs to move.
+
 ## License
 
 MIT © David Lafreniere

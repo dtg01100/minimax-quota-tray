@@ -254,11 +254,12 @@ same window shape. Rules:
 - **`throttled` is optional** — set it to `true` when the provider signals
   rate-limit state, or just omit it and the ⚠ line stays hidden.
 
-The UI hardcodes the menu labels `5h:` and `weekly:` (search `updateMenu()`
-for those literals). If your windows aren't a 5-hour interval + a weekly
-window, either rename the labels to match what your provider exposes
-(e.g. `daily:` / `monthly:`), or change the literals in `updateMenu()` to
-match the new `id` values.
+The UI has **no hardcoded window labels or IDs** — `updateMenu()` reads each
+window's `label` field and the chip uses `windows[0]` (the first window in
+the array). Return any number of windows (1, 2, 3…) in any order; the menu
+will show one label+bar row per window. Put the window you want shown in the
+top-bar chip first (the convention here is the rolling short-interval
+window, since that's the one most likely to need urgent attention).
 
 #### 3. Multiple plans in one payload — `parsePayload()`
 
@@ -330,10 +331,13 @@ Authorization: Bearer <key>
 ```js
 function parsePayload(payload) {
   if (!payload.daily) throw new Error('Provider X returned no daily window');
-  const makeWindow = (key, id, label) => {
+  const makeWindow = (key, label) => {
     const w = payload[key];
     return {
-      id, label,
+      // `label` is what shows in the menu ("daily: 80% left · resets in 18h").
+      // `id` is optional and only used by the parser for its own bookkeeping;
+      // the UI never looks at it.
+      label,
       total: Number(w.limit) || 0,
       used:  Number(w.used)  || 0,
       remaining_pct: Math.max(0, Math.min(100, 100 * (1 - w.used / w.limit))),
@@ -341,15 +345,12 @@ function parsePayload(payload) {
       throttled: false,
     };
   };
-  return [makeWindow('daily',   '5h', '5h'),     // id='5h' so chip lookup works
-          makeWindow('monthly', 'weekly', 'weekly')];
+  // First window = primary (drives the top-bar chip). Put the more urgent
+  // window first if you want the chip to reflect it.
+  return [makeWindow('daily',   'daily'),
+          makeWindow('monthly', 'monthly')];
 }
 ```
-
-And in `updateMenu()`, change the two label literals from `5h:` and
-`weekly:` to whatever you want them to read in the menu (`daily:`,
-`monthly:`). The chip stays correct because it only uses `remaining_pct`,
-not the label.
 
 That's it — no other code in the project needs to move.
 

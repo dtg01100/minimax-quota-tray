@@ -323,10 +323,14 @@ function scheduleNext(remainingPct) {
 
 function setChip({ windows, error, fetching, offline }) {
   const planLabel = (config.plans[config.plan] && config.plans[config.plan].label) || 'MiniMax';
+  // The "primary" window — its remaining_pct drives the chip. By convention,
+  // this is the first window returned by parsePayload(). Porters can put
+  // whichever window represents the most pressing quota (e.g. the rolling
+  // 5h interval) first in the array.
+  const primary = (windows || lastGoodWindows)?.[0] || null;
   if (offline) {
     // Show last cached % (if any) with the network-offline icon and a · suffix.
-    const cur = lastGoodWindows ? lastGoodWindows.find((w) => w.id === '5h') : null;
-    const pct = cur ? cur.remaining_pct : 0;
+    const pct = primary ? primary.remaining_pct : 0;
     indicator.set_icon_full('network-offline-symbolic', '');
     indicator.set_label(`${planLabel} ${pct} ·`, `${planLabel} 0%`);
     return;
@@ -335,9 +339,8 @@ function setChip({ windows, error, fetching, offline }) {
     // Keep showing the last known % (with warning icon + " !" suffix) when
     // we have cached data, so a transient API error doesn't blind the user.
     // Fall back to the bare "Plan !" only when there's no cached data.
-    if (lastGoodWindows) {
-      const cur = lastGoodWindows.find((w) => w.id === '5h');
-      const pct = cur ? cur.remaining_pct : 0;
+    if (primary) {
+      const pct = primary.remaining_pct;
       indicator.set_icon_full(config.warning_icon, '');
       indicator.set_label(`${planLabel} ${pct} !`, `${planLabel} 0%`);
     } else {
@@ -346,8 +349,7 @@ function setChip({ windows, error, fetching, offline }) {
     }
     return;
   }
-  const cur = windows?.find((w) => w.id === '5h');
-  const remainingPct = cur ? cur.remaining_pct : 0;
+  const remainingPct = primary ? primary.remaining_pct : 0;
   const iconName =
     remainingPct <= 100 - config.thresholds.red          ? config.warning_icon :
     remainingPct <= 100 - config.thresholds.yellow       ? config.warning_icon :
@@ -371,30 +373,24 @@ function buildMenu() {
 
   _menuItems = {
     header: new Gtk.MenuItem({ label: '' }),
-    fiveHLabel: new Gtk.MenuItem({ label: '' }),
-    fiveHBar:   makeBarMenuItem(),
-    weeklyLabel: new Gtk.MenuItem({ label: '' }),
-    weeklyBar:   makeBarMenuItem(),
+    // Window rows are rebuilt on every updateMenu() — there's one label+bar
+    // pair per window in the parser's return array. The menu's static
+    // structure (header, separator, action items) stays fixed; only the
+    // window rows in the middle change.
+    windowRows: [],
     throttled: new Gtk.MenuItem({ label: '' }),
     error:     new Gtk.MenuItem({ label: '' }),
   };
-  for (const k of ['header', 'fiveHLabel', 'weeklyLabel', 'throttled', 'error']) {
+  for (const k of ['header', 'throttled', 'error']) {
     _menuItems[k].set_sensitive(false);
   }
 
   _menuItems.header.show();
-  _menuItems.fiveHLabel.hide();
-  _menuItems.fiveHBar.item.hide();
-  _menuItems.weeklyLabel.hide();
-  _menuItems.weeklyBar.item.hide();
   _menuItems.throttled.hide();
   _menuItems.error.hide();
 
   menu.append(_menuItems.header);
-  menu.append(_menuItems.fiveHLabel);
-  menu.append(_menuItems.fiveHBar.item);
-  menu.append(_menuItems.weeklyLabel);
-  menu.append(_menuItems.weeklyBar.item);
+  // Window rows are inserted between header and throttled at updateMenu() time.
   menu.append(_menuItems.throttled);
   menu.append(_menuItems.error);
 
@@ -436,34 +432,36 @@ function updateMenu({ windows, error, lastGood, lastGoodAt, offline }) {
   const ageMs = lastGoodAt ? Date.now() - lastGoodAt : 0;
   const staleTag = stale ? ` · last update ${fmtAge(ageMs)} ago` : '';
 
-  const cur = effective?.find((w) => w.id === '5h');
-  const wk  = effective?.find((w) => w.id === 'weekly');
-
   _menuItems.header.set_label(`Plan: ${planCfg.label}`);
   _menuItems.header.show();
 
-  if (cur) {
-    _menuItems.fiveHLabel.set_label(
-      `  5h: ${cur.remaining_pct}% left · resets in ${fmtReset(cur.resetAt - Date.now())}${staleTag}`
-    );
-    setItemMarkup(_menuItems.fiveHBar.item, barMarkup(cur.remaining_pct));
-    _menuItems.fiveHLabel.show();
-    _menuItems.fiveHBar.item.show();
-  } else {
-    _menuItems.fiveHLabel.hide();
-    _menuItems.fiveHBar.item.hide();
+  // Rebuild the window rows. Remove the old Gtk widgets from the menu first
+  // (Gtk.Menu keeps strong refs, so unparented items would leak). The
+  // throttled item is our anchor: window rows always sit immediately before it.
+  const menu = _menuItems.throttled.get_parent();
+  for (const row of _menuItems.windowRows) {
+    menu.remove(row.label);
+    menu.remove(row.bar.item);
   }
+  _menuItems.windowRows = [];
 
-  if (wk) {
-    _menuItems.weeklyLabel.set_label(
-      `  weekly: ${wk.remaining_pct}% left · resets in ${fmtReset(wk.resetAt - Date.now())}${staleTag}`
-    );
-    setItemMarkup(_menuItems.weeklyBar.item, barMarkup(wk.remaining_pct));
-    _menuItems.weeklyLabel.show();
-    _menuItems.weeklyBar.item.show();
-  } else {
-    _menuItems.weeklyLabel.hide();
-    _menuItems.weeklyBar.item.hide();
+  if (effective && effective.length > 0) {
+    const siblings = menu.get_children();
+    let throttledIdx = siblings.indexOf(_menuItems.throttled);
+    for (const w of effective) {
+      const label = new Gtk.MenuItem({ label: '' });
+      label.set_sensitive(false);
+      label.set_label(
+        `  ${w.label}: ${w.remaining_pct}% left · resets in ${fmtReset(w.resetAt - Date.now())}${staleTag}`
+      );
+      const bar = makeBarMenuItem();
+      setItemMarkup(bar.item, barMarkup(w.remaining_pct));
+      _menuItems.windowRows.push({ label, bar });
+      menu.insert(label, throttledIdx);
+      menu.insert(bar.item, throttledIdx + 1);
+      throttledIdx += 2;
+    }
+    menu.show_all();
   }
 
   if (effective?.some((w) => w.throttled)) {
@@ -504,7 +502,7 @@ function refresh() {
       setChip({ windows });
       updateMenu({ windows });
       consecutiveFailures = 0;
-      const cur = windows.find((w) => w.id === '5h');
+      const cur = windows[0];
       scheduleNext(cur ? cur.remaining_pct : null);
     })
     .catch((err) => {

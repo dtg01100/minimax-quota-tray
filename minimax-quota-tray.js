@@ -40,12 +40,12 @@ const DEFAULT_CONFIG = {
   plans: {
     coding_plan: {
       endpoint: 'https://api.minimax.io/v1/api/openplatform/coding_plan/remains',
-      dashboard_url: 'https://api.minimax.chat/user-center/payment/balance',
+      dashboard_url: 'https://platform.minimax.io/console/plan',
       label: 'Coding Plan',
     },
     token_plan: {
       endpoint: 'https://api.minimax.io/v1/token_plan/remains',
-      dashboard_url: 'https://platform.minimax.io/user-center/payment/token-plan',
+      dashboard_url: 'https://platform.minimax.io/console/plan',
       label: 'Token Plan',
     },
   },

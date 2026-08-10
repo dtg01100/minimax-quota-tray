@@ -1,7 +1,7 @@
 #!/usr/bin/gjs -m
 // minimax-quota-tray.js — standalone GNOME tray indicator for MiniMax quota.
 // Supports both the Coding Plan and the Token Plan via the user's API key.
-// Talks directly to the MiniMax API (no Hermes dependency).
+
 
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';

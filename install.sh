@@ -4,7 +4,7 @@
 #
 set -euo pipefail
 
-ROOT="${$(echo $0 | sed 's|/[^/]*$||')}(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BIN_DEST="$HOME/.local/bin/minimax-quota-tray.js"
 SERVICE_DEST="$HOME/.config/systemd/user/minimax-quota.service"

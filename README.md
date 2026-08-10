@@ -233,7 +233,8 @@ produces the array of "windows" the UI consumes:
   used: 25,
   remaining_pct: 95,       // 0..100; drives chip + bar
   resetAt: <ms epoch>,     // absolute time; drives "resets in X" countdown
-  throttled: false,        // optional; flips the ⚠ Throttled menu line
+  throttled: false,        // optional; flips the ⚠ Throttled menu line.
+                       // Derived from remaining_pct (window exhausted), NOT from a status field.
 }
 ```
 
@@ -251,8 +252,12 @@ same window shape. Rules:
   `used`/`total` instead, compute `100 * (1 - used/total)` here.
 - **`resetAt` is an absolute ms-since-epoch.** If your provider gives a
   duration ("resets in 3h 20m"), do `Date.now() + durationMs` here.
-- **`throttled` is optional** — set it to `true` when the provider signals
-  rate-limit state, or just omit it and the ⚠ line stays hidden.
+- **`throttled` is optional** — derived from `remaining_pct <= 0` (window
+  exhausted). The tray deliberately ignores any `*_status` field from the
+  provider response: the official MiniMax-AI/cli documents that enum as
+  `1=normal / 2=exhausted / 3=unlimited`, so reading `status===1` would
+  falsely flag every healthy window as throttled. If your provider returns a
+  similar status enum, ignore it and rely on `remaining_pct`.
 
 The UI has **no hardcoded window labels or IDs** — `updateMenu()` reads each
 window's `label` field and the chip uses `windows[0]` (the first window in

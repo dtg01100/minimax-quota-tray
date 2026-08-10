@@ -53,7 +53,7 @@ const DEFAULT_CONFIG = {
       label: 'Token Plan',
     },
   },
-  icon_name: 'appointment-soon-symbolic',
+  icon_name: '',
   warning_icon: 'dialog-warning-symbolic',
   thresholds: { yellow: 60, red: 85 },
 };
@@ -205,14 +205,20 @@ function parseWindow(entry, weekly) {
     Math.min(100, Number(entry[`current_${suffix}_remaining_percent`]) || 0)
   );
   const resetMs = Math.max(0, Number(entry[weekly ? 'weekly_remains_time' : 'remains_time']) || 0);
-  const statusKey = weekly ? 'current_weekly_status' : 'current_interval_status';
+  // Throttle = the window has been fully consumed. We deliberately do NOT
+  // read current_interval_status / current_weekly_status: per the official
+  // MiniMax-AI/cli source (src/output/quota-table.ts) that field's enum is
+  // 1=normal, 2=exhausted, 3=unlimited — so a `=== 1` check would (mis)flag
+  // every healthy window as throttled. Other community parsers (minimax-status,
+  // openclaw, openchamber) likewise ignore the status field and infer state
+  // from remaining_pct. Stay consistent with that.
   return {
     id: weekly ? 'weekly' : '5h',
     label: weekly ? 'weekly' : '5h',
     total, used,
     remaining_pct,
     resetAt: Date.now() + resetMs,
-    throttled: Number(entry[statusKey]) === 1,
+    throttled: remaining_pct <= 0,
   };
 }
 
@@ -336,12 +342,15 @@ function setChip({ windows, error, fetching, offline }) {
     return;
   }
   if (error) {
-    // Keep showing the last known % (with warning icon + " !" suffix) when
-    // we have cached data, so a transient API error doesn't blind the user.
-    // Fall back to the bare "Plan !" only when there's no cached data.
+    // Keep showing the last known % so a transient API error doesn't blind
+    // the user. Icon: warning only if the cached data is itself throttled
+    // (0%) or we have no cache at all — otherwise a brief API blip would
+    // make a healthy tray look throttled. Label gets a " !" suffix to
+    // signal the data is stale.
     if (primary) {
       const pct = primary.remaining_pct;
-      indicator.set_icon_full(config.warning_icon, '');
+      const iconName = primary.throttled ? config.warning_icon : config.icon_name;
+      indicator.set_icon_full(iconName, '');
       indicator.set_label(`${planLabel} ${pct} !`, `${planLabel} 0%`);
     } else {
       indicator.set_icon_full(config.warning_icon, '');

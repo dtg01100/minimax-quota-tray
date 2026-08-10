@@ -325,9 +325,10 @@ function scheduleNext(remainingPct) {
   });
 }
 
-// Status icons (shipped in icons/, installed by install.sh into the hicolor
-// theme). One solid circle per state — no text in the tray, color carries
-// the signal and the menu carries the detail.
+// Status icons. Offline/throttled/error states ship as static SVGs
+// (icons/quota-*.svg). For healthy / warning states we draw a progress ring
+// around the dot so the user sees the percentage at a glance without
+// spending any panel space on text.
 const ICON = {
   normal:    'quota-normal',
   warning:   'quota-warning',
@@ -335,6 +336,34 @@ const ICON = {
   offline:   'quota-offline',
   error:     'quota-error',
 };
+const RING_COLOR = {
+  normal:  '#3a9d4d',
+  warning: '#f6d32d',
+};
+const RING_CIRCUMFERENCE = 2 * Math.PI * 9;  // r=9, matches the SVG ring
+
+// We render the dynamic ring SVG into $XDG_RUNTIME_DIR and pass that path to
+// set_icon_full. AppIndicator accepts absolute paths.
+function renderRingSvg(remainingPct, color) {
+  const clamped = Math.max(0, Math.min(100, remainingPct));
+  const arc = (RING_CIRCUMFERENCE * clamped) / 100;
+  const rest = RING_CIRCUMFERENCE - arc;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" width="22" height="22">
+  <circle cx="11" cy="11" r="9" fill="${color}" fill-opacity="0.18"/>
+  <circle cx="11" cy="11" r="9" fill="none" stroke="${color}" stroke-width="2.5" stroke-linecap="round"
+          stroke-dasharray="${arc.toFixed(2)} ${rest.toFixed(2)}" transform="rotate(-90 11 11)"/>
+  <circle cx="11" cy="11" r="3.5" fill="${color}"/>
+</svg>
+`;
+}
+
+let _ringIconPath = null;
+function ringIconPath() {
+  if (_ringIconPath) return _ringIconPath;
+  const dir = GLib.getenv('XDG_RUNTIME_DIR') || GLib.get_tmp_dir();
+  _ringIconPath = `${dir}/minimax-quota-ring.svg`;
+  return _ringIconPath;
+}
 
 function setChip({ windows, error, fetching, offline }) {
   const planLabel = (config.plans[config.plan] && config.plans[config.plan].label) || 'MiniMax';
@@ -344,32 +373,52 @@ function setChip({ windows, error, fetching, offline }) {
   // 5h interval) first in the array.
   const primary = (windows || lastGoodWindows)?.[0] || null;
 
-  // Pick an icon name based on the most pressing state. Order matters:
+  // Pick an icon based on the most pressing state. Order matters:
   // offline > throttled > error > warning > normal.
+  // Healthy / warning states get a dynamic progress ring around the dot;
+  // offline / throttled / error get a static dot (no percentage to show).
   let iconName;
+  let bucket = 'normal';
   if (offline) {
     iconName = ICON.offline;
+    bucket = 'offline';
   } else if (primary && primary.throttled) {
     iconName = ICON.throttled;
+    bucket = 'throttled';
   } else if (error && !primary) {
     iconName = ICON.error;
+    bucket = 'error';
   } else if (primary) {
     const remainingPct = primary.remaining_pct;
-    iconName =
-      remainingPct <= 100 - config.thresholds.red    ? ICON.warning :
-      remainingPct <= 100 - config.thresholds.yellow ? ICON.warning :
-                                                        ICON.normal;
+    if (remainingPct <= 100 - config.thresholds.red    ||
+        remainingPct <= 100 - config.thresholds.yellow) {
+      bucket = 'warning';
+    } else {
+      bucket = 'normal';
+    }
+    const color = RING_COLOR[bucket];
+    const path = ringIconPath();
+    try {
+      const bytes = new TextEncoder().encode(renderRingSvg(remainingPct, color));
+      GLib.file_set_contents(path, bytes);
+      iconName = path;
+    } catch (e) {
+      // Fall back to the static dot if we can't write the runtime SVG.
+      iconName = bucket === 'warning' ? ICON.warning : ICON.normal;
+    }
   } else {
     iconName = ICON.normal;
   }
 
   indicator.set_icon_full(iconName, '');
-  // No text label — the menu carries detail. The accessible label is still
-  // set so screen readers / panel tooltips can announce the state.
+  // No text label — the menu carries detail. The accessible label still
+  // carries the percentage for screen readers and panel tooltips.
   const accessible = error
     ? `${planLabel} — stale data`
     : offline
     ? `${planLabel} — offline`
+    : bucket === 'throttled'
+    ? `${planLabel} — throttled`
     : primary
     ? `${planLabel} — ${primary.remaining_pct}% remaining`
     : `${planLabel}`;

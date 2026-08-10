@@ -1,5 +1,8 @@
 [Unit]
 Description=MiniMax Quota Tray Indicator
+# After graphical-session.target so we don't start until the user's
+# desktop session is up (which gives us DISPLAY / WAYLAND_DISPLAY /
+# XDG_CURRENT_DESKTOP via the session manager's env propagation).
 After=graphical-session.target
 
 [Service]
@@ -7,10 +10,11 @@ Type=simple
 ExecStart=/usr/bin/gjs -m %h/.local/bin/minimax-quota-tray.js
 Restart=on-failure
 RestartSec=5
-Environment=DISPLAY=:0
-Environment=WAYLAND_DISPLAY=wayland-0
-Environment=XDG_SESSION_TYPE=wayland
-Environment=XDG_CURRENT_DESKTOP=GNOME
+# No hardcoded env vars. After=graphical-session.target above ensures
+# the session is up, and the session DBus activation context propagates
+# DISPLAY / WAYLAND_DISPLAY / XDG_SESSION_TYPE / XDG_CURRENT_DESKTOP
+# to the spawned service. Makes the unit portable across single vs
+# multi-monitor, X11 vs Wayland, and non-GNOME desktops.
 
 [Install]
 WantedBy=default.target

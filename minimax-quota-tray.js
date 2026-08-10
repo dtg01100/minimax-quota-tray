@@ -268,6 +268,7 @@ function setItemMarkup(item, markup) {
 
 let config, apiKey, indicator;
 let isFetching = false;
+let consecutiveFailures = 0;
 let _menuItems = null;
 
 // Adaptive polling: faster when remaining is low, slower when high,

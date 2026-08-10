@@ -235,6 +235,15 @@ function fmtReset(ms) {
   return m ? `${h}h ${m}m` : `${h}h`;
 }
 
+// Compact "Xs / Xm / Xh" since-last-update label for stale-data annotations.
+function fmtAge(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h`;
+}
+
 function barColor(remainingPct) {
   const used = 100 - remainingPct;
   if (used >= config.thresholds.red)    return '#e01b24';
@@ -269,6 +278,11 @@ function setItemMarkup(item, markup) {
 let config, apiKey, indicator;
 let isFetching = false;
 let consecutiveFailures = 0;
+// Cache of the last successful windows + when we got it, so a transient
+// API error doesn't leave the menu completely empty (we show stale data
+// with an annotation instead).
+let lastGoodWindows = null;
+let lastGoodAt = 0;
 let _menuItems = null;
 
 // Adaptive polling: faster when remaining is low, slower when high,
@@ -306,8 +320,18 @@ function scheduleNext(remainingPct) {
 function setChip({ windows, error, fetching }) {
   const planLabel = (config.plans[config.plan] && config.plans[config.plan].label) || 'MiniMax';
   if (error) {
-    indicator.set_icon_full(config.warning_icon, '');
-    indicator.set_label(`${planLabel} !`, `${planLabel} 0%`);
+    // Keep showing the last known % (with warning icon + " !" suffix) when
+    // we have cached data, so a transient API error doesn't blind the user.
+    // Fall back to the bare "Plan !" only when there's no cached data.
+    if (lastGoodWindows) {
+      const cur = lastGoodWindows.find((w) => w.id === '5h');
+      const pct = cur ? cur.remaining_pct : 0;
+      indicator.set_icon_full(config.warning_icon, '');
+      indicator.set_label(`${planLabel} ${pct} !`, `${planLabel} 0%`);
+    } else {
+      indicator.set_icon_full(config.warning_icon, '');
+      indicator.set_label(`${planLabel} !`, `${planLabel} 0%`);
+    }
     return;
   }
   const cur = windows?.find((w) => w.id === '5h');
@@ -389,18 +413,26 @@ function buildMenu() {
   return menu;
 }
 
-function updateMenu({ windows, error }) {
+function updateMenu({ windows, error, lastGood, lastGoodAt }) {
   if (!_menuItems) return;
   const planCfg = config.plans[config.plan] || config.plans.coding_plan;
-  const cur = windows?.find((w) => w.id === '5h');
-  const wk  = windows?.find((w) => w.id === 'weekly');
+
+  // On error, fall back to the last successful payload so the menu still
+  // shows useful data (with a "stale · Xm ago" annotation).
+  const effective = windows ?? lastGood;
+  const stale = !!error && !windows && !!lastGood;
+  const ageMs = lastGoodAt ? Date.now() - lastGoodAt : 0;
+  const staleTag = stale ? ` · last update ${fmtAge(ageMs)} ago` : '';
+
+  const cur = effective?.find((w) => w.id === '5h');
+  const wk  = effective?.find((w) => w.id === 'weekly');
 
   _menuItems.header.set_label(`Plan: ${planCfg.label}`);
   _menuItems.header.show();
 
   if (cur) {
     _menuItems.fiveHLabel.set_label(
-      `  5h: ${cur.remaining_pct}% left · resets in ${fmtReset(cur.resetAt - Date.now())}`
+      `  5h: ${cur.remaining_pct}% left · resets in ${fmtReset(cur.resetAt - Date.now())}${staleTag}`
     );
     setItemMarkup(_menuItems.fiveHBar.item, barMarkup(cur.remaining_pct));
     _menuItems.fiveHLabel.show();
@@ -412,7 +444,7 @@ function updateMenu({ windows, error }) {
 
   if (wk) {
     _menuItems.weeklyLabel.set_label(
-      `  weekly: ${wk.remaining_pct}% left · resets in ${fmtReset(wk.resetAt - Date.now())}`
+      `  weekly: ${wk.remaining_pct}% left · resets in ${fmtReset(wk.resetAt - Date.now())}${staleTag}`
     );
     setItemMarkup(_menuItems.weeklyBar.item, barMarkup(wk.remaining_pct));
     _menuItems.weeklyLabel.show();
@@ -422,15 +454,16 @@ function updateMenu({ windows, error }) {
     _menuItems.weeklyBar.item.hide();
   }
 
-  if (windows?.some((w) => w.throttled)) {
-    _menuItems.throttled.set_label('  ⚠ Throttled');
+  if (effective?.some((w) => w.throttled)) {
+    _menuItems.throttled.set_label(stale ? `  ⚠ Throttled (stale)` : '  ⚠ Throttled');
     _menuItems.throttled.show();
   } else {
     _menuItems.throttled.hide();
   }
 
   if (error) {
-    _menuItems.error.set_label(`  ⚠ Error: ${error}`);
+    const staleNote = stale ? ' (showing cached data)' : '';
+    _menuItems.error.set_label(`  ⚠ Error: ${error}${staleNote}`);
     _menuItems.error.show();
   } else {
     _menuItems.error.hide();
@@ -445,6 +478,8 @@ function refresh() {
   fetchQuota(apiKey, planCfg.endpoint)
     .then((payload) => {
       const windows = parsePayload(payload);
+      lastGoodWindows = windows;
+      lastGoodAt = Date.now();
       setChip({ windows });
       updateMenu({ windows });
       consecutiveFailures = 0;
@@ -453,7 +488,7 @@ function refresh() {
     })
     .catch((err) => {
       setChip({ error: err.message });
-      updateMenu({ error: err.message });
+      updateMenu({ error: err.message, lastGood: lastGoodWindows, lastGoodAt });
       consecutiveFailures++;
       scheduleNext(null);
     })

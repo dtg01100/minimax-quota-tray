@@ -13,8 +13,9 @@ Talks directly to the MiniMax API — no agent or plugin system required.
 - **Menu**:
   ```
   Plan: Coding Plan
-    5h: 95% left · resets in 4h 32m
-    ████████████████████░░
+    5h: 80% left · resets in 4h
+    ██████████████████░░░░
+    · on pace to have ~48% left at reset (40 tok/h)
     weekly: 100% left · resets in 6d 8h
     ███████████████████████
     ───
@@ -24,6 +25,18 @@ Talks directly to the MiniMax API — no agent or plugin system required.
     ───
     Quit
   ```
+- **Burn-rate row** — once the tray has ~10 minutes of polling history it
+  estimates the token burn rate for the primary (5h) window, and a row under
+  the 5h bar always shows the projection:
+  - healthy: `· on pace to have ~48% left at reset (40 tok/h)`
+  - idle (no recent token usage): `· on pace to have ~98% left at reset (0 tok/h)`
+  - warning (projected exhaustion before reset):
+    `⚠ 1.2k tok/h → exhausts ~1h 5m before reset` — and the top-bar chip
+    flips to the warning color, even when the remaining-% thresholds look
+    fine.
+
+  The projection resets on every window rollover; it's an estimate, not a
+  promise — bursty usage will make it conservative or optimistic accordingly.
 
 ## Requirements
 
@@ -79,7 +92,10 @@ It imports the real app module with `MINIMAX_QUOTA_TEST=1` (which skips
 and asserts the single-flight invariant: at most one poll timeout is ever
 armed, and an explicit refresh arriving mid-fetch is queued exactly once.
 The suite also covers offline handling, the no-key state, backoff after
-errors, and threshold-notification dedup.
+errors, threshold-notification dedup, and the burn-rate projection
+(history gating, rollover resets, the warn/don't-warn decision, the
+projected-% at reset label, and the chip bucket flip — driven under a
+stubbed clock so the slope math is deterministic).
 
 `tests/regression-scheduler.test.js` documents the bug this guards against:
 it runs a faithful replica of the pre-fix scheduler (extracted from commit
@@ -112,7 +128,13 @@ if the cancel-before-arm logic is ever removed.
       "label": "Token Plan"
     }
   },
-  "thresholds": { "yellow": 60, "red": 85 }
+  "thresholds": { "yellow": 60, "red": 85 },
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true
+  }
 }
 ```
 
@@ -121,6 +143,17 @@ if the cancel-before-arm logic is ever removed.
 - `thresholds` — the warning icon swap fires when **used** % exceeds these
   (i.e., yellow at 60% used, red at 85% used). The chip label always shows
   **remaining** %.
+- `burn_warning` — burn-rate projection. After the tray has collected
+  `min_history_ms` (default 10 min) of polling history, it estimates the
+  token burn rate for the primary window and shows a row under its bar —
+  informational (`on pace to have ~X% left at reset`) whenever there's
+  enough data, switching to a `⚠` warning (plus a yellow chip) when the
+  trend projects the window exhausting before it resets. The rate is the
+  max of the recent slope over `lookback_ms` (default 1h) and the
+  whole-epoch average; set `use_epoch_average: false` to react to
+  short-term spikes only. `enabled: false` turns the feature off entirely.
+  Note the projection needs history — it appears ~10 min after startup and
+  resets on every window rollover.
 - **Polling cadence** — `refresh_seconds` is the baseline (default 120s, peer-aligned).
   The actual interval is adaptive: when remaining quota drops below the
   yellow threshold, polls speed up to `refresh_seconds / 2`; below the
@@ -260,10 +293,16 @@ produces the array of "windows" the UI consumes:
   used: 25,
   remaining_pct: 95,       // 0..100; drives chip + bar
   resetAt: <ms epoch>,     // absolute time; drives "resets in X" countdown
+  startAt: <ms epoch>,     // optional; epoch start, drives the burn projection
   throttled: false,        // optional; flips the ⚠ Throttled menu line.
                        // Derived from remaining_pct (window exhausted), NOT from a status field.
 }
 ```
+
+`startAt` is only needed for the burn-rate projection (it floors the rate
+with the whole-epoch average and detects rollover). Omit it (0) if your
+provider doesn't return an epoch start; the projection then uses the recent
+slope alone and the used-drop rollover check.
 
 To port, rewrite these two functions to map your provider's payload into the
 same window shape. Rules:

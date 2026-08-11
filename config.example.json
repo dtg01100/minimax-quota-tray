@@ -18,5 +18,11 @@
   "thresholds": {
     "yellow": 60,
     "red": 85
+  },
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true
   }
 }

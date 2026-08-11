@@ -48,6 +48,24 @@ const CONFIG_DIR = `${HOME}/.config/minimax-quota`;
 const CONFIG_PATH = `${CONFIG_DIR}/config.json`;
 const KEY_PATH = `${CONFIG_DIR}/key`;  // legacy — auto-migrated to keyring on first run
 
+// Burn-rate projection tuning. The quota windows are fixed-length epochs
+// (the API exposes start_time / end_time / remains_time), so `used` grows
+// monotonically inside an epoch and resets at the boundary — a burn rate
+// from successive poll samples is meaningful. These knobs control how much
+// history the projection needs before it speaks and how the rate is formed.
+const DEFAULT_BURN_WARNING = {
+  enabled: true,
+  // Watching time (ms) before we project a burn rate. With 120s polls this
+  // is ~5 samples; any less and a single burst would scream alarm.
+  min_history_ms: 10 * 60 * 1000,
+  // Recent-slope window (ms): the least-squares slope over samples within
+  // this span is the "right now" burn rate.
+  lookback_ms: 60 * 60 * 1000,
+  // Floor the rate with the whole-epoch average (used / elapsed since
+  // epoch start), so a short recent dip can't hide a fast epoch overall.
+  use_epoch_average: true,
+};
+
 const DEFAULT_CONFIG = {
   plan: 'coding_plan',
   // Polling cadence (adaptive; see nextIntervalSeconds below).
@@ -68,6 +86,7 @@ const DEFAULT_CONFIG = {
     },
   },
   thresholds: { yellow: 60, red: 85 },
+  burn_warning: { ...DEFAULT_BURN_WARNING },
 };
 
 function loadConfig() {
@@ -79,6 +98,7 @@ function loadConfig() {
       const merged = Object.assign({}, DEFAULT_CONFIG, JSON.parse(text));
       merged.plans = Object.assign({}, DEFAULT_CONFIG.plans, merged.plans || {});
       merged.thresholds = Object.assign({}, DEFAULT_CONFIG.thresholds, merged.thresholds || {});
+      merged.burn_warning = Object.assign({}, DEFAULT_BURN_WARNING, merged.burn_warning || {});
       return merged;
     }
   } catch (e) {
@@ -251,7 +271,13 @@ function parseWindow(entry, weekly) {
     label: weekly ? 'weekly' : '5h',
     total, used,
     remaining_pct,
-    resetAt: Date.now() + resetMs,
+    resetAt: nowFn() + resetMs,
+    // Epoch start (absolute ms). The burn-rate projection uses it to floor
+    // the rate with the whole-epoch average; it doubles as the rollover
+    // detector (a changed startAt means a fresh epoch). Porters whose
+    // provider lacks a start time can omit it (0) — the projection then
+    // relies on the recent slope and the used-drop rollover check alone.
+    startAt: Math.max(0, Number(entry[weekly ? 'weekly_start_time' : 'start_time']) || 0),
     throttled: remaining_pct <= 0,
   };
 }
@@ -294,6 +320,143 @@ function barMarkup(fractionPct) {
   return `  [${'█'.repeat(filled)}${'░'.repeat(empty)}]`;
 }
 
+// Compact burn-rate label: "850" or "1.2k" or "12k" tokens/hour.
+function fmtRate(tokensPerHour) {
+  if (tokensPerHour >= 1000) {
+    const k = tokensPerHour / 1000;
+    return k >= 100 ? `${Math.round(k)}k` : `${k.toFixed(1).replace(/\.0$/, '')}k`;
+  }
+  return `${Math.round(tokensPerHour)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Burn-rate projection
+// ---------------------------------------------------------------------------
+// The quota windows are fixed-length epochs (start_time / end_time /
+// remains_time), so `used` grows monotonically inside an epoch and resets
+// at the boundary. recordBurnSample() appends one sample per successful
+// refresh and clears the history on epoch rollover; computeBurn() forms the
+// rate as max(recent slope, whole-epoch average) and projects whether the
+// trend exhausts the window before it resets.
+
+// One sample per successful refresh, for the primary (first) window.
+function recordBurnSample(window) {
+  if (!window) return;
+  const last = burnHistory[burnHistory.length - 1];
+  if (last) {
+    const rolled =
+      (window.startAt > 0 && last.startAt > 0 && window.startAt !== last.startAt) ||
+      window.used < last.used - 1;  // defensive: usage only grows within an epoch
+    if (rolled) burnHistory.length = 0;
+  }
+  burnHistory.push({
+    t: nowFn(),
+    used: window.used,
+    total: window.total,
+    startAt: window.startAt,
+    resetAt: window.resetAt,
+  });
+  if (burnHistory.length > BURN_MAX_SAMPLES) burnHistory.shift();
+}
+
+// Burn projection for a window, from the recorded sample history. Returns
+// null (no warning) until the history spans min_history_ms. The rate is the
+// max of:
+//   - the least-squares slope of the samples within lookback_ms, and
+//   - the whole-epoch average (used / elapsed since startAt) — the floor,
+//     so a short recent dip can't hide a fast epoch overall.
+// Returns a projection even when the rate is 0 (idle user / provider with no
+// recent activity): the informational row then reads "on pace to have ~100%
+// left at reset (0 tok/h)". exhaustBeforeReset is naturally false at rate=0
+// (Infinity is not less than any finite remainingMs), so we never warn.
+// Returns null only when there's not enough history to speak at all.
+// exhaustBeforeReset: projected time-to-exhaust is shorter than the time
+// left until the window resets.
+function computeBurn(window) {
+  if (!window) return null;
+  const now = nowFn();
+  const cfg = Object.assign({}, DEFAULT_BURN_WARNING, config.burn_warning || {});
+  if (!cfg.enabled) return null;
+  if (burnHistory.length < 2) return null;
+  if (now - burnHistory[0].t < cfg.min_history_ms) return null;
+
+  // Samples within the recent-slope window, oldest first.
+  const recent = [];
+  for (let i = burnHistory.length - 1; i >= 0; i--) {
+    if (now - burnHistory[i].t > cfg.lookback_ms) break;
+    recent.unshift(burnHistory[i]);
+  }
+
+  let rate = 0;  // tokens per hour — default 0 so an idle user still gets a row
+  if (recent.length >= 2) {
+    // Mean-centered least squares: t values are ~1.7e12 ms, so uncentered
+    // t*t exceeds the 2^53 integer-exact range; x = t - first-sample-t
+    // keeps the arithmetic in ~10^6 territory.
+    const t0 = recent[0].t;
+    let sx = 0, sy = 0;
+    for (const s of recent) { sx += s.t - t0; sy += s.used; }
+    const mx = sx / recent.length, my = sy / recent.length;
+    let num = 0, den = 0;
+    for (const s of recent) {
+      const dx = s.t - t0 - mx;
+      num += dx * (s.used - my);
+      den += dx * dx;
+    }
+    if (den > 0) {
+      const slope = (num / den) * 3.6e6;  // used per ms → per hour
+      if (slope > 0) rate = slope;        // floor at 0; idle user stays at 0
+    }
+  }
+
+  if (cfg.use_epoch_average && window.startAt > 0) {
+    const elapsedMs = now - window.startAt;
+    if (elapsedMs > 0) {
+      const avg = (window.used / elapsedMs) * 3.6e6;
+      if (avg > rate) rate = avg;
+    }
+  }
+
+  // rate may be 0 here (idle user, or live API without start_time); that's
+  // fine — the informational row handles it, and exhaustBeforeReset is
+  // false at rate=0.
+
+  const remainingMs = Math.max(0, window.resetAt - now);
+  if (remainingMs <= 0) return null;
+  // exhaustMs is Infinity at rate=0; >0 check passes; exhaustBeforeReset
+  // becomes false because Infinity is not less than any finite remainingMs.
+  const exhaustMs = rate > 0
+    ? ((window.total - window.used) / rate) * 3600e3
+    : Infinity;
+  if (exhaustMs <= 0) return null;
+
+  const projectedUsedAtReset = (window.total > 0)
+    ? window.used + (rate * remainingMs) / 3600e3
+    : window.used;
+  const projectedPctLeft = window.total > 0
+    ? Math.max(0, Math.min(100, Math.round(100 * (window.total - projectedUsedAtReset) / window.total)))
+    : 0;
+
+  return {
+    ratePerHour: rate,
+    exhaustMs,
+    remainingMs,
+    exhaustBeforeReset: exhaustMs < remainingMs,
+    // Where the window lands at reset if the current rate holds — the
+    // informational row reads from this even when no exhaustion is projected.
+    projectedPctLeft,
+  };
+}
+
+// Label for the burn-rate row. Warning variant when the trend exhausts the
+// window before it resets; otherwise an informational projection of how much
+// remains at reset. Shown whenever computeBurn() has enough data to speak.
+function burnRowLabel(burn) {
+  if (burn.exhaustBeforeReset) {
+    return `  ⚠ ${fmtRate(burn.ratePerHour)} tok/h → exhausts ~${fmtReset(burn.exhaustMs)} before reset`;
+  }
+  return `  · on pace to have ~${burn.projectedPctLeft}% left at reset (${fmtRate(burn.ratePerHour)} tok/h)`;
+}
+
 // ---------------------------------------------------------------------------
 // Tray
 // ---------------------------------------------------------------------------
@@ -325,12 +488,37 @@ let _menuItems = null;
 // so we can fire a notification when the state gets worse. null on startup
 // means "no prior state" — the first refresh won't notify.
 let _lastBucket = null;
+// Burn-rate projection state: samples of the primary window's usage taken
+// on every successful refresh, within the current window epoch. Cleared on
+// epoch rollover. Drives the ⚠ burn-rate warning row and the chip's warning
+// flip when the trend projects exhaustion before the window resets.
+let burnHistory = [];
+// 480 samples ≈ 16h at the 120s baseline, 2h at the 15s urgent floor —
+// always covers the 1h recent-slope lookback and then some.
+const BURN_MAX_SAMPLES = 480;
+// Clock seam for the burn-rate projection. The projection is time-based
+// (sample timestamps, epoch averages, reset countdowns), and the test
+// harness substitutes a fake clock so the math is deterministic. Stubbing
+// the global Date.now is unreliable under gjs, so the burn path reads time
+// exclusively through nowFn(). Production always uses Date.now.
+let nowFn = Date.now;
 
 const BUCKET_RANK = { normal: 0, warning: 1, throttled: 2 };
 function bucketFor(pct, throttled) {
   if (throttled || pct <= 0) return 'throttled';
   if (pct <= 100 - config.thresholds.red ||
       pct <= 100 - config.thresholds.yellow) return 'warning';
+  return 'normal';
+}
+// Chip bucket for the primary window: throttled > warning (thresholds OR
+// burn-rate projection) > normal. The burn flip is what turns the icon
+// yellow while remaining % still looks healthy.
+function bucketForChip(primary, burn) {
+  if (!primary) return 'normal';
+  if (primary.throttled || primary.remaining_pct <= 0) return 'throttled';
+  if (primary.remaining_pct <= 100 - config.thresholds.red ||
+      primary.remaining_pct <= 100 - config.thresholds.yellow ||
+      (burn && burn.exhaustBeforeReset)) return 'warning';
   return 'normal';
 }
 function primaryBucket(windows) {
@@ -482,14 +670,13 @@ function setChip({ windows, error, fetching, offline }) {
     iconName = ICON.error;
     bucket = 'error';
   } else if (primary) {
-    const remainingPct = primary.remaining_pct;
-    if (remainingPct <= 100 - config.thresholds.red    ||
-        remainingPct <= 100 - config.thresholds.yellow) {
-      bucket = 'warning';
-    } else {
-      bucket = 'normal';
-    }
+    // Burn flip only with fresh data — same gate as the menu row, so the
+    // chip never warns from a stale payload + current history (an outage
+    // spanning a rollover would otherwise flip it on garbage).
+    const burn = (!error && !offline) ? computeBurn(primary) : null;
+    bucket = bucketForChip(primary, burn);
     const color = RING_COLOR[bucket];
+    const remainingPct = primary.remaining_pct;
     const path = ringIconPath(remainingPct);
     // Skip the SVG encode + magick fork when a PNG already exists for this
     // rounded percentage. The steady state (120s polls at 100% remaining for
@@ -572,15 +759,19 @@ function buildMenu() {
     // structure (header, separator, action items) stays fixed; only the
     // window rows in the middle change.
     windowRows: [],
+    // Burn-rate warning row — created once, reinserted beside the primary
+    // window row whenever the projection is active.
+    burn: new Gtk.MenuItem({ label: '' }),
     throttled: new Gtk.MenuItem({ label: '' }),
     error:     new Gtk.MenuItem({ label: '' }),
   };
-  for (const k of ['header', 'throttled', 'error']) {
+  for (const k of ['header', 'burn', 'throttled', 'error']) {
     _menuItems[k].set_sensitive(false);
   }
 
   _menuItems.header.set_label(`Plan: ${planCfg.label}`);
   _menuItems.header.show();
+  _menuItems.burn.hide();
   _menuItems.throttled.hide();
   _menuItems.error.hide();
 
@@ -639,10 +830,14 @@ function updateMenu({ windows, error, lastGood, lastGoodAt, offline }) {
     menu.remove(row.bar.item);
   }
   _menuItems.windowRows = [];
+  if (_menuItems.burn.get_parent()) menu.remove(_menuItems.burn);
 
   if (effective && effective.length > 0) {
     const siblings = menu.get_children();
     let throttledIdx = siblings.indexOf(_menuItems.throttled);
+    // Burn-rate projection for the primary window — only with fresh data
+    // (never while stale/offline, when the trend would mislead).
+    const burn = (!stale && !offline) ? computeBurn(effective[0]) : null;
     for (const w of effective) {
       const label = new Gtk.MenuItem({ label: '' });
       label.set_sensitive(false);
@@ -655,6 +850,15 @@ function updateMenu({ windows, error, lastGood, lastGoodAt, offline }) {
       menu.insert(label, throttledIdx);
       menu.insert(bar.item, throttledIdx + 1);
       throttledIdx += 2;
+      // The burn-rate row sits directly under the primary window's bar and
+      // shows whenever there's enough history — informational when healthy,
+      // a ⚠ warning when the trend exhausts before reset.
+      if (w === effective[0] && burn) {
+        _menuItems.burn.set_label(burnRowLabel(burn));
+        menu.insert(_menuItems.burn, throttledIdx);
+        throttledIdx += 1;
+        _menuItems.burn.show();
+      }
     }
     menu.show_all();
   }
@@ -710,6 +914,7 @@ function refresh(force) {
       const windows = parsePayload(payload);
       lastGoodWindows = windows;
       lastGoodAt = Date.now();
+      recordBurnSample(windows[0]);
       _hooks.setChip({ windows });
       _hooks.updateMenu({ windows });
       consecutiveFailures = 0;
@@ -881,6 +1086,8 @@ export const __test = {
     lastGoodAt = 0;
     isOffline = false;
     _lastBucket = null;
+    burnHistory.length = 0;
+    nowFn = Date.now;
   },
   getState() {
     return {
@@ -895,6 +1102,11 @@ export const __test = {
   },
   refresh,
   scheduleNext,
+  computeBurn,
+  burnRowLabel,
+  bucketForChip,
+  getBurnHistory: () => burnHistory.slice(),
+  setNow(fn) { nowFn = fn || Date.now; },
   // Fires the armed poll timeout exactly as GLib would (same teardown, same
   // refresh() call), so tests drive the loop deterministically instead of
   // waiting real seconds. Returns false if no poll is armed.

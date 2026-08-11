@@ -64,7 +64,30 @@ const TEST_CONFIG = {
     },
   },
   thresholds: { yellow: 60, red: 85 },
+  burn_warning: { enabled: true, min_history_ms: 1, lookback_ms: 3600e3, use_epoch_average: true },
 };
+
+// Payload with explicit interval usage (for burn-rate tests). startTime is
+// the epoch start in ms; remainsMs the ms until the window resets.
+function burnPayload({ used, total = 500, remainsMs = 5 * 3600e3, startTime = 0 }) {
+  const remainingPct = Math.max(0, Math.round(100 * (total - used) / total));
+  return {
+    model_remains: [{
+      model_name: 'general',
+      current_interval_total_count: total,
+      current_interval_usage_count: used,
+      current_interval_remaining_percent: remainingPct,
+      start_time: startTime,
+      remains_time: remainsMs,
+      current_interval_status: 1,
+      current_weekly_total_count: 5000,
+      current_weekly_usage_count: 0,
+      current_weekly_remaining_percent: 100,
+      weekly_remains_time: 561600000,
+      current_weekly_status: 1,
+    }],
+  };
+}
 
 let fetchMode = 'manual';      // 'manual' | 'auto' | 'reject'
 const pendingResolvers = [];   // one resolver per in-flight fetch
@@ -108,6 +131,7 @@ app.__test.setHooks({
 
 function reset() {
   app.__test.resetState();
+  app.__test.setConfig(TEST_CONFIG);   // restore burn_warning knobs for each test
   calls.fetch.length = 0;
   calls.setChip.length = 0;
   calls.updateMenu.length = 0;
@@ -357,6 +381,260 @@ await test('T10: queued refresh drains before re-firing — no infinite loop', a
   assert(calls.fetch.length === 2, 'no cascade: the follow-up did not re-queue itself');
   assert(done.pendingRefresh === false, 'queue empty at rest');
   assert(done.isFetching === false, 'idle — loop terminated');
+});
+
+// ---------------------------------------------------------------------------
+// Burn-rate projection
+// ---------------------------------------------------------------------------
+// The projection needs a controlled clock: samples are taken at refresh()
+// time, so the recent-slope math must be deterministic. The app exposes a
+// clock seam (__test.setNow) for exactly this — do NOT stub the global
+// Date.now, which gjs doesn't reliably honor for imported modules. The seam
+// also keeps parseWindow's resetAt and the epoch arithmetic consistent.
+
+function withClock(startMs, fn) {
+  // Substitute the app's clock seam (not the global Date.now — gjs doesn't
+  // reliably honor global reassignment for imported modules). resetState()
+  // restores Date.now on the next reset(); we also restore here for safety.
+  let now = startMs;
+  app.__test.setNow(() => now);
+  const p = fn({ now: () => now, advance: (ms) => { now += ms; } });
+  // Restore the real clock when the callback's promise settles. A plain
+  // `try { return fn() } finally { … }` would restore synchronously, while
+  // the async body is still awaiting — the stub would be dead before the
+  // first refresh's .then ever ran (this bit us: samples got real times).
+  return p.finally(() => app.__test.setNow(null));
+}
+
+await test('T11: burn projection warns when the usage trend exhausts before reset', async () => {
+  reset();
+  await withClock(1700000000000, async ({ now, advance }) => {
+    const epochStart = now() - 30 * 60e3;   // epoch began 30 min ago
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 40, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+    await flush();
+    assert(app.__test.getBurnHistory().length === 1, 'first burn sample recorded');
+
+    advance(10 * 60e3);                     // 10 minutes of steady burning
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 240, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+    await flush();
+    assert(app.__test.getBurnHistory().length === 2, 'second burn sample recorded');
+
+    const w = { total: 500, used: 240, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 52 };
+    const burn = app.__test.computeBurn(w);
+    assert(burn !== null, 'burn projection computed');
+    // 200 tokens in 10 min = 1200/h; 260 left → ~13 min to exhaust < 3h reset.
+    assert(Math.round(burn.ratePerHour) === 1200, `recent slope rate is 1200/h, got ${burn.ratePerHour}`);
+    assert(burn.exhaustBeforeReset === true, 'projects exhaustion before the reset');
+    assert(app.__test.bucketForChip(w, burn) === 'warning', 'chip flips to warning');
+    const warnLabel = app.__test.burnRowLabel(burn);
+    assert(warnLabel.includes('exhausts ~13m before reset'), `warning row label, got: ${warnLabel}`);
+    assert(!warnLabel.includes('on pace'), 'warning label is not the informational variant');
+  });
+});
+
+await test('T12: low burn rate projects no exhaustion warning', async () => {
+  reset();
+  await withClock(1700000000000, async ({ now, advance }) => {
+    const epochStart = now() - 30 * 60e3;
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 40, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+    await flush();
+    advance(10 * 60e3);
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 45, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+    await flush();
+
+    const w = { total: 500, used: 45, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 91 };
+    const burn = app.__test.computeBurn(w);
+    assert(burn !== null, 'projection computed (a rate exists)');
+    // 5 tok/10 min = 30/h; epoch avg 45/40 min = 67.5/h → 455/67.5 ≈ 6.7h > 3h reset.
+    assert(burn.exhaustBeforeReset === false, 'does not warn: exhausts long after the reset');
+    assert(app.__test.bucketForChip(w, burn) === 'normal', 'chip stays normal');
+    // Even healthy, the informational row shows the projected % at reset:
+    // used 45 + 67.5/h × 3h = 247.5 → 252.5/500 = 50.5% → rounds to 51.
+    assert(burn.projectedPctLeft === 51, `projected ~51% left at reset, got ${burn.projectedPctLeft}`);
+    const infoLabel = app.__test.burnRowLabel(burn);
+    assert(infoLabel.includes('on pace to have ~51% left at reset'), `informational row label, got: ${infoLabel}`);
+    assert(!infoLabel.includes('⚠'), 'informational label is not the warning variant');
+  });
+});
+
+await test('T13: epoch rollover clears the burn history', async () => {
+  reset();
+  await withClock(1700000000000, async ({ now, advance }) => {
+    const epoch1 = now() - 30 * 60e3;
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 40, startTime: epoch1, remainsMs: 10 * 60e3 }));
+    await flush();
+    advance(10 * 60e3);
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 200, startTime: epoch1, remainsMs: 60e3 }));
+    await flush();
+    assert(app.__test.getBurnHistory().length === 2, 'history spans the epoch');
+
+    advance(5 * 60e3);                      // window resets: fresh epoch, usage drops
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 5, startTime: now(), remainsMs: 5 * 3600e3 }));
+    await flush();
+    assert(app.__test.getBurnHistory().length === 1, 'history cleared on rollover');
+
+    const w = { total: 500, used: 5, startAt: now(), resetAt: now() + 5 * 3600e3, remaining_pct: 99 };
+    assert(app.__test.computeBurn(w) === null, 'no projection with a single fresh sample');
+  });
+});
+
+await test('T15: enabled:false disables the projection; use_epoch_average:false drops the floor', async () => {
+  // disabled: even a steep trend must produce nothing
+  reset();
+  app.__test.setConfig({
+    ...TEST_CONFIG,
+    burn_warning: { enabled: false, min_history_ms: 1, lookback_ms: 3600e3, use_epoch_average: true },
+  });
+  await withClock(1700000000000, async ({ now, advance }) => {
+    const epochStart = now() - 30 * 60e3;
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 40, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+    await flush();
+    advance(10 * 60e3);
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 240, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+    await flush();
+    const w = { total: 500, used: 240, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 52 };
+    assert(app.__test.computeBurn(w) === null, 'disabled: no projection despite a steep trend');
+  });
+
+  // no epoch-average floor: a flat recent trend returns an informational
+  // projection (rate=0) instead of null — so the row still shows "0 tok/h"
+  // for an idle user — but it does not warn (exhaustBeforeReset is false
+  // at rate=0 because Infinity isn't less than any finite remainingMs).
+  reset();
+  app.__test.setConfig({
+    ...TEST_CONFIG,
+    burn_warning: { enabled: true, min_history_ms: 1, lookback_ms: 3600e3, use_epoch_average: false },
+  });
+  await withClock(1700000000000, async ({ now, advance }) => {
+    const epochStart = now() - 60 * 60e3;   // heavy early burn, then flat
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 200, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+    await flush();
+    advance(10 * 60e3);
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 200, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+    await flush();
+    const w = { total: 500, used: 200, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 60 };
+    const burn = app.__test.computeBurn(w);
+    assert(burn !== null, 'idle user still gets an informational row');
+    assert(burn.ratePerHour === 0, `idle user has rate 0, got ${burn.ratePerHour}`);
+    assert(burn.exhaustBeforeReset === false, 'idle user does not warn (rate=0 → Infinity exhaustMs)');
+    assert(!app.__test.burnRowLabel(burn).includes('⚠'), 'idle user label is informational, not the warning variant');
+  });
+
+  // sanity: the same flat trend WITH the floor does warn (epoch avg 200/70min ≈ 171/h → exhaust ~1.75h < 3h)
+  reset();
+  app.__test.setConfig({
+    ...TEST_CONFIG,
+    burn_warning: { enabled: true, min_history_ms: 1, lookback_ms: 3600e3, use_epoch_average: true },
+  });
+  await withClock(1700000000000, async ({ now, advance }) => {
+    const epochStart = now() - 60 * 60e3;
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 200, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+    await flush();
+    advance(10 * 60e3);
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 200, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+    await flush();
+    const w = { total: 500, used: 200, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 60 };
+    const burn = app.__test.computeBurn(w);
+    assert(burn !== null && burn.exhaustBeforeReset === true,
+      'with floor: whole-epoch average still projects exhaustion before reset');
+  });
+});
+
+await test('T14: min_history_ms gate suppresses premature projections', async () => {
+  reset();
+  app.__test.setConfig({
+    ...TEST_CONFIG,
+    burn_warning: { enabled: true, min_history_ms: 3600e3, lookback_ms: 3600e3, use_epoch_average: true },
+  });
+  await withClock(1700000000000, async ({ now, advance }) => {
+    const epochStart = now() - 30 * 60e3;
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 40, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+    await flush();
+    advance(10 * 60e3);
+    app.__test.refresh(true);
+    resolveNext(burnPayload({ used: 240, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+    await flush();
+
+    const w = { total: 500, used: 240, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 52 };
+    assert(app.__test.computeBurn(w) === null,
+      'history only spans 10 min < 1h gate — the steep slope must not fire yet');
+  });
+});
+
+// Regression: live MiniMax API doesn't return start_time, so the epoch-average
+// floor is skipped. With an idle user (no token usage), the recent slope is
+// also 0. Before this fix, computeBurn() returned null and the menu never
+// showed the projected burn rate — even after a long uptime. The fix: when
+// the rate is 0, return an informational projection (rate=0) instead of
+// null. exhaustBeforeReset is naturally false at rate=0, so we never warn;
+// the row just reads "on pace to have ~100% left at reset (0 tok/h)".
+await test('T16: idle user with live API shape (no start_time) still gets an informational row', async () => {
+  reset();
+  app.__test.setConfig({
+    ...TEST_CONFIG,
+    burn_warning: { enabled: true, min_history_ms: 1, lookback_ms: 3600e3, use_epoch_average: true },
+  });
+  await withClock(1700000000000, async ({ now, advance }) => {
+    // 5 polls spaced 2 min apart, used unchanged (idle user).
+    // start_time omitted from every payload → startAt = 0 in parsed window.
+    for (let i = 0; i < 5; i++) {
+      const used = 100;                          // constant — no growth
+      const total = 5000;
+      const remainsMs = 5 * 3600e3 - i * 2 * 60e3;
+      const payload = {
+        model_remains: [{
+          model_name: 'general',
+          current_interval_total_count: total,
+          current_interval_usage_count: used,
+          current_interval_remaining_percent: Math.round(100 * (total - used) / total),
+          // start_time intentionally omitted
+          remains_time: remainsMs,
+          current_interval_status: 1,
+          current_weekly_total_count: 5000,
+          current_weekly_usage_count: 0,
+          current_weekly_remaining_percent: 80,
+          weekly_remains_time: 6 * 86400e3,
+          current_weekly_status: 1,
+        }],
+      };
+      app.__test.refresh(true);
+      // Use the test's resolveNext helper, which expects burnPayload shape,
+      // so build the resolve inline by pushing the payload into the queue.
+      assert(pendingResolvers.length > 0, `expected pending fetch at iteration ${i}`);
+      pendingResolvers.shift()(payload);
+      await flush();
+      if (i < 4) advance(2 * 60e3);
+    }
+
+    const hist = app.__test.getBurnHistory();
+    assert(hist.length === 5, `5 samples recorded, got ${hist.length}`);
+    assert(hist[0].startAt === 0, `startAt=0 (live shape), got ${hist[0].startAt}`);
+
+    const w = { ...hist[hist.length - 1] };
+    const burn = app.__test.computeBurn(w);
+    assert(burn !== null, 'idle user with no start_time still gets an informational projection');
+    assert(burn.ratePerHour === 0, `idle user rate is 0, got ${burn.ratePerHour}`);
+    assert(burn.exhaustBeforeReset === false, 'idle user does not warn');
+    assert(burn.projectedPctLeft === 98, `idle user with used=100/5000 projects 98% left at reset, got ${burn.projectedPctLeft}`);
+    const label = app.__test.burnRowLabel(burn);
+    assert(label.includes('on pace to have ~98% left at reset'), `informational label, got: ${label}`);
+    assert(label.includes('0 tok/h'), `shows 0 tok/h, got: ${label}`);
+    assert(!label.includes('⚠'), 'no warning glyph for an idle user');
+  });
 });
 
 await test('T8: failed fetch shows the error row, backs off, stays single-flight', async () => {

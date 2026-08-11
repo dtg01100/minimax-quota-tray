@@ -340,6 +340,11 @@ function fmtRate(tokensPerHour) {
 // trend exhausts the window before it resets.
 
 // One sample per successful refresh, for the primary (first) window.
+// Tracks both `used` (token-count, used by plans that expose it) and
+// `remaining_pct` (the universal signal — Coding Plan reports total/used
+// as 0 and tracks consumption via remaining_percent only, so a token-only
+// fit is blind there). `recordBurnSample` records both; `computeBurn`
+// picks the signal that actually moves.
 function recordBurnSample(window) {
   if (!window) return;
   const last = burnHistory[burnHistory.length - 1];
@@ -353,25 +358,47 @@ function recordBurnSample(window) {
     t: nowFn(),
     used: window.used,
     total: window.total,
+    remainingPct: window.remaining_pct,
     startAt: window.startAt,
     resetAt: window.resetAt,
   });
   if (burnHistory.length > BURN_MAX_SAMPLES) burnHistory.shift();
 }
 
+// Least-squares slope of `key` over the samples within lookback_ms.
+// Returns null if fewer than 2 samples or den <= 0.
+function slopePerHour(samples, key) {
+  if (samples.length < 2) return null;
+  const t0 = samples[0].t;
+  let sx = 0, sy = 0;
+  for (const s of samples) { sx += s.t - t0; sy += s[key]; }
+  const mx = sx / samples.length, my = sy / samples.length;
+  let num = 0, den = 0;
+  for (const s of samples) {
+    const dx = s.t - t0 - mx;
+    num += dx * (s[key] - my);
+    den += dx * dx;
+  }
+  if (den <= 0) return null;
+  return (num / den) * 3.6e6;  // value per ms → per hour
+}
+
 // Burn projection for a window, from the recorded sample history. Returns
-// null (no warning) until the history spans min_history_ms. The rate is the
-// max of:
-//   - the least-squares slope of the samples within lookback_ms, and
-//   - the whole-epoch average (used / elapsed since startAt) — the floor,
-//     so a short recent dip can't hide a fast epoch overall.
-// Returns a projection even when the rate is 0 (idle user / provider with no
-// recent activity): the informational row then reads "on pace to have ~100%
-// left at reset (0 tok/h)". exhaustBeforeReset is naturally false at rate=0
-// (Infinity is not less than any finite remainingMs), so we never warn.
+// null (no warning) until the history spans min_history_ms.
+//
+// The Coding Plan's primary window reports `current_interval_total_count`
+// and `current_interval_usage_count` as 0 — only `current_interval_remaining_percent`
+// carries consumption signal. Token-based plans (Token Plan, etc.) expose
+// real count fields. We pick whichever signal actually moves:
+//   - token-based rate when `used` grows across samples (or the epoch-average
+//     floor is positive); expressed in tok/h; projects exhaust by token count
+//   - pct-based rate when `remaining_pct` drops across samples (Coding Plan);
+//     expressed in %/h; projects exhaust when remaining_pct would hit 0
+//   - 0 when neither moves (idle); informational row reads "0 tok/h"
+//
+// exhaustBeforeReset is naturally false at rate=0 (Infinity is not less
+// than any finite remainingMs), so we never warn on an idle user.
 // Returns null only when there's not enough history to speak at all.
-// exhaustBeforeReset: projected time-to-exhaust is shorter than the time
-// left until the window resets.
 function computeBurn(window) {
   if (!window) return null;
   const now = nowFn();
@@ -386,58 +413,66 @@ function computeBurn(window) {
     if (now - burnHistory[i].t > cfg.lookback_ms) break;
     recent.unshift(burnHistory[i]);
   }
+  if (recent.length < 2) return null;
 
-  let rate = 0;  // tokens per hour — default 0 so an idle user still gets a row
-  if (recent.length >= 2) {
-    // Mean-centered least squares: t values are ~1.7e12 ms, so uncentered
-    // t*t exceeds the 2^53 integer-exact range; x = t - first-sample-t
-    // keeps the arithmetic in ~10^6 territory.
-    const t0 = recent[0].t;
-    let sx = 0, sy = 0;
-    for (const s of recent) { sx += s.t - t0; sy += s.used; }
-    const mx = sx / recent.length, my = sy / recent.length;
-    let num = 0, den = 0;
-    for (const s of recent) {
-      const dx = s.t - t0 - mx;
-      num += dx * (s.used - my);
-      den += dx * dx;
-    }
-    if (den > 0) {
-      const slope = (num / den) * 3.6e6;  // used per ms → per hour
-      if (slope > 0) rate = slope;        // floor at 0; idle user stays at 0
-    }
+  // Try token-based rate first (used > 0 in recent samples, OR the
+  // epoch-average floor on `used` is positive). Used-only is the legacy
+  // signal and is more meaningful when the API actually exposes counts.
+  let tokenRate = null;
+  if (recent.some((s) => s.used > 0)) {
+    const slopeTok = slopePerHour(recent, 'used');
+    if (slopeTok !== null && slopeTok > 0) tokenRate = slopeTok;
   }
-
   if (cfg.use_epoch_average && window.startAt > 0) {
     const elapsedMs = now - window.startAt;
     if (elapsedMs > 0) {
       const avg = (window.used / elapsedMs) * 3.6e6;
-      if (avg > rate) rate = avg;
+      if (avg > 0 && (tokenRate === null || avg > tokenRate)) tokenRate = avg;
     }
   }
 
-  // rate may be 0 here (idle user, or live API without start_time); that's
-  // fine — the informational row handles it, and exhaustBeforeReset is
-  // false at rate=0.
+  // Pct-based rate (Coding Plan and any provider whose count fields are 0).
+  // remaining_pct DROPS as the window is consumed, so the slope is negative;
+  // we store it as a positive "burn" rate (pct-per-hour consumed).
+  let pctRate = null;
+  const slopePct = slopePerHour(recent, 'remainingPct');
+  if (slopePct !== null && slopePct < 0) pctRate = -slopePct;  // negate → positive
+
+  // Pick the mode that has a signal. Token-based wins when both have data
+  // (a count-based provider whose pct also moves); otherwise the one with
+  // a positive rate. If neither has data, surface an informational row
+  // with rate=0 (idle / freshly-started).
+  let mode = 'idle';
+  let rate = 0;
+  if (tokenRate !== null) { mode = 'token'; rate = tokenRate; }
+  else if (pctRate !== null) { mode = 'pct'; rate = pctRate; }
 
   const remainingMs = Math.max(0, window.resetAt - now);
   if (remainingMs <= 0) return null;
-  // exhaustMs is Infinity at rate=0; >0 check passes; exhaustBeforeReset
-  // becomes false because Infinity is not less than any finite remainingMs.
-  const exhaustMs = rate > 0
-    ? ((window.total - window.used) / rate) * 3600e3
-    : Infinity;
-  if (exhaustMs <= 0) return null;
 
-  const projectedUsedAtReset = (window.total > 0)
-    ? window.used + (rate * remainingMs) / 3600e3
-    : window.used;
-  const projectedPctLeft = window.total > 0
-    ? Math.max(0, Math.min(100, Math.round(100 * (window.total - projectedUsedAtReset) / window.total)))
-    : 0;
+  // Projection: where does remaining_pct land at reset, at the current rate?
+  // token mode: derive used at reset, then pct = 100 * (total - usedAtReset) / total
+  // pct mode:   pct drops linearly at rate pct/h
+  // idle:       use the last observed remaining_pct (no change)
+  let projectedPctLeft = window.remaining_pct;
+  let exhaustMs = Infinity;  // default for rate=0; never < remainingMs
+  if (mode === 'pct' && rate > 0) {
+    // pct drops at `rate` per hour; hits 0 when remainingMs catches up.
+    const hoursToZero = window.remaining_pct / rate;
+    exhaustMs = hoursToZero * 3600e3;
+    projectedPctLeft = Math.max(0, window.remaining_pct - (rate * remainingMs) / 3600e3);
+  } else if (mode === 'token' && rate > 0 && window.total > 0) {
+    const usedAtReset = window.used + (rate * remainingMs) / 3600e3;
+    projectedPctLeft = Math.max(0, Math.min(100,
+      Math.round(100 * (window.total - usedAtReset) / window.total)));
+    exhaustMs = ((window.total - window.used) / rate) * 3600e3;
+  }
+  projectedPctLeft = isNaN(projectedPctLeft) ? window.remaining_pct
+                    : Math.round(projectedPctLeft);
 
   return {
     ratePerHour: rate,
+    mode,                                // 'token' | 'pct' | 'idle'
     exhaustMs,
     remainingMs,
     exhaustBeforeReset: exhaustMs < remainingMs,
@@ -450,11 +485,19 @@ function computeBurn(window) {
 // Label for the burn-rate row. Warning variant when the trend exhausts the
 // window before it resets; otherwise an informational projection of how much
 // remains at reset. Shown whenever computeBurn() has enough data to speak.
+//
+// Rate unit depends on the provider shape:
+//   - 'token': tok/h (provider exposes counts, e.g. Token Plan)
+//   - 'pct':   %/h consumed (Coding Plan — total/used are 0)
+//   - 'idle':  no movement; surfaces "(0 tok/h)" for a uniform look
 function burnRowLabel(burn) {
+  const rateUnit = burn.mode === 'pct'
+    ? `${fmtRate(burn.ratePerHour)}%/h`
+    : `${fmtRate(burn.ratePerHour)} tok/h`;
   if (burn.exhaustBeforeReset) {
-    return `  ⚠ ${fmtRate(burn.ratePerHour)} tok/h → exhausts ~${fmtReset(burn.exhaustMs)} before reset`;
+    return `  ⚠ ${rateUnit} → exhausts ~${fmtReset(burn.exhaustMs)} before reset`;
   }
-  return `  · on pace to have ~${burn.projectedPctLeft}% left at reset (${fmtRate(burn.ratePerHour)} tok/h)`;
+  return `  · on pace to have ~${burn.projectedPctLeft}% left at reset (${rateUnit})`;
 }
 
 // ---------------------------------------------------------------------------

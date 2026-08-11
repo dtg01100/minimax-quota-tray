@@ -28,12 +28,16 @@ Talks directly to the MiniMax API — no agent or plugin system required.
 - **Burn-rate row** — once the tray has ~10 minutes of polling history it
   estimates the token burn rate for the primary (5h) window, and a row under
   the 5h bar always shows the projection:
-  - healthy: `· on pace to have ~48% left at reset (40 tok/h)`
+  - healthy (token-based plan): `· on pace to have ~48% left at reset (40 tok/h)`
+  - healthy (Coding Plan, pct-based): `· on pace to have ~62% left at reset (15%/h)`
+    *(Coding Plan's API returns 0 for `current_interval_total_count` and
+    `current_interval_usage_count`; consumption is tracked via
+    `current_interval_remaining_percent` only, so the rate is %/h)*
   - idle (no recent token usage): `· on pace to have ~98% left at reset (0 tok/h)`
   - warning (projected exhaustion before reset):
-    `⚠ 1.2k tok/h → exhausts ~1h 5m before reset` — and the top-bar chip
-    flips to the warning color, even when the remaining-% thresholds look
-    fine.
+    `⚠ 1.2k tok/h → exhausts ~1h 5m before reset` (or `⚠ 60%/h → exhausts ~22m before reset`)
+    — and the top-bar chip flips to the warning color, even when the
+    remaining-% thresholds look fine.
 
   The projection resets on every window rollover; it's an estimate, not a
   promise — bursty usage will make it conservative or optimistic accordingly.

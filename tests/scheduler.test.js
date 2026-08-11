@@ -624,7 +624,12 @@ await test('T16: idle user with live API shape (no start_time) still gets an inf
     assert(hist.length === 5, `5 samples recorded, got ${hist.length}`);
     assert(hist[0].startAt === 0, `startAt=0 (live shape), got ${hist[0].startAt}`);
 
-    const w = { ...hist[hist.length - 1] };
+    const last = hist[hist.length - 1];
+    const w = {
+      id: '5h', label: '5h', total: last.total, used: last.used,
+      remaining_pct: last.remainingPct, resetAt: last.resetAt, startAt: last.startAt,
+      throttled: false,
+    };
     const burn = app.__test.computeBurn(w);
     assert(burn !== null, 'idle user with no start_time still gets an informational projection');
     assert(burn.ratePerHour === 0, `idle user rate is 0, got ${burn.ratePerHour}`);
@@ -634,6 +639,72 @@ await test('T16: idle user with live API shape (no start_time) still gets an inf
     assert(label.includes('on pace to have ~98% left at reset'), `informational label, got: ${label}`);
     assert(label.includes('0 tok/h'), `shows 0 tok/h, got: ${label}`);
     assert(!label.includes('⚠'), 'no warning glyph for an idle user');
+  });
+});
+
+// Live Coding Plan shape: `current_interval_total_count` and
+// `current_interval_usage_count` are 0; only `current_interval_remaining_percent`
+// carries consumption signal. Verify computeBurn fits a pct-based rate and
+// the row renders the pct/h variant.
+await test('T17: live Coding Plan shape — used=0, remaining_pct drops → pct-based rate', async () => {
+  reset();
+  app.__test.setConfig({
+    ...TEST_CONFIG,
+    burn_warning: { enabled: true, min_history_ms: 1, lookback_ms: 3600e3, use_epoch_average: true },
+  });
+  await withClock(1700000000000, async ({ now, advance }) => {
+    // 5 polls spaced 2 min apart; used=0 always; remaining_pct drops 0.5 per poll.
+    // 0.5%/2min = 15%/h — well under the 72%/4h = 18%/h that would trigger a
+    // warning, so we exercise the informational variant.
+    const startTime = now() - 30 * 60e3;     // epoch started 30 min ago
+    for (let i = 0; i < 5; i++) {
+      const remainingPct = Math.round((80 - i * 0.5) * 10) / 10;  // 80, 79.5, 79, 78.5, 78
+      const remainsMs = 5 * 3600e3 - 30 * 60e3 - i * 2 * 60e3;
+      const payload = {
+        model_remains: [{
+          model_name: 'general',
+          current_interval_total_count: 0,    // <-- live shape: 0
+          current_interval_usage_count: 0,    // <-- live shape: 0
+          current_interval_remaining_percent: remainingPct,
+          start_time: startTime,
+          remains_time: remainsMs,
+          current_interval_status: 1,
+          current_weekly_total_count: 5000,
+          current_weekly_usage_count: 0,
+          current_weekly_remaining_percent: 80,
+          weekly_remains_time: 6 * 86400e3,
+          current_weekly_status: 1,
+        }],
+      };
+      app.__test.refresh(true);
+      assert(pendingResolvers.length > 0, `expected pending fetch at iteration ${i}`);
+      pendingResolvers.shift()(payload);
+      await flush();
+      if (i < 4) advance(2 * 60e3);
+    }
+
+    const hist = app.__test.getBurnHistory();
+    assert(hist.length === 5, `5 samples recorded, got ${hist.length}`);
+    assert(hist.every((s) => s.used === 0), 'all samples have used=0 (live shape)');
+
+    const last = hist[hist.length - 1];
+    const w = {
+      id: '5h', label: '5h', total: last.total, used: last.used,
+      remaining_pct: last.remainingPct, resetAt: last.resetAt, startAt: last.startAt,
+      throttled: false,
+    };
+    const burn = app.__test.computeBurn(w);
+    assert(burn !== null, 'live Coding Plan shape must produce a projection');
+    assert(burn.mode === 'pct', `pct mode, got ${burn.mode}`);
+    // 0.5 pct per 2 min = 15 pct/h
+    assert(Math.round(burn.ratePerHour) === 15, `rate ~15%/h, got ${burn.ratePerHour}`);
+    // ~78%/15%h ≈ 5.2h to exhaust vs ~4h remaining → does NOT warn
+    assert(burn.exhaustBeforeReset === false, '15%/h does not warn (5.2h to exhaust > 4h remainingMs)');
+    const label = app.__test.burnRowLabel(burn);
+    assert(label.includes('on pace to have'), `informational label, got: ${label}`);
+    assert(label.includes('%/h'), `pct unit in label, got: ${label}`);
+    assert(!label.includes('tok/h'), `no token unit in pct mode, got: ${label}`);
+    assert(!label.includes('⚠'), 'no warning glyph for a healthy 15%/h trend');
   });
 });
 

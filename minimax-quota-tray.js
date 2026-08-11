@@ -87,10 +87,17 @@ function loadConfig() {
   try {
     GLib.mkdir_with_parents(CONFIG_DIR, 0o700);
     const f = Gio.File.new_for_path(CONFIG_PATH);
+    const bytes = new TextEncoder().encode(JSON.stringify(DEFAULT_CONFIG, null, 2));
     f.replace_contents(
-      JSON.stringify(DEFAULT_CONFIG, null, 2),
+      bytes,
       null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null
     );
+    // Force 0600 explicitly — replace_contents() inherits the process umask
+    // (typically 0644), and install.sh already writes the same file at 0600.
+    // A read-only mode flip keeps first-run installs consistent with later runs.
+    try {
+      f.set_attribute_uint32('unix::mode', 0o600, Gio.FileSetAttributeFlags.NONE);
+    } catch (_) {}
   } catch (e) {
     printerr(`minimax-quota: cannot create default config: ${e.message}`);
   }
@@ -132,10 +139,17 @@ function clearKeyFromKeyring() {
   try {
     const proc = new Gio.Subprocess({
       argv: ['secret-tool', 'clear', 'application', 'minimax-quota'],
-      flags: Gio.SubprocessFlags.STDIN_PIPE,
+      flags: Gio.SubprocessFlags.STDOUT_SILENCE
+            | Gio.SubprocessFlags.STDERR_PIPE,
     });
     proc.init(null);
-    return proc.communicate(null, null)[0];
+    const [ok, , errBytes] = proc.communicate(null, null);
+    if (!ok) {
+      const err = errBytes ? new TextDecoder().decode(errBytes).trim() : '(no stderr)';
+      printerr(`minimax-quota: keyring clear failed: ${err}`);
+      return false;
+    }
+    return true;
   } catch (e) {
     printerr(`minimax-quota: keyring clear failed: ${e.message}`);
     return false;
@@ -176,6 +190,10 @@ function loadApiKey() {
 
 const session = Soup.Session.new();
 session.user_agent = 'minimax-quota-tray/1.0';
+// Hard ceiling on a single request. Without this, a stalled TCP open
+// (firewall blackhole, dead API host) sits in send_and_read_async forever
+// and blocks the scheduler from re-arming — the next poll never fires.
+session.timeout = 30;
 
 function fetchQuota(apiKey, endpoint) {
   return new Promise((resolve, reject) => {
@@ -192,7 +210,11 @@ function fetchQuota(apiKey, endpoint) {
           const bytes = sess.send_and_read_finish(res);
           const status = message.status_code;
           if (status !== 200) {
-            const snippet = new TextDecoder().decode(bytes.get_data()).slice(0, 200);
+            // Defensive: some providers echo the bearer token in error bodies.
+            // Truncate hard and strip anything that looks like an Authorization
+            // header before this lands in the menu / journald.
+            const raw = new TextDecoder().decode(bytes.get_data()).slice(0, 80);
+            const snippet = raw.replace(/(?:Bearer|Authorization|api[-_]?key)\s*[:=]?\s*[A-Za-z0-9._\-+/=]+/gi, '[redacted]');
             reject(new Error(`HTTP ${status}: ${snippet}`));
             return;
           }
@@ -469,30 +491,39 @@ function setChip({ windows, error, fetching, offline }) {
     }
     const color = RING_COLOR[bucket];
     const path = ringIconPath(remainingPct);
-    try {
-      // Render to PNG (not SVG) — at panel icon size, SVG strokes thinner
-      // than ~1px disappear under the host's rasterization. PNG renders
-      // crisply at any DPI.
-      const bytes = new TextEncoder().encode(renderRingSvg(remainingPct, color));
-      const svgPath = path.replace(/\.png$/, '.svg');
-      GLib.file_set_contents(svgPath, bytes);
-      // -background none MUST precede the input file: ImageMagick paints
-      // the SVG onto its canvas while reading it, using whatever
-      // -background is set at that instant. Placed after the input it's
-      // too late — the ring comes out on an opaque white square.
-      const proc = new Gio.Subprocess({
-        argv: ['magick', '-background', 'none', '-density', '600', svgPath, path],
-        flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
-      });
-      proc.init(null);
-      proc.wait(null);
-      if (proc.get_exit_status() === 0)
-        iconName = path;
-      else
+    // Skip the SVG encode + magick fork when a PNG already exists for this
+    // rounded percentage. The steady state (120s polls at 100% remaining for
+    // hours) would otherwise fork ImageMagick every poll for nothing. The
+    // filename is keyed on the percentage so any new value is still a cache
+    // miss and gets a fresh render.
+    if (GLib.file_test(path, GLib.FileTest.EXISTS)) {
+      iconName = path;
+    } else {
+      try {
+        // Render to PNG (not SVG) — at panel icon size, SVG strokes thinner
+        // than ~1px disappear under the host's rasterization. PNG renders
+        // crisply at any DPI.
+        const bytes = new TextEncoder().encode(renderRingSvg(remainingPct, color));
+        const svgPath = path.replace(/\.png$/, '.svg');
+        GLib.file_set_contents(svgPath, bytes);
+        // -background none MUST precede the input file: ImageMagick paints
+        // the SVG onto its canvas while reading it, using whatever
+        // -background is set at that instant. Placed after the input it's
+        // too late — the ring comes out on an opaque white square.
+        const proc = new Gio.Subprocess({
+          argv: ['magick', '-background', 'none', '-density', '600', svgPath, path],
+          flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+        });
+        proc.init(null);
+        proc.wait(null);
+        if (proc.get_exit_status() === 0)
+          iconName = path;
+        else
+          iconName = bucket === 'warning' ? ICON.warning : ICON.normal;
+      } catch (e) {
+        // Fall back to the static dot if conversion fails.
         iconName = bucket === 'warning' ? ICON.warning : ICON.normal;
-    } catch (e) {
-      // Fall back to the static dot if conversion fails.
-      iconName = bucket === 'warning' ? ICON.warning : ICON.normal;
+      }
     }
   } else {
     iconName = ICON.normal;
@@ -902,7 +933,7 @@ function showKeyEntryDialog() {
 
   const entry = new Gtk.Entry();
   entry.set_text(apiKey || '');
-  entry.set_visibility(true);
+  entry.set_visibility(false);  // mask the typed API key
   entry.set_input_purpose(Gtk.InputPurpose.PASSWORD);  // hint to password manager
 
   const btnBox = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 8 });

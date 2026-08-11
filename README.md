@@ -17,7 +17,6 @@ Talks directly to the MiniMax API — no agent or plugin system required.
     ████████████████████░░
     weekly: 100% left · resets in 6d 8h
     ███████████████████████
-    ⚠ Throttled
     ───
     Refresh now
     Open dashboard
@@ -98,22 +97,22 @@ if the cancel-before-arm logic is ever removed.
 ```json
 {
   "plan": "coding_plan",
-  "refresh_seconds": 60,
+  "refresh_seconds": 120,
+  "refresh_min_seconds": 15,
+  "refresh_max_backoff_seconds": 600,
   "plans": {
     "coding_plan": {
       "endpoint":      "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
-      "dashboard_url": "https://api.minimax.chat/user-center/payment/balance",
+      "dashboard_url": "https://platform.minimax.io/console/plan",
       "label": "Coding Plan"
     },
     "token_plan": {
       "endpoint":      "https://api.minimax.io/v1/token_plan/remains",
-      "dashboard_url": "https://platform.minimax.io/user-center/payment/token-plan",
+      "dashboard_url": "https://platform.minimax.io/console/plan",
       "label": "Token Plan"
     }
   },
-  "icon_name":    "appointment-soon-symbolic",
-  "warning_icon": "dialog-warning-symbolic",
-  "thresholds":   { "yellow": 60, "red": 85 }
+  "thresholds": { "yellow": 60, "red": 85 }
 }
 ```
 
@@ -161,10 +160,12 @@ shelled out; reads use `Secret.password_lookup_sync` directly.
 
 ## Troubleshooting
 
-- **Three dots where the icon should be** — your icon theme doesn't have
-  the configured `icon_name`. The default `appointment-soon-symbolic`
-  ships with Adwaita. Inspect with
-  `gjs -c "imports.gi.versions.GTK='3.0'; const t=Gtk.IconTheme.get_default(); print(t.lookup_icon('your-icon', 16, 0)?.get_filename() ?? 'NOT FOUND');"`
+- **Three dots where the icon should be** — the static status icons
+  (`icons/quota-{normal,warning,throttled,offline,error}.svg`) aren't being
+  resolved by the icon theme. The installer copies them into
+  `~/.local/share/icons/hicolor/scalable/apps/` and refreshes the icon
+  cache; if that step was skipped, the icons won't appear. Inspect with
+  `gjs -c "imports.gi.versions.GTK='3.0'; const t=Gtk.IconTheme.get_default(); print(t.lookup_icon('quota-normal', 16, 0)?.get_filename() ?? 'NOT FOUND');"`
 - **`Argument password may not be null`** — your GNOME Keyring is locked.
   Unlock it or re-enter the key from the menu (click chip → **Set API Key…**).
 - **`Requiring Gtk, version 3.0: ... '4.0' is already loaded`** — make
@@ -191,7 +192,7 @@ config-driven:
 - `plans.<id>.dashboard_url` — opened by the **Open dashboard** menu item
 - `plans.<id>.label` — shown in the chip and menu header
 - `thresholds`, `refresh_seconds`, `refresh_min_seconds`,
-  `refresh_max_backoff_seconds`, `icon_name`, `warning_icon`
+  `refresh_max_backoff_seconds`
 
 You can rename or add plan IDs freely in `config.json`; the `plan` field picks
 the active one.

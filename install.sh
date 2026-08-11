@@ -26,6 +26,16 @@ command -v systemctl >/dev/null 2>&1 || {
   echo "error: systemctl not found (not a systemd system?)" >&2
   exit 1
 }
+# Soft preflight warnings: the app degrades gracefully if these are absent,
+# but the user should know before the tray silently falls back.
+command -v magick >/dev/null 2>&1 || {
+  echo "warning: ImageMagick (magick) not found — dynamic ring icons will fall back to static dots" >&2
+  echo "  try: dnf install ImageMagick   /   apt install imagemagick" >&2
+}
+command -v gnome-keyring-daemon >/dev/null 2>&1 || {
+  echo "warning: gnome-keyring-daemon not detected — secret-tool writes may fail at runtime" >&2
+  echo "  ensure GNOME Keyring (gnome-keyring-daemon --components=secrets) is running" >&2
+}
 
 # Install binary
 install -d "$HOME/.local/bin"
@@ -53,7 +63,9 @@ fi
 
 # First-run config (don't clobber an existing one)
 if [ ! -f "$CONFIG_DEST" ]; then
-  install -d "$CONFIG_DIR"
+  # 0700 so the directory matches what the app enforces on subsequent runs
+  # (it only chmods the file, not the parent).
+  install -d -m 0700 "$CONFIG_DIR"
   install -m 0600 "$ROOT/config.example.json" "$CONFIG_DEST"
   echo "wrote default config: $CONFIG_DEST"
 fi

@@ -3,7 +3,6 @@ Plan: Coding Plan
   ████████████████████░░
   weekly: 100% left · resets in 6d 8h
   ███████████████████████
-  ⚠ Throttled
   ───
   Refresh now
   Open dashboard

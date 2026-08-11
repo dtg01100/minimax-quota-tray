@@ -65,6 +65,32 @@ systemctl --user enable --now minimax-quota.service
 Stops and disables the service, removes the installed files, and
 optionally purges your config dir and the stored key from GNOME Keyring.
 
+## Tests
+
+The poll scheduler has a unit harness that simulates overlapping
+`refresh()` calls — the exact scenario that used to spawn multiple,
+permanently self-rescheduling polling chains:
+
+```bash
+./tests/run.sh
+```
+
+It imports the real app module with `MINIMAX_QUOTA_TEST=1` (which skips
+`main()`), swaps the network / tray / menu / notification hooks for fakes,
+and asserts the single-flight invariant: at most one poll timeout is ever
+armed, and an explicit refresh arriving mid-fetch is queued exactly once.
+The suite also covers offline handling, the no-key state, backoff after
+errors, and threshold-notification dedup.
+
+`tests/regression-scheduler.test.js` documents the bug this guards against:
+it runs a faithful replica of the pre-fix scheduler (extracted from commit
+`d4d07cd`, where every manual refresh spawned a second self-rescheduling
+poll chain) head-to-head against the fixed app — Part A reproduces the
+stacked chains and request burst, Part B proves the fixed code has exactly
+one chain and no burst. The suite is red against the pre-fix algorithm and
+green against the fix; the real-timer Part B test is the decisive detector
+if the cancel-before-arm logic is ever removed.
+
 ## Configuration
 
 `~/.config/minimax-quota/config.json`:

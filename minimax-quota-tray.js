@@ -76,6 +76,16 @@ const SNI_IFACE_XML = `
   </interface>
 </node>`;
 
+// GLib doesn't expose getpid() directly; read it from /proc/self/stat.
+function getSelfPid() {
+  try {
+    const [, bytes] = GLib.file_get_contents('/proc/self/stat');
+    return parseInt(new TextDecoder().decode(bytes).split(' ')[0]);
+  } catch (e) {
+    return 0;
+  }
+}
+
 class SniIndicator {
   constructor({ id, title, category }) {
     this._id = id;
@@ -97,14 +107,8 @@ class SniIndicator {
 
     // Bus name: org.freedesktop.StatusNotifierItem-<pid>-1. The PID is part
     // of the spec; the trailing ID distinguishes multiple items from the
-    // same process. GLib doesn't expose getpid directly; read /proc/self/stat.
-    let pid;
-    try {
-      const [, bytes] = GLib.file_get_contents('/proc/self/stat');
-      pid = parseInt(new TextDecoder().decode(bytes).split(' ')[0]);
-    } catch (e) {
-      pid = 0;
-    }
+    // same process.
+    const pid = getSelfPid();
     printerr(`minimax-quota: SNI bus name will be StatusNotifierItem-${pid}-1`);
     this._busName = `org.freedesktop.StatusNotifierItem-${pid}-1`;
 
@@ -516,6 +520,16 @@ function barMarkup(fractionPct) {
 
 let config, apiKey, indicator;
 let isFetching = false;
+// Set when refresh() is requested while a fetch is in flight (menu click,
+// new API key, network reconnect). The in-flight fetch re-runs refresh()
+// from its .finally() so the request is never silently dropped.
+let pendingRefresh = false;
+// Source id of the single scheduled poll timeout. Keeping exactly one
+// pending timeout (cancelled/re-armed in scheduleNext) is what makes the
+// polling loop single-flight: previously every manual refresh spawned a
+// second, permanently self-rescheduling chain that doubled the request
+// rate and raced on the shared notification/backoff state.
+let pollTimeoutId = 0;
 let consecutiveFailures = 0;
 // Cache of the last successful windows + when we got it, so a transient
 // API error doesn't leave the menu completely empty (we show stale data
@@ -587,10 +601,17 @@ function nextIntervalSeconds(remainingPct) {
 }
 
 function scheduleNext(remainingPct) {
+  // Single-flight: drop any previously-scheduled poll before arming the
+  // next one, so at most one timeout (one polling chain) can ever exist.
+  if (pollTimeoutId) {
+    GLib.source_remove(pollTimeoutId);
+    pollTimeoutId = 0;
+  }
   const ms = Math.max(1000, Math.floor(nextIntervalSeconds(remainingPct) * 1000));
-  GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+  pollTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+    pollTimeoutId = 0;  // firing now; the in-flight fetch re-arms on completion
     refresh();
-    return GLib.SOURCE_REMOVE;  // refresh() re-schedules itself
+    return GLib.SOURCE_REMOVE;
   });
 }
 
@@ -772,7 +793,7 @@ function buildMenu() {
   M.separator2.property_set('type', 'separator');
 
   M.refresh.property_set('label', 'Refresh now');
-  M.refresh.connect('item-activated', () => refresh());
+  M.refresh.connect('item-activated', () => refresh(true));
 
   M.dashboard.property_set('label', 'Open dashboard');
   M.dashboard.connect('item-activated', () => {
@@ -870,24 +891,40 @@ function updateMenu({ windows, error, lastGood, lastGoodAt, offline }) {
   }
 }
 
-function refresh() {
-  if (isFetching) return;
+function refresh(force) {
+  if (!apiKey) {
+    // Nothing to poll with; keep the "no key" state visible instead of
+    // error-spamming the API with an empty key (menu / reconnect refreshes).
+    _hooks.setChip({ error: 'No API key — open menu → Set API Key…' });
+    _hooks.updateMenu({ error: 'No API key configured' });
+    return;
+  }
+  if (isFetching) {
+    // An explicit request (menu, new key, reconnect) must not be lost to
+    // the in-flight fetch — queue it and let .finally() re-run us. Plain
+    // timeout-triggered polls just skip: the in-flight fetch re-arms the
+    // loop itself, so nothing is dropped.
+    if (force) pendingRefresh = true;
+    return;
+  }
   if (isOffline) {
     // Don't hit the API — just update the UI to reflect the offline state.
-    setChip({ offline: true });
-    updateMenu({ offline: true });
+    // No poll is scheduled here; the NetworkMonitor reconnect handler
+    // restarts the loop when connectivity returns.
+    _hooks.setChip({ offline: true });
+    _hooks.updateMenu({ offline: true });
     return;
   }
   isFetching = true;
-  setChip({ fetching: true });
+  _hooks.setChip({ fetching: true });
   const planCfg = config.plans[config.plan] || config.plans.coding_plan;
-  fetchQuota(apiKey, planCfg.endpoint)
+  _hooks.fetchQuota(apiKey, planCfg.endpoint)
     .then((payload) => {
       const windows = parsePayload(payload);
       lastGoodWindows = windows;
       lastGoodAt = Date.now();
-      setChip({ windows });
-      updateMenu({ windows });
+      _hooks.setChip({ windows });
+      _hooks.updateMenu({ windows });
       consecutiveFailures = 0;
       const cur = windows[0];
 
@@ -897,13 +934,13 @@ function refresh() {
       if (_lastBucket !== null &&
           BUCKET_RANK[newBucket] > BUCKET_RANK[_lastBucket]) {
         if (newBucket === 'throttled') {
-          notify(
+          _hooks.notify(
             `${config.plans[config.plan].label} — throttled`,
             `Quota exhausted. The menu shows when it resets.`,
             'critical',
           );
         } else if (newBucket === 'warning') {
-          notify(
+          _hooks.notify(
             `${config.plans[config.plan].label} — running low`,
             `Remaining dropped below ${100 - config.thresholds.yellow}%.`,
             'normal',
@@ -915,13 +952,164 @@ function refresh() {
       scheduleNext(cur ? cur.remaining_pct : null);
     })
     .catch((err) => {
-      setChip({ error: err.message });
-      updateMenu({ error: err.message, lastGood: lastGoodWindows, lastGoodAt });
+      _hooks.setChip({ error: err.message });
+      _hooks.updateMenu({ error: err.message, lastGood: lastGoodWindows, lastGoodAt });
       consecutiveFailures++;
       scheduleNext(null);
     })
-    .finally(() => { isFetching = false; });
+    .finally(() => {
+      isFetching = false;
+      if (pendingRefresh) {
+        pendingRefresh = false;
+        refresh(true);
+      }
+    });
 }
+
+// ---------------------------------------------------------------------------
+// Offline detection via Gio.NetworkMonitor
+// ---------------------------------------------------------------------------
+
+function setupNetworkMonitor() {
+  try {
+    const monitor = Gio.NetworkMonitor.get_default();
+    if (!monitor) return;
+    isOffline = !monitor.get_network_available();
+    monitor.connect('network-changed', (m, available) => {
+      const nowOffline = !available;
+      if (nowOffline === isOffline) return;
+      isOffline = nowOffline;
+      if (isOffline) {
+        // Network dropped: surface the offline state immediately rather
+        // than relying on refresh(), which the isFetching guard may skip
+        // (the in-flight fetch's .catch() would otherwise show a
+        // misleading API error row). Pending polls no-op against the
+        // offline branch and the loop pauses until connectivity returns.
+        _hooks.setChip({ offline: true });
+        _hooks.updateMenu({ offline: true });
+      } else {
+        // Back online: skip the exponential backoff and poll right away.
+        consecutiveFailures = 0;
+        refresh(true);
+      }
+    });
+  } catch (e) {
+    printerr(`minimax-quota: NetworkMonitor unavailable (${e.message}); offline detection disabled`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Single-instance guard (PID lock in $XDG_RUNTIME_DIR)
+// ---------------------------------------------------------------------------
+
+let _lockPath = null;
+
+function acquireSingleInstanceLock() {
+  const dir = GLib.getenv('XDG_RUNTIME_DIR') || GLib.get_tmp_dir();
+  const path = `${dir}/minimax-quota-tray.pid`;
+  try {
+    const f = Gio.File.new_for_path(path);
+    try {
+      // Atomic create (O_EXCL semantics): fails if another instance got
+      // here first, closing the check-then-write race.
+      const out = f.create(Gio.FileCreateFlags.NONE, null);
+      out.write_all(new TextEncoder().encode(String(getSelfPid())), null);
+      out.close(null);
+      _lockPath = path;
+      return true;
+    } catch (e) {
+      // Lock already exists — only a live owner blocks startup.
+      const [, contents] = f.load_contents(null);
+      const pid = parseInt(new TextDecoder().decode(contents).trim(), 10);
+      if (pid > 0 && GLib.file_test(`/proc/${pid}`, GLib.FileTest.EXISTS)) {
+        printerr(`minimax-quota: another instance is already running (pid ${pid}); exiting.`);
+        return false;
+      }
+      // Stale lock (owner is dead): take it over. Best-effort; a recycled
+      // PID would block startup until that process exits — rare, acceptable.
+      f.replace_contents(
+        new TextEncoder().encode(String(getSelfPid())),
+        null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null
+      );
+      _lockPath = path;
+      return true;
+    }
+  } catch (e) {
+    // Locking is best-effort; refusing to run on a lock error is worse
+    // than the (rare) duplicate it would allow.
+    printerr(`minimax-quota: cannot acquire single-instance lock (${e.message})`);
+    return true;
+  }
+}
+
+function releaseSingleInstanceLock() {
+  if (!_lockPath) return;
+  try { Gio.File.new_for_path(_lockPath).delete(null); } catch (e) {}
+  _lockPath = null;
+}
+
+// ---------------------------------------------------------------------------
+// Test seams
+// ---------------------------------------------------------------------------
+// refresh() and the poll scheduler reach the outside world (network, tray
+// chip, menu, notifications) only through these hooks. The app uses the
+// real implementations below; the unit test harness
+// (tests/scheduler.test.js) replaces them with fakes so overlapping
+// refresh() calls can be simulated without a network, a tray, or a display.
+const _hooks = {
+  fetchQuota,
+  setChip,
+  updateMenu,
+  notify,
+};
+
+// Test-only API, imported by tests/scheduler.test.js via
+//   import * as app from '../minimax-quota-tray.js';
+// The module runs main() only when executed directly (see bottom of file),
+// so importing it in a test process boots nothing.
+export const __test = {
+  setConfig(c) { config = c; },
+  setApiKey(k) { apiKey = k; },
+  setHooks(h) { Object.assign(_hooks, h); },
+  setOffline(o) { isOffline = o; },
+  resetState() {
+    if (pollTimeoutId) {
+      GLib.source_remove(pollTimeoutId);
+      pollTimeoutId = 0;
+    }
+    isFetching = false;
+    pendingRefresh = false;
+    consecutiveFailures = 0;
+    lastGoodWindows = null;
+    lastGoodAt = 0;
+    isOffline = false;
+    _lastBucket = null;
+  },
+  getState() {
+    return {
+      isFetching,
+      pendingRefresh,
+      pollTimeoutId,
+      consecutiveFailures,
+      isOffline,
+      lastGoodAt,
+      lastBucket: _lastBucket,
+    };
+  },
+  refresh,
+  scheduleNext,
+  // Fires the armed poll timeout exactly as GLib would (same teardown, same
+  // refresh() call), so tests drive the loop deterministically instead of
+  // waiting real seconds. Returns false if no poll is armed.
+  firePollTimeout() {
+    if (!pollTimeoutId) return false;
+    const id = pollTimeoutId;
+    pollTimeoutId = 0;
+    GLib.source_remove(id);
+    refresh();
+    return true;
+  },
+};
 
 // ---------------------------------------------------------------------------
 // API key entry modal (writes to GNOME Keyring on Save)
@@ -967,7 +1155,7 @@ function showKeyEntryDialog() {
     if (saveKeyToKeyring(value)) {
       apiKey = value;
       win.destroy();
-      refresh();  // immediately fetch with the new key
+      refresh(true);  // fetch with the new key now (queues if one is in flight)
     } else {
       msg.set_text('Failed to save to GNOME Keyring. Is it unlocked?');
     }
@@ -993,6 +1181,8 @@ function showKeyEntryDialog() {
 function main() {
   Gtk.init(null);
 
+  if (!acquireSingleInstanceLock()) return;
+
   config = loadConfig();
   apiKey = loadApiKey();
 
@@ -1008,14 +1198,22 @@ function main() {
   indicator.set_status(SNI_STATUS.ACTIVE);
   indicator.setRootMenu(buildMenu());
 
+  setupNetworkMonitor();
+
   if (!apiKey) {
-    setChip({ error: 'No API key — open menu → Set API Key…' });
-    updateMenu({ error: 'No API key configured' });
+    _hooks.setChip({ error: 'No API key — open menu → Set API Key…' });
+    _hooks.updateMenu({ error: 'No API key configured' });
   } else {
-    refresh();
+    refresh(true);
   }
 
   Gtk.main();
+  releaseSingleInstanceLock();
 }
 
-main();
+// Run the app only when executed directly. When imported (e.g. by the unit
+// test harness in tests/, which sets MINIMAX_QUOTA_TEST=1), main() is
+// skipped so the scheduler can be exercised without booting the tray.
+if (!GLib.getenv('MINIMAX_QUOTA_TEST')) {
+  main();
+}

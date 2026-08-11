@@ -2,18 +2,26 @@
 // minimax-quota-tray.js — standalone GNOME tray indicator for MiniMax quota.
 // Supports both the Coding Plan and the Token Plan via the user's API key.
 //
-// Tray: implements the StatusNotifierItem spec directly over Gio.DBus, with
-// a Dbusmenu.Server backing the menu. This avoids libayatana-appindicator
-// (deprecated upstream; the GTK-3 fork it suggests replacing, libayatana-
-// appindicator-glib, has no GJS bindings). The implementation lives in this
-// file, below.
+// Tray: libayatana-appindicator (AyatanaAppIndicator3) over the freedesktop
+// StatusNotifierItem protocol, with a Gtk menu. An earlier revision spoke
+// the SNI spec by hand over Gio.DBus + Dbusmenu.Server; that raced the GNOME
+// Shell AppIndicator extension's proxy init (its handlers dereference
+// this._cancellable before init completes) and the shell logged repeated
+// uncaught JS errors, destabilizing the whole tray. The library paces
+// registration and signal emission correctly, so we use it instead.
+//
+// Note: the library logs a one-line "libayatana-appindicator is deprecated"
+// warning at startup. That's cosmetic — the suggested GTK-4 fork
+// (libayatana-appindicator-glib) has no GJS typelib, so this is the binding
+// the AppIndicator extension is designed to consume. Don't "fix" it by
+// hand-rolling SNI again; the races above are why we're here.
 
 
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import Soup from 'gi://Soup';
 import Gtk from 'gi://Gtk?version=3.0';
-import Dbusmenu from 'gi://Dbusmenu?version=0.4';
+import AyatanaAppIndicator3 from 'gi://AyatanaAppIndicator3?version=0.1';
 import Secret from 'gi://Secret?version=1';
 
 // ---------------------------------------------------------------------------
@@ -30,248 +38,6 @@ const KEY_SCHEMA = new Secret.Schema(
 );
 const KEY_ATTRIBUTES = { application: 'minimax-quota' };
 const KEY_LABEL = 'MiniMax API Key';
-
-// ---------------------------------------------------------------------------
-// StatusNotifierItem wrapper (raw SNI over Gio.DBus + Dbusmenu.Server).
-//
-// Replaces the old libayatana-appindicator dependency. The wrapper exposes a
-// small compat surface (set_icon_full / set_label / set_menu / set_status)
-// so the rest of this script doesn't have to care that we're speaking the
-// freedesktop.org StatusNotifierItem spec directly.
-// ---------------------------------------------------------------------------
-
-// The SNI spec defines the canonical interface name as
-// org.freedesktop.StatusNotifierItem, but some hosts (notably
-// gnome-shell-extension-appindicator's dbusProxy.js) still query the
-// historical KDE name org.kde.StatusNotifierItem. We expose both so the
-// item is discovered regardless of which one the host probes.
-const SNI_PROPS = `
-<property name="Category"   type="s"        access="read"/>
-<property name="Id"         type="s"        access="read"/>
-<property name="Title"      type="s"        access="read"/>
-<property name="Status"     type="s"        access="read"/>
-<property name="IconName"   type="s"        access="read"/>
-<property name="IconPixmap" type="a(iiay)"  access="read"/>
-<property name="ItemIsMenu" type="b"        access="read"/>
-<property name="Menu"       type="o"        access="read"/>`;
-const SNI_METHODS = `
-<method name="Activate">
-  <arg type="i" name="x"/><arg type="i" name="y"/>
-</method>
-<method name="ContextMenu">
-  <arg type="i" name="x"/><arg type="i" name="y"/>
-</method>
-<method name="SecondaryActivate">
-  <arg type="i" name="x"/><arg type="i" name="y"/>
-</method>`;
-const SNI_SIGNALS = `
-<signal name="NewIcon"/>
-<signal name="NewTitle"/>
-<signal name="NewStatus"/>`;
-const SNI_IFACE_XML = `
-<node>
-  <interface name="org.kde.StatusNotifierItem">${SNI_PROPS}${SNI_METHODS}${SNI_SIGNALS}
-  </interface>
-  <interface name="org.freedesktop.StatusNotifierItem">${SNI_PROPS}${SNI_METHODS}${SNI_SIGNALS}
-  </interface>
-</node>`;
-
-// GLib doesn't expose getpid() directly; read it from /proc/self/stat.
-function getSelfPid() {
-  try {
-    const [, bytes] = GLib.file_get_contents('/proc/self/stat');
-    return parseInt(new TextDecoder().decode(bytes).split(' ')[0]);
-  } catch (e) {
-    return 0;
-  }
-}
-
-class SniIndicator {
-  constructor({ id, title, category }) {
-    this._id = id;
-    this._title = title;
-    this._category = category;
-    this._status = 'Active';
-    this._iconName = '';
-    this._iconThemePath = '';
-    this._menuPath = '';
-    this._onActivate = null;
-    this._onContextMenu = null;
-
-    this._conn = Gio.bus_get_sync(Gio.BusType.SESSION, null);
-    this._nodeInfo = Gio.DBusNodeInfo.new_for_xml(SNI_IFACE_XML);
-    this._ifaces = [
-      this._nodeInfo.lookup_interface('org.kde.StatusNotifierItem'),
-      this._nodeInfo.lookup_interface('org.freedesktop.StatusNotifierItem'),
-    ];
-
-    // Bus name: org.freedesktop.StatusNotifierItem-<pid>-1. The PID is part
-    // of the spec; the trailing ID distinguishes multiple items from the
-    // same process.
-    const pid = getSelfPid();
-    printerr(`minimax-quota: SNI bus name will be StatusNotifierItem-${pid}-1`);
-    this._busName = `org.freedesktop.StatusNotifierItem-${pid}-1`;
-
-    // Register the /StatusNotifierItem object. We register both the kde and
-    // freedesktop interface names so the host (whatever it probes for) finds
-    // a matching interface on our object.
-    this._regIds = [];
-    for (const iface of this._ifaces) {
-      this._regIds.push(this._conn.register_object(
-        '/StatusNotifierItem',
-        iface,
-        this._onMethodCall.bind(this),
-        this._onGetProperty.bind(this),
-        this._onSetProperty.bind(this),
-      ));
-    }
-
-    // Dbusmenu server — owns the menu tree. Use a unique path to avoid
-    // collisions with other SNI clients (tailscale and similar use the
-    // KDE-canonical /StatusNotifierMenu).
-    this._menuPath = `/StatusNotifierMenu/minimax_${this._id.replace(/[^a-zA-Z0-9_]/g, '_')}`;
-    this._dbusmenu = new Dbusmenu.Server({ 'dbus-object': this._menuPath });
-
-    // Acquire the well-known bus name
-    this._nameId = Gio.bus_own_name_on_connection(
-      this._conn, this._busName, Gio.BusNameOwnerFlags.NONE,
-      null, null,
-    );
-
-    // Register with the StatusNotifierWatcher (GNOME Shell implements it).
-    // If there's no watcher, that's fine — the indicator simply won't show
-    // on this desktop.
-    //
-    // Send the object path /StatusNotifierItem. The watcher's
-    // RegisterStatusNotifierItem handler treats path-prefixed arguments
-    // as: bus name = invocation sender, object path = the argument. This
-    // is the most reliable form — no need to resolve a well-known name.
-    try {
-      this._conn.call_sync(
-        'org.kde.StatusNotifierWatcher',
-        '/StatusNotifierWatcher',
-        'org.kde.StatusNotifierWatcher',
-        'RegisterStatusNotifierItem',
-        GLib.Variant.new('(s)', ['/StatusNotifierItem']),
-        null,
-        Gio.DBusCallFlags.NONE,
-        2000,
-        null,
-      );
-    } catch (e) {
-      printerr(`minimax-quota: StatusNotifierWatcher not reachable (${e.message})`);
-    }
-  }
-
-  setRootMenu(rootItem) {
-    // Attach the menu tree IMMEDIATELY. The host's dbusmenu client calls
-    // AboutToShow(0) right after connecting — it needs a layout to query,
-    // and a delayed attach produces "There currently isn't a layout" errors.
-    //
-    // The LayoutUpdated signal this triggers races with the host's
-    // DBusProxy init (its `_cancellable` isn't set until init_async
-    // completes). On modern systems the race is benign — the host's
-    // g-signal handler silently no-ops while cancellable is undefined,
-    // and the subsequent GetLayout call sees the populated tree. Earlier
-    // versions of the extension (and stale cache states) saw JS errors
-    // here, but those are gone in current Fedora packages.
-    this._dbusmenu.set_property('root-node', rootItem);
-  }
-
-  set_icon_full(iconName, accessibleDesc) {
-    this._iconName = iconName;
-    this._emitPropertyChanged('IconName', GLib.Variant.new_string(iconName));
-    this._emitSignal('NewIcon', null);
-  }
-
-  set_label(label, accessibleDesc) {
-    this._title = accessibleDesc || label || '';
-    this._emitPropertyChanged('Title', GLib.Variant.new_string(this._title));
-    this._emitSignal('NewTitle', null);
-  }
-
-  set_status(status) {
-    this._status = status;
-    this._emitPropertyChanged('Status', GLib.Variant.new_string(status));
-    this._emitSignal('NewStatus', GLib.Variant.new('(s)', [status]));
-  }
-
-  // The GNOME Shell AppIndicator host updates the tray icon ONLY when it
-  // receives PropertiesChanged on org.freedesktop.DBus.Properties for the
-  // item object path — its interface XML comments out every SNI signal
-  // (NewIcon/NewTitle/NewStatus), so those are silently dropped. KDE
-  // Plasma, by contrast, listens for the signals. Emit both forms, for
-  // both org.kde.* and org.freedesktop.* interface names, so every host
-  // sees the change regardless of which interface name it proxies. The
-  // interface name in the PropertiesChanged payload must match the
-  // host's proxy interface, hence the two emissions.
-  _emitPropertyChanged(propertyName, value) {
-    const changed = GLib.Variant.new('a{sv}', { [propertyName]: value });
-    const invalidated = GLib.Variant.new('as', []);
-    for (const ifaceName of ['org.kde.StatusNotifierItem',
-                             'org.freedesktop.StatusNotifierItem']) {
-      // GLib.Variant.new() cannot pack a (sa{sv}as) tuple whose dict
-      // contains variants (gjs packing bug), so build it with new_tuple.
-      const params = GLib.Variant.new_tuple([
-        GLib.Variant.new_string(ifaceName), changed, invalidated,
-      ]);
-      this._conn.emit_signal(
-        null, '/StatusNotifierItem',
-        'org.freedesktop.DBus.Properties', 'PropertiesChanged', params,
-      );
-    }
-  }
-
-  _emitSignal(signalName, params) {
-    for (const iface of this._ifaces) {
-      this._conn.emit_signal(null, '/StatusNotifierItem', iface.name, signalName, params);
-    }
-  }
-
-  connect_activate(handler) { this._onActivate = handler; }
-  connect_context_menu(handler) { this._onContextMenu = handler; }
-
-  _onMethodCall(conn, sender, op, iface, method, params, invocation) {
-    if (method === 'Activate' && this._onActivate) {
-      this._onActivate(sender);
-    } else if (method === 'ContextMenu' && this._onContextMenu) {
-      const [x, y] = params.deep_unpack();
-      this._onContextMenu(x, y, sender);
-    } else if (method === 'SecondaryActivate') {
-      // No-op for now
-    }
-    invocation.return_value(null);
-  }
-
-  _onGetProperty(conn, sender, op, iface, name) {
-    switch (name) {
-      case 'Category':   return GLib.Variant.new_string(this._category);
-      case 'Id':         return GLib.Variant.new_string(this._id);
-      case 'Title':      return GLib.Variant.new_string(this._title);
-      case 'Status':     return GLib.Variant.new_string(this._status);
-      case 'IconName':   return GLib.Variant.new_string(this._iconName);
-      case 'IconPixmap': return GLib.Variant.new('a(iiay)', []);
-      case 'ItemIsMenu': return GLib.Variant.new_boolean(false);
-      case 'Menu':       return GLib.Variant.new_object_path(this._menuPath);
-      default:           return null;
-    }
-  }
-
-  _onSetProperty(conn, sender, op, iface, name, value) {
-    // All SNI properties are read-only per spec; ignore writes.
-    return true;
-  }
-}
-
-const SNI_CATEGORIES = {
-  APPLICATION_STATUS: 'ApplicationStatus',
-  COMMUNICATIONS:     'Communications',
-  SYSTEM_SERVICES:    'SystemServices',
-  HARDWARE:           'Hardware',
-};
-const SNI_STATUS = { ACTIVE: 'Active', PASSIVE: 'Passive', ATTENTION: 'NeedsAttention' };
-
-
 
 // ---------------------------------------------------------------------------
 // Paths and config
@@ -496,17 +262,9 @@ function fmtAge(ms) {
   return `${Math.floor(m / 60)}h`;
 }
 
-function barColor(remainingPct) {
-  const used = 100 - remainingPct;
-  if (used >= config.thresholds.red)    return '#e01b24';
-  if (used >= config.thresholds.yellow) return '#f6d32d';
-  return '#3584e4';
-}
-
 function barMarkup(fractionPct) {
-  // Plain-text bar — the dbusmenu protocol doesn't carry Pango markup
-  // (well, it does via the 'markup' property, but host renderers vary in
-  // how they handle it; a plain ASCII bar is universally safe).
+  // Plain-text bar — avoids relying on Pango markup support in menu
+  // renderers; a plain ASCII bar is universally safe.
   const W = 22;
   const fraction = Math.max(0, Math.min(1, fractionPct / 100));
   const filled = Math.round(fraction * W);
@@ -632,7 +390,7 @@ const RING_COLOR = {
 };
 const RING_CIRCUMFERENCE = 2 * Math.PI * 9;  // r=9, matches the SVG ring
 
-// We render the dynamic ring SVG into $XDG_RUNTIME_DIR and pass that path to
+// We render the dynamic ring into $TMPDIR and pass that path to
 // set_icon_full. AppIndicator accepts absolute paths.
 //
 // Layout: background ring (full circle, faded) + foreground arc (the
@@ -667,12 +425,12 @@ function ringIconPath(remainingPct) {
   // any DPI.
   //
   // Unique filename per remaining-% value: the GNOME Shell host caches
-  // resolved icons by name for ~120s and skips the icon update when the
-  // cached Gio.Icon object is unchanged. With a constant path the ring
-  // would freeze at whatever percentage the host first loaded. Keying the
-  // name on the percentage makes every new value a brand-new icon name
-  // (cache miss → fresh render), while unchanged values reuse the cached
-  // icon (no churn). At most one tiny file per distinct percentage (0-100).
+  // resolved icons for ~120s and skips the icon update when the cached
+  // Gio.Icon object is unchanged. With a constant path the ring would
+  // freeze at whatever percentage the host first loaded. Keying the name
+  // on the percentage makes every new value a brand-new icon name (cache
+  // miss → fresh render), while unchanged values reuse the cached icon
+  // (no churn). At most one tiny file per distinct percentage (0-100).
   const pct = Math.max(0, Math.min(100, Math.round(Number(remainingPct) || 0)));
   const dir = GLib.getenv('TMPDIR') || GLib.get_tmp_dir();
   return `${dir}/minimax-quota-ring-${pct}.png`;
@@ -756,70 +514,80 @@ function setChip({ windows, error, fetching, offline }) {
 }
 
 function makeBarMenuItem() {
-  const item = Dbusmenu.Menuitem.new();
-  item.property_set_bool('enabled', false);
-  return item;
+  const item = new Gtk.MenuItem();
+  item.set_sensitive(false);
+  return { item };
+}
+
+// Pango markup on a menu item's child GtkLabel. Falls back to plain text
+// if the child isn't a label.
+function setItemMarkup(item, markup) {
+  const child = item.get_child();
+  if (child && typeof child.set_markup === 'function') {
+    child.set_markup(markup);
+  } else {
+    item.set_label(markup.replace(/<[^>]+>/g, ''));
+  }
 }
 
 function buildMenu() {
+  const menu = new Gtk.Menu();
   const planCfg = config.plans[config.plan] || config.plans.coding_plan;
-  const root = Dbusmenu.Menuitem.new();
-  root.property_set('label', 'MiniMax');
 
   _menuItems = {
-    root,
-    header:    Dbusmenu.Menuitem.new(),
+    header: new Gtk.MenuItem({ label: '' }),
+    // Window rows are rebuilt on every updateMenu() — there's one label+bar
+    // pair per window in the parser's return array. The menu's static
+    // structure (header, separator, action items) stays fixed; only the
+    // window rows in the middle change.
     windowRows: [],
-    throttled: Dbusmenu.Menuitem.new(),
-    error:     Dbusmenu.Menuitem.new(),
-    separator1: Dbusmenu.Menuitem.new(),
-    refresh:   Dbusmenu.Menuitem.new(),
-    dashboard: Dbusmenu.Menuitem.new(),
-    setKey:    Dbusmenu.Menuitem.new(),
-    separator2: Dbusmenu.Menuitem.new(),
-    quit:      Dbusmenu.Menuitem.new(),
+    throttled: new Gtk.MenuItem({ label: '' }),
+    error:     new Gtk.MenuItem({ label: '' }),
   };
+  for (const k of ['header', 'throttled', 'error']) {
+    _menuItems[k].set_sensitive(false);
+  }
 
-  const M = _menuItems;
-  M.header.property_set_bool('enabled', false);
-  M.header.property_set('label', `Plan: ${planCfg.label}`);
-  M.throttled.property_set('label', '');
-  M.throttled.property_set_bool('enabled', false);
-  M.throttled.property_set_bool('visible', false);
-  M.error.property_set('label', '');
-  M.error.property_set_bool('enabled', false);
-  M.error.property_set_bool('visible', false);
-  M.separator1.property_set('type', 'separator');
-  M.separator2.property_set('type', 'separator');
+  _menuItems.header.set_label(`Plan: ${planCfg.label}`);
+  _menuItems.header.show();
+  _menuItems.throttled.hide();
+  _menuItems.error.hide();
 
-  M.refresh.property_set('label', 'Refresh now');
-  M.refresh.connect('item-activated', () => refresh(true));
+  menu.append(_menuItems.header);
+  // Window rows are inserted between header and throttled at updateMenu() time.
+  menu.append(_menuItems.throttled);
+  menu.append(_menuItems.error);
 
-  M.dashboard.property_set('label', 'Open dashboard');
-  M.dashboard.connect('item-activated', () => {
+  menu.append(new Gtk.SeparatorMenuItem());
+
+  const refreshItem = new Gtk.MenuItem({ label: 'Refresh now' });
+  refreshItem.connect('activate', () => refresh(true));
+  menu.append(refreshItem);
+
+  const dashItem = new Gtk.MenuItem({ label: 'Open dashboard' });
+  dashItem.connect('activate', () => {
     try { Gio.AppInfo.launch_default_for_uri(planCfg.dashboard_url, null); }
     catch (e) { printerr(`minimax-quota: cannot open dashboard: ${e.message}`); }
   });
+  menu.append(dashItem);
 
-  M.setKey.property_set('label', 'Set API Key…');
-  M.setKey.connect('item-activated', () => showKeyEntryDialog());
+  const setKeyItem = new Gtk.MenuItem({ label: 'Set API Key…' });
+  setKeyItem.connect('activate', () => showKeyEntryDialog());
+  menu.append(setKeyItem);
 
-  M.quit.property_set('label', 'Quit');
-  M.quit.connect('item-activated', () => Gtk.main_quit());
+  menu.append(new Gtk.SeparatorMenuItem());
 
-  for (const k of ['header', 'throttled', 'error', 'separator1',
-                    'refresh', 'dashboard', 'setKey', 'separator2', 'quit']) {
-    root.child_append(M[k]);
-  }
+  const quitItem = new Gtk.MenuItem({ label: 'Quit' });
+  quitItem.connect('activate', () => Gtk.main_quit());
+  menu.append(quitItem);
 
-  return root;
+  menu.show_all();
+  return menu;
 }
 
 function updateMenu({ windows, error, lastGood, lastGoodAt, offline }) {
   if (!_menuItems) return;
   const planCfg = config.plans[config.plan] || config.plans.coding_plan;
-  const M = _menuItems;
-  const root = M.root;
 
   // On error, fall back to the last successful payload so the menu still
   // shows useful data (with a "stale · Xm ago" annotation).
@@ -828,66 +596,54 @@ function updateMenu({ windows, error, lastGood, lastGoodAt, offline }) {
   const ageMs = lastGoodAt ? Date.now() - lastGoodAt : 0;
   const staleTag = stale ? ` · last update ${fmtAge(ageMs)} ago` : '';
 
-  M.header.property_set('label', `Plan: ${planCfg.label}`);
+  _menuItems.header.set_label(`Plan: ${planCfg.label}`);
+  _menuItems.header.show();
 
-  // Rebuild the window rows. Tear down old ones first.
-  for (const row of M.windowRows) {
-    root.child_delete(row.label);
-    root.child_delete(row.bar);
+  // Rebuild the window rows. Remove the old Gtk widgets from the menu first
+  // (Gtk.Menu keeps strong refs, so unparented items would leak). The
+  // throttled item is our anchor: window rows always sit immediately before it.
+  const menu = _menuItems.throttled.get_parent();
+  for (const row of _menuItems.windowRows) {
+    menu.remove(row.label);
+    menu.remove(row.bar.item);
   }
-  M.windowRows = [];
+  _menuItems.windowRows = [];
 
-  // Insert new window rows immediately before the throttled item.
-  // dbusmenu has no insert-at-index; the cleanest pattern is to walk the
-  // child list, detach everything from the insertion point onward, then
-  // re-append the rows followed by the detached children in order.
   if (effective && effective.length > 0) {
-    const newRows = [];
+    const siblings = menu.get_children();
+    let throttledIdx = siblings.indexOf(_menuItems.throttled);
     for (const w of effective) {
-      const labelItem = Dbusmenu.Menuitem.new();
-      labelItem.property_set('label',
-        `  ${w.label}: ${w.remaining_pct}% left · resets in ${fmtReset(w.resetAt - Date.now())}${staleTag}`);
-      labelItem.property_set_bool('enabled', false);
-      labelItem.property_set_bool('visible', true);
-      newRows.push(labelItem);
-
+      const label = new Gtk.MenuItem({ label: '' });
+      label.set_sensitive(false);
+      label.set_label(
+        `  ${w.label}: ${w.remaining_pct}% left · resets in ${fmtReset(w.resetAt - Date.now())}${staleTag}`
+      );
       const bar = makeBarMenuItem();
-      bar.property_set('label', barMarkup(w.remaining_pct));
-      newRows.push(bar);
-      M.windowRows.push({ label: labelItem, bar });
+      setItemMarkup(bar.item, barMarkup(w.remaining_pct));
+      _menuItems.windowRows.push({ label, bar });
+      menu.insert(label, throttledIdx);
+      menu.insert(bar.item, throttledIdx + 1);
+      throttledIdx += 2;
     }
-
-    const throttledIdx = M.throttled.get_position(root);
-    // Detach everything from throttled onward (preserving order), append
-    // the new rows, then re-append the detached tail.
-    const tail = [];
-    const remaining = root.get_children();
-    for (const c of remaining) {
-      if (c.get_position(root) >= throttledIdx) {
-        root.child_delete(c);
-        tail.push(c);
-      }
-    }
-    for (const r of newRows) root.child_append(r);
-    for (const c of tail) root.child_append(c);
+    menu.show_all();
   }
 
   if (effective?.some((w) => w.throttled)) {
-    M.throttled.property_set('label', stale ? '  ⚠ Throttled (stale)' : '  ⚠ Throttled');
-    M.throttled.property_set_bool('visible', true);
+    _menuItems.throttled.set_label(stale ? `  ⚠ Throttled (stale)` : '  ⚠ Throttled');
+    _menuItems.throttled.show();
   } else {
-    M.throttled.property_set_bool('visible', false);
+    _menuItems.throttled.hide();
   }
 
   if (error) {
     const staleNote = stale ? ' (showing cached data)' : '';
-    M.error.property_set('label', `  ⚠ Error: ${error}${staleNote}`);
-    M.error.property_set_bool('visible', true);
+    _menuItems.error.set_label(`  ⚠ Error: ${error}${staleNote}`);
+    _menuItems.error.show();
   } else if (offline) {
-    M.error.property_set('label', '  ⚠ Offline — local network unavailable (showing cached data)');
-    M.error.property_set_bool('visible', true);
+    _menuItems.error.set_label('  ⚠ Offline — local network unavailable (showing cached data)');
+    _menuItems.error.show();
   } else {
-    M.error.property_set_bool('visible', false);
+    _menuItems.error.hide();
   }
 }
 
@@ -1001,6 +757,16 @@ function setupNetworkMonitor() {
 // ---------------------------------------------------------------------------
 // Single-instance guard (PID lock in $XDG_RUNTIME_DIR)
 // ---------------------------------------------------------------------------
+
+// GLib doesn't expose getpid() directly; read it from /proc/self/stat.
+function getSelfPid() {
+  try {
+    const [, bytes] = GLib.file_get_contents('/proc/self/stat');
+    return parseInt(new TextDecoder().decode(bytes).split(' ')[0]);
+  } catch (e) {
+    return 0;
+  }
+}
 
 let _lockPath = null;
 
@@ -1190,13 +956,13 @@ function main() {
     printerr(`minimax-quota: no API key found in GNOME Keyring, ${KEY_PATH}, or MINIMAX_API_KEY env var`);
   }
 
-  indicator = new SniIndicator({
-    id: 'minimax-quota',
-    title: 'MiniMax Quota',
-    category: SNI_CATEGORIES.SYSTEM_SERVICES,
-  });
-  indicator.set_status(SNI_STATUS.ACTIVE);
-  indicator.setRootMenu(buildMenu());
+  indicator = AyatanaAppIndicator3.Indicator.new(
+    'minimax-quota',
+    ICON.normal,
+    AyatanaAppIndicator3.IndicatorCategory.SYSTEM_SERVICES,
+  );
+  indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE);
+  indicator.set_menu(buildMenu());
 
   setupNetworkMonitor();
 

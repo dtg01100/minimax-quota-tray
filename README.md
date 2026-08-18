@@ -18,6 +18,7 @@ Talks directly to the MiniMax API — no agent or plugin system required.
     · on pace to have ~48% left at reset (40 tok/h)
     weekly: 100% left · resets in 6d 8h
     ███████████████████████
+    · on pace to have ~96% left at reset (40 tok/h)
     ───
     Refresh now
     Open dashboard
@@ -103,7 +104,10 @@ The suite also covers offline handling, the no-key state, backoff after
 errors, threshold-notification dedup, and the burn-rate projection
 (history gating, rollover resets, the warn/don't-warn decision, the
 projected-% at reset label, and the chip bucket flip — driven under a
-stubbed clock so the slope math is deterministic).
+stubbed clock so the slope math is deterministic). The burn-rate
+coverage exercises both windows independently: T18 verifies the weekly
+rate is computed from weekly samples (a quiet 5h doesn't pollute it),
+and T19 verifies the 5h rollover does not clear the weekly history.
 
 `tests/regression-scheduler.test.js` documents the bug this guards against:
 it runs a faithful replica of the pre-fix scheduler (extracted from commit

@@ -463,14 +463,20 @@ function computeBurn(window, history) {
   const slopePct = slopePerHour(recent, 'remainingPct');
   if (slopePct !== null && slopePct < 0) pctRate = -slopePct;  // negate → positive
 
-  // Pick the mode that has a signal. Token-based wins when both have data
-  // (a count-based provider whose pct also moves); otherwise the one with
-  // a positive rate. If neither has data, surface an informational row
-  // with rate=0 (idle / freshly-started).
+  // Pick the mode that has a signal. Token first when total > 0 AND
+  // used moves across samples (Token Plan / count-based provider); pct
+  // when the count fields are zero (Coding Plan — total=0, used=0, the
+  // only signal is remaining_percent); pct also wins when total=0 even
+  // if pct is null (idle Coding Plan row, with the unit carried through
+  // so the label says '0%/h' not '0 tok/h'). If neither has data, idle
+  // in the unit that was usable.
   let mode = 'idle';
   let rate = 0;
-  if (tokenRate !== null) { mode = 'token'; rate = tokenRate; }
-  else if (pctRate !== null) { mode = 'pct'; rate = pctRate; }
+  let unit = 'token';
+  const countProvider = window.total > 0;
+  if (countProvider && tokenRate !== null) { mode = 'token'; rate = tokenRate; unit = 'token'; }
+  else if (pctRate !== null) { mode = 'pct'; rate = pctRate; unit = 'pct'; }
+  else if (!countProvider && recent.some((s) => typeof s.remainingPct === 'number')) { unit = 'pct'; }
 
   const remainingMs = Math.max(0, window.resetAt - now);
   if (remainingMs <= 0) return null;
@@ -498,6 +504,7 @@ function computeBurn(window, history) {
   return {
     ratePerHour: rate,
     mode,                                // 'token' | 'pct' | 'idle'
+    unit,                                // 'token' | 'pct' — for label
     exhaustMs,
     remainingMs,
     exhaustBeforeReset: exhaustMs < remainingMs,
@@ -516,7 +523,12 @@ function computeBurn(window, history) {
 //   - 'pct':   %/h consumed (Coding Plan — total/used are 0)
 //   - 'idle':  no movement; surfaces "(0 tok/h)" for a uniform look
 function burnRowLabel(burn) {
-  const rateUnit = burn.mode === 'pct'
+  // Rate unit: 'pct' for the live Coding Plan (and any provider whose
+  // count fields are 0/0); 'token' for count-based providers. The
+  // trailing 'tok/h' on a Coding Plan idle row would be a lie — there
+  // are no tokens to count, the only signal is the pct slope — so the
+  // unit is tracked in `burn.unit` rather than inferred from `mode`.
+  const rateUnit = burn.unit === 'pct'
     ? `${fmtRate(burn.ratePerHour)}%/h`
     : `${fmtRate(burn.ratePerHour)} tok/h`;
   if (burn.exhaustBeforeReset) {

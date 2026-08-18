@@ -836,6 +836,54 @@ await test('T19: per-window histories are independent — 5h rollover does not c
   });
 });
 
+await test('T20: idle Coding-Plan user (total=0) labels the row with %/h, not tok/h', async () => {
+  // Regression for the live-tray bug: an idle user on the Coding Plan
+  // (total=0, used=0, no remaining_pct slope) used to show "(0 tok/h)"
+  // because the unit was inferred from mode===idle. The Coding Plan
+  // has no tokens to count — the unit should be %/h whenever total=0.
+  reset();
+  app.__test.setConfig({
+    ...TEST_CONFIG,
+    burn_warning: { enabled: true, min_history_ms: 1, lookback_ms: 3600e3, use_epoch_average: false },
+  });
+  await withClock(1700000000000, async ({ now, advance }) => {
+    // 3 polls, remaining_pct flat at 100, used=0, total=0. Idle.
+    for (let i = 0; i < 3; i++) {
+      app.__test.refresh(true);
+      const payload = {
+        model_remains: [{
+          model_name: 'general',
+          current_interval_total_count: 0,
+          current_interval_usage_count: 0,
+          current_interval_remaining_percent: 100,
+          start_time: 0,            // no epoch start — projection uses slope only
+          remains_time: 5 * 3600e3 - i * 2 * 60e3,
+          current_interval_status: 1,
+          current_weekly_total_count: 0,
+          current_weekly_usage_count: 0,
+          current_weekly_remaining_percent: 100,
+          weekly_remains_time: 6 * 86400e3,
+          current_weekly_status: 1,
+        }],
+      };
+      assert(pendingResolvers.length > 0, `expected pending fetch at iteration ${i}`);
+      pendingResolvers.shift()(payload);
+      await flush();
+      if (i < 2) advance(2 * 60e3);
+    }
+
+    const w = { id: '5h', total: 0, used: 0, startAt: 0,
+                resetAt: now() + 5 * 3600e3 - 4 * 60e3, remaining_pct: 100 };
+    const burn = app.__test.computeBurn(w, app.__test.getBurnHistory(w.id));
+    assert(burn !== null, 'idle Coding-Plan user still gets an informational row');
+    assert(burn.ratePerHour === 0, `idle rate is 0, got ${burn.ratePerHour}`);
+    assert(burn.unit === 'pct', `idle Coding-Plan unit is pct, got ${burn.unit}`);
+    const label = app.__test.burnRowLabel(burn);
+    assert(label.includes('0%/h'), `idle Coding-Plan row shows 0%/h, got: ${label}`);
+    assert(!label.includes('tok/h'), `idle Coding-Plan row does not mention tokens, got: ${label}`);
+  });
+});
+
 await test('T8: failed fetch shows the error row, backs off, stays single-flight', async () => {
   reset();
   fetchMode = 'reject';

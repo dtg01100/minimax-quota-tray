@@ -10,15 +10,16 @@ Talks directly to the MiniMax API — no agent or plugin system required.
 
 - **Chip** in the top bar: `<Plan> <remaining>%` with an icon that flips
   to a warning glyph when usage crosses the configured thresholds.
-- **Menu**:
+- **Menu** (Coding Plan — both windows compute in `%/h` mode; token plans
+  show `tok/h`):
   ```
   Plan: Coding Plan
     5h: 80% left · resets in 4h
     ██████████████████░░░░
-    · on pace to have ~48% left at reset (40 tok/h)
+    · on pace to have ~62% left at reset (15%/h)
     weekly: 100% left · resets in 6d 8h
     ███████████████████████
-    · on pace to have ~96% left at reset (40 tok/h)
+    · on pace to have ~96% left at reset (1%/h)
     ───
     Refresh now
     Open dashboard
@@ -27,16 +28,18 @@ Talks directly to the MiniMax API — no agent or plugin system required.
     Quit
   ```
 - **Burn-rate rows** — once the tray has ~10 minutes of polling history
-  for a window, it estimates the token burn rate using that window's own
-  sample history, and a row under the window's bar always shows the
-  projection. The 5h and weekly windows each get their own row, computed
-  independently — a quiet 5h window doesn't pollute the weekly rate, and
-  vice versa.
+  for a window, it estimates the burn rate using that window's own sample
+  history, and a row under the window's bar always shows the projection.
+  The 5h and weekly windows each get their own row, computed independently
+  — a quiet 5h window doesn't pollute the weekly rate, and vice versa.
   - healthy (token-based plan): `· on pace to have ~48% left at reset (40 tok/h)`
   - healthy (Coding Plan, pct-based): `· on pace to have ~62% left at reset (15%/h)`
-    *(Coding Plan's API returns 0 for `current_interval_total_count` and
-    `current_interval_usage_count`; consumption is tracked via
-    `current_interval_remaining_percent` only, so the rate is %/h)*
+    *(verified live 2026-08-18: the Coding Plan returns
+    `current_interval_total_count=0`, `current_interval_usage_count=0`,
+    `current_weekly_total_count=0`, and `current_weekly_usage_count=0`.
+    Both windows track consumption via `*_remaining_percent` only, so
+    the rate is %/h on the Coding Plan. Token plans / any provider that
+    exposes real count fields will use the `tok/h` variant.)*
   - idle (no recent token usage): `· on pace to have ~98% left at reset (0 tok/h)`
   - warning (projected exhaustion before reset):
     `⚠ 1.2k tok/h → exhausts ~1h 5m before reset` (or `⚠ 60%/h → exhausts ~22m before reset`)

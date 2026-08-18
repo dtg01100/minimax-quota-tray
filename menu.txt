@@ -1,10 +1,10 @@
 Plan: Coding Plan
   5h: 80% left · resets in 4h
   ██████████████████░░░░
-  · on pace to have ~48% left at reset (40 tok/h)
+  · on pace to have ~62% left at reset (15%/h)
   weekly: 100% left · resets in 6d 8h
   ███████████████████████
-  · on pace to have ~96% left at reset (40 tok/h)
+  · on pace to have ~96% left at reset (1%/h)
   ───
   Refresh now
   Open dashboard

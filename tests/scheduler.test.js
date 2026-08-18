@@ -73,7 +73,11 @@ const TEST_CONFIG = {
 // (both are in the same payload and both get a sample recorded).
 function burnPayload({
   used, total = 500, remainsMs = 5 * 3600e3, startTime = 0,
-  weeklyUsed = 0, weeklyTotal = 5000, weeklyRemainsMs = 6 * 86400e3, weeklyStartTime = 0,
+  // Weekly defaults mirror the LIVE Coding Plan API shape: token count
+  // fields are 0/0, consumption is tracked via remaining_percent only
+  // (verified 2026-08-18 against api.minimax.io general entry). Token-based
+  // weekly tests must opt in by passing weeklyTotal / weeklyUsed explicitly.
+  weeklyUsed = 0, weeklyTotal = 0, weeklyRemainsMs = 6 * 86400e3, weeklyStartTime = 0,
 }) {
   const remainingPct = Math.max(0, Math.round(100 * (total - used) / total));
   const weeklyRemainingPct = Math.max(0, Math.round(100 * (weeklyTotal - weeklyUsed) / weeklyTotal));
@@ -109,7 +113,7 @@ function okPayload(remainingPct) {
       current_interval_remaining_percent: remainingPct,
       remains_time: 3600000,
       current_interval_status: 1,
-      current_weekly_total_count: 5000,
+      current_weekly_total_count: 0,
       current_weekly_usage_count: 0,
       current_weekly_remaining_percent: 100,
       weekly_remains_time: 561600000,
@@ -611,7 +615,7 @@ await test('T16: idle user with live API shape (no start_time) still gets an inf
           // start_time intentionally omitted
           remains_time: remainsMs,
           current_interval_status: 1,
-          current_weekly_total_count: 5000,
+          current_weekly_total_count: 0,
           current_weekly_usage_count: 0,
           current_weekly_remaining_percent: 80,
           weekly_remains_time: 6 * 86400e3,
@@ -676,7 +680,7 @@ await test('T17: live Coding Plan shape — used=0, remaining_pct drops → pct-
           start_time: startTime,
           remains_time: remainsMs,
           current_interval_status: 1,
-          current_weekly_total_count: 5000,
+          current_weekly_total_count: 0,
           current_weekly_usage_count: 0,
           current_weekly_remaining_percent: 80,
           weekly_remains_time: 6 * 86400e3,
@@ -715,46 +719,83 @@ await test('T17: live Coding Plan shape — used=0, remaining_pct drops → pct-
   });
 });
 
-await test('T18: weekly burn rate is tracked independently of the 5h window', async () => {
-  // Heavy weekly usage on a slow slope must register a weekly burn even
-  // when the 5h window is idle. The 5h burn is informational (or absent);
-  // the weekly burn uses the weekly history.
+await test('T18: weekly burn rate is tracked independently of the 5h window (live Coding Plan shape)', async () => {
+  // Verified 2026-08-18: the live Coding Plan returns 0/0 for the weekly
+  // token count fields, same as the 5h window. Both windows compute in
+  // pct mode (%/h), driven by remaining_percent dropping. The point of
+  // this test is the INDEPENDENCE property — a quiet 5h does not pollute
+  // the weekly rate, and the 5h rollover does not clear the weekly
+  // history — not the rate unit (covered by T17 for the 5h side).
   reset();
+  app.__test.setConfig({
+    ...TEST_CONFIG,
+    burn_warning: { enabled: true, min_history_ms: 1, lookback_ms: 3600e3, use_epoch_average: true },
+  });
   await withClock(1700000000000, async ({ now, advance }) => {
     const weeklyEpoch = now() - 2 * 86400e3;    // 2 days into the week
     const weeklyResetMs = 5 * 86400e3;          // 5 days left in the week
-    app.__test.refresh(true);
-    resolveNext(burnPayload({
-      used: 0, weeklyUsed: 1000, weeklyStartTime: weeklyEpoch, weeklyRemainsMs: weeklyResetMs,
-    }));
-    await flush();
+    const fiveHrStart = now() - 30 * 60e3;      // epoch started 30 min ago
+    // 5h: very slow burn (1 pct per 2 min → 30 pct/h). weekly: faster
+    // burn (2 pct per 2 min → 60 pct/h). The two rates are independent.
+    // start_time is hoisted out of the loop so the rollover detector in
+    // recordBurnSample doesn't fire on every iteration (it would see the
+    // epoch "advance" by 2 min each poll and clear the history).
+    for (let i = 0; i < 5; i++) {
+      const fiveHrRemaining = 80 - i * 1;        // 80, 79, 78, 77, 76
+      const weeklyRemaining = 90 - i * 2;        // 90, 88, 86, 84, 82
+      const fiveHrRemains = 4 * 3600e3 - i * 2 * 60e3;
+      const weeklyRemains = weeklyResetMs - i * 2 * 60e3;
+      app.__test.refresh(true);
+      // Live Coding Plan shape: total/used = 0 for both windows.
+      const payload = {
+        model_remains: [{
+          model_name: 'general',
+          current_interval_total_count: 0,
+          current_interval_usage_count: 0,
+          current_interval_remaining_percent: fiveHrRemaining,
+          start_time: fiveHrStart,
+          remains_time: fiveHrRemains,
+          current_interval_status: 1,
+          current_weekly_total_count: 0,
+          current_weekly_usage_count: 0,
+          current_weekly_remaining_percent: weeklyRemaining,
+          weekly_start_time: weeklyEpoch,
+          weekly_remains_time: weeklyRemains,
+          current_weekly_status: 1,
+        }],
+      };
+      assert(pendingResolvers.length > 0, `expected pending fetch at iteration ${i}`);
+      pendingResolvers.shift()(payload);
+      await flush();
+      if (i < 4) advance(2 * 60e3);
+    }
 
-    advance(60 * 60e3);                          // 1h later
-    app.__test.refresh(true);
-    resolveNext(burnPayload({
-      used: 0, weeklyUsed: 1200, weeklyStartTime: weeklyEpoch, weeklyRemainsMs: weeklyResetMs - 60 * 60e3,
-    }));
-    await flush();
+    // 5h: 1 pct / 2 min = 30 pct/h, pct mode (matches T17's live shape).
+    const fiveHrHist = app.__test.getBurnHistory('5h');
+    assert(fiveHrHist.length === 5, `5h: 5 samples, got ${fiveHrHist.length}`);
+    const burn5h = app.__test.computeBurn(
+      { id: '5h', total: 0, used: 0,
+        startAt: now() - 50 * 60e3, resetAt: now() + 4 * 3600e3 - 8 * 60e3,
+        remaining_pct: 76 },
+      fiveHrHist,
+    );
+    assert(burn5h !== null && burn5h.mode === 'pct', `5h: pct mode, got ${burn5h && burn5h.mode}`);
+    assert(Math.round(burn5h.ratePerHour) === 30, `5h rate ~30%/h, got ${burn5h.ratePerHour}`);
 
-    // 5h window: idle (used 0 throughout), no projection here.
-    const w5h = { id: '5h', total: 500, used: 0, startAt: now() - 60 * 60e3,
-                  resetAt: now() + 4 * 3600e3, remaining_pct: 100 };
-    const burn5h = app.__test.computeBurn(w5h, app.__test.getBurnHistory('5h'));
-    // 5h window is idle (used=0) — still gets an informational row at 0 tok/h.
-    assert(burn5h !== null && burn5h.ratePerHour === 0, '5h window: idle informational projection');
-
-    // Weekly window: 200 tokens in 1h = 200/h. model_remains returns
-    // 5h-then-weekly, so the parsed window carries the weekly fields.
-    const ww = { id: 'weekly', total: 5000, used: 1200, startAt: weeklyEpoch,
-                 resetAt: now() + weeklyResetMs - 60 * 60e3, remaining_pct: 76 };
-    const burnWeekly = app.__test.computeBurn(ww, app.__test.getBurnHistory('weekly'));
-    assert(burnWeekly !== null, 'weekly window has a projection');
-    assert(Math.round(burnWeekly.ratePerHour) === 200, `weekly rate ~200/h, got ${burnWeekly.ratePerHour}`);
-    assert(burnWeekly.mode === 'token', `weekly token mode, got ${burnWeekly.mode}`);
+    // Weekly: 2 pct / 2 min = 60 pct/h, pct mode — independent of 5h.
+    const weeklyHist = app.__test.getBurnHistory('weekly');
+    assert(weeklyHist.length === 5, `weekly: 5 samples, got ${weeklyHist.length}`);
+    const burnWeekly = app.__test.computeBurn(
+      { id: 'weekly', total: 0, used: 0,
+        startAt: weeklyEpoch, resetAt: now() + weeklyResetMs - 8 * 60e3,
+        remaining_pct: 82 },
+      weeklyHist,
+    );
+    assert(burnWeekly !== null && burnWeekly.mode === 'pct', `weekly: pct mode, got ${burnWeekly && burnWeekly.mode}`);
+    assert(Math.round(burnWeekly.ratePerHour) === 60, `weekly rate ~60%/h, got ${burnWeekly.ratePerHour}`);
     const label = app.__test.burnRowLabel(burnWeekly);
-    assert(label.includes('200 tok/h'), `weekly row label shows rate, got: ${label}`);
-    // 200 tok/h for 5 days → exhausts ~19h into a 5d reset, so it DOES warn.
-    assert(label.includes('⚠'), 'weekly row warns when 200/h burns ~19h of 5d remaining');
+    assert(label.includes('60%/h'), `weekly row shows %/h rate, got: ${label}`);
+    assert(!label.includes('tok/h'), `no token unit in pct mode, got: ${label}`);
   });
 });
 

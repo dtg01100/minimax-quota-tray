@@ -25,9 +25,12 @@ Talks directly to the MiniMax API — no agent or plugin system required.
     ───
     Quit
   ```
-- **Burn-rate row** — once the tray has ~10 minutes of polling history it
-  estimates the token burn rate for the primary (5h) window, and a row under
-  the 5h bar always shows the projection:
+- **Burn-rate rows** — once the tray has ~10 minutes of polling history
+  for a window, it estimates the token burn rate using that window's own
+  sample history, and a row under the window's bar always shows the
+  projection. The 5h and weekly windows each get their own row, computed
+  independently — a quiet 5h window doesn't pollute the weekly rate, and
+  vice versa.
   - healthy (token-based plan): `· on pace to have ~48% left at reset (40 tok/h)`
   - healthy (Coding Plan, pct-based): `· on pace to have ~62% left at reset (15%/h)`
     *(Coding Plan's API returns 0 for `current_interval_total_count` and
@@ -36,8 +39,9 @@ Talks directly to the MiniMax API — no agent or plugin system required.
   - idle (no recent token usage): `· on pace to have ~98% left at reset (0 tok/h)`
   - warning (projected exhaustion before reset):
     `⚠ 1.2k tok/h → exhausts ~1h 5m before reset` (or `⚠ 60%/h → exhausts ~22m before reset`)
-    — and the top-bar chip flips to the warning color, even when the
-    remaining-% thresholds look fine.
+    — and the top-bar chip flips to the warning color based on the 5h window
+    alone, even when the remaining-% thresholds look fine. The weekly row
+    can warn independently of the chip.
 
   The projection resets on every window rollover; it's an estimate, not a
   promise — bursty usage will make it conservative or optimistic accordingly.
@@ -148,16 +152,18 @@ if the cancel-before-arm logic is ever removed.
   (i.e., yellow at 60% used, red at 85% used). The chip label always shows
   **remaining** %.
 - `burn_warning` — burn-rate projection. After the tray has collected
-  `min_history_ms` (default 10 min) of polling history, it estimates the
-  token burn rate for the primary window and shows a row under its bar —
-  informational (`on pace to have ~X% left at reset`) whenever there's
-  enough data, switching to a `⚠` warning (plus a yellow chip) when the
-  trend projects the window exhausting before it resets. The rate is the
-  max of the recent slope over `lookback_ms` (default 1h) and the
-  whole-epoch average; set `use_epoch_average: false` to react to
-  short-term spikes only. `enabled: false` turns the feature off entirely.
-  Note the projection needs history — it appears ~10 min after startup and
-  resets on every window rollover.
+  `min_history_ms` (default 10 min) of polling history for a window, it
+  estimates the token burn rate for that window and shows a row under its
+  bar — informational (`on pace to have ~X% left at reset`) whenever
+  there's enough data, switching to a `⚠` warning when the trend projects
+  the window exhausting before it resets. Each window (5h, weekly) gets
+  its own row, computed from its own history — a quiet 5h window does not
+  pollute the weekly rate. The 5h window's warning also flips the chip
+  to yellow. The rate is the max of the recent slope over `lookback_ms`
+  (default 1h) and the whole-epoch average; set `use_epoch_average: false`
+  to react to short-term spikes only. `enabled: false` turns the feature
+  off entirely. Note the projection needs history — it appears ~10 min
+  after startup and resets on every window rollover (per window).
 - **Polling cadence** — `refresh_seconds` is the baseline (default 120s, peer-aligned).
   The actual interval is adaptive: when remaining quota drops below the
   yellow threshold, polls speed up to `refresh_seconds / 2`; below the
@@ -312,9 +318,10 @@ To port, rewrite these two functions to map your provider's payload into the
 same window shape. Rules:
 
 - **Always return 1–2 windows** (the UI is laid out for a short-window +
-  long-window pair). Hide a window by returning `null` from `parsePayload()`
-  for it, or by returning an array with one entry and adding a `.find((w) =>
-  w.id === 'weekly')` guard in `updateMenu()`.
+  long-window pair). To run with a single window, return an array with one
+  entry; the menu and burn-rate row render automatically for each window
+  the parser returns. The chip's primary window is matched by `id === '5h'`
+  in `setChip()`.
 - **`id` must be `'5h'` for the chip** — `setChip()` looks up
   `windows.find((w) => w.id === '5h')` to pick the percentage shown in the
   top-bar label. Rename consistently in `parseWindow()` and `setChip()`.

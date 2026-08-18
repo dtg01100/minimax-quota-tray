@@ -335,26 +335,45 @@ function fmtRate(tokensPerHour) {
 // The quota windows are fixed-length epochs (start_time / end_time /
 // remains_time), so `used` grows monotonically inside an epoch and resets
 // at the boundary. recordBurnSample() appends one sample per successful
-// refresh and clears the history on epoch rollover; computeBurn() forms the
-// rate as max(recent slope, whole-epoch average) and projects whether the
-// trend exhausts the window before it resets.
+// refresh and clears the per-window history on epoch rollover; computeBurn()
+// forms the rate as max(recent slope, whole-epoch average) and projects
+// whether the trend exhausts the window before it resets.
+//
+// Per-window histories: each plan exposes two windows (e.g. 5h and weekly)
+// with very different lengths and reset cadences. Sharing one history
+// between them would let a 5h window's samples pollute the weekly rate
+// (and vice versa). The window id is its stable label ('5h', 'weekly');
 
-// One sample per successful refresh, for the primary (first) window.
-// Tracks both `used` (token-count, used by plans that expose it) and
-// `remaining_pct` (the universal signal — Coding Plan reports total/used
-// as 0 and tracks consumption via remaining_percent only, so a token-only
-// fit is blind there). `recordBurnSample` records both; `computeBurn`
-// picks the signal that actually moves.
+// if a provider renames or reorders them, the projection simply doesn't
+// fire for the new label rather than misprojecting.
+
+// Per-window sample history. Keyed by window.id (stable label,
+// '5h' / 'weekly'); values are append-only arrays trimmed to
+// BURN_MAX_SAMPLES. Each window's samples are independent so a 5h
+// window's pacing can't pollute the weekly rate (and vice versa).
+const burnHistory = new Map();
+
+// One sample per successful refresh, per window. Tracks both `used`
+// (token-count, used by plans that expose it) and `remaining_pct` (the
+// universal signal — Coding Plan reports total/used as 0 and tracks
+// consumption via remaining_percent only, so a token-only fit is blind
+// there). `recordBurnSample` records both; `computeBurn` picks the
+// signal that actually moves.
 function recordBurnSample(window) {
-  if (!window) return;
-  const last = burnHistory[burnHistory.length - 1];
+  if (!window || !window.id) return;
+  let history = burnHistory.get(window.id);
+  if (!history) {
+    history = [];
+    burnHistory.set(window.id, history);
+  }
+  const last = history[history.length - 1];
   if (last) {
     const rolled =
       (window.startAt > 0 && last.startAt > 0 && window.startAt !== last.startAt) ||
       window.used < last.used - 1;  // defensive: usage only grows within an epoch
-    if (rolled) burnHistory.length = 0;
+    if (rolled) history.length = 0;
   }
-  burnHistory.push({
+  history.push({
     t: nowFn(),
     used: window.used,
     total: window.total,
@@ -362,7 +381,7 @@ function recordBurnSample(window) {
     startAt: window.startAt,
     resetAt: window.resetAt,
   });
-  if (burnHistory.length > BURN_MAX_SAMPLES) burnHistory.shift();
+  if (history.length > BURN_MAX_SAMPLES) history.shift();
 }
 
 // Least-squares slope of `key` over the samples within lookback_ms.
@@ -399,19 +418,25 @@ function slopePerHour(samples, key) {
 // exhaustBeforeReset is naturally false at rate=0 (Infinity is not less
 // than any finite remainingMs), so we never warn on an idle user.
 // Returns null only when there's not enough history to speak at all.
-function computeBurn(window) {
+//
+// Per-window: the caller passes the sample history for THIS window (drawn
+// from `burnHistory.get(window.id)`). Computing a 5h rate from a weekly
+// history would read like a steep burn (weekly usage is heavy) and a
+// weekly rate from a 5h history would look idle for most of the week.
+function computeBurn(window, history) {
   if (!window) return null;
+  if (!history) return null;
   const now = nowFn();
   const cfg = Object.assign({}, DEFAULT_BURN_WARNING, config.burn_warning || {});
   if (!cfg.enabled) return null;
-  if (burnHistory.length < 2) return null;
-  if (now - burnHistory[0].t < cfg.min_history_ms) return null;
+  if (history.length < 2) return null;
+  if (now - history[0].t < cfg.min_history_ms) return null;
 
   // Samples within the recent-slope window, oldest first.
   const recent = [];
-  for (let i = burnHistory.length - 1; i >= 0; i--) {
-    if (now - burnHistory[i].t > cfg.lookback_ms) break;
-    recent.unshift(burnHistory[i]);
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (now - history[i].t > cfg.lookback_ms) break;
+    recent.unshift(history[i]);
   }
   if (recent.length < 2) return null;
 
@@ -531,11 +556,12 @@ let _menuItems = null;
 // so we can fire a notification when the state gets worse. null on startup
 // means "no prior state" — the first refresh won't notify.
 let _lastBucket = null;
-// Burn-rate projection state: samples of the primary window's usage taken
-// on every successful refresh, within the current window epoch. Cleared on
-// epoch rollover. Drives the ⚠ burn-rate warning row and the chip's warning
-// flip when the trend projects exhaustion before the window resets.
-let burnHistory = [];
+// Burn-rate projection state: per-window sample histories (`burnHistory`,
+// Map<windowId, samples[]> declared at the top of the burn-rate section).
+// Each window's samples are taken on every successful refresh, within the
+// current window epoch, cleared on epoch rollover. Drives the per-window
+// ⚠ burn-rate row and the chip's warning flip when the primary window's
+// trend projects exhaustion before reset.
 // 480 samples ≈ 16h at the 120s baseline, 2h at the 15s urgent floor —
 // always covers the 1h recent-slope lookback and then some.
 const BURN_MAX_SAMPLES = 480;
@@ -715,8 +741,10 @@ function setChip({ windows, error, fetching, offline }) {
   } else if (primary) {
     // Burn flip only with fresh data — same gate as the menu row, so the
     // chip never warns from a stale payload + current history (an outage
-    // spanning a rollover would otherwise flip it on garbage).
-    const burn = (!error && !offline) ? computeBurn(primary) : null;
+    // spanning a rollover would otherwise flip it on garbage). The chip
+    // only reflects the primary window's burn; the weekly window's row
+    // (in the menu) can warn independently.
+    const burn = (!error && !offline) ? computeBurn(primary, burnHistory.get(primary.id)) : null;
     bucket = bucketForChip(primary, burn);
     const color = RING_COLOR[bucket];
     const remainingPct = primary.remaining_pct;
@@ -802,19 +830,20 @@ function buildMenu() {
     // structure (header, separator, action items) stays fixed; only the
     // window rows in the middle change.
     windowRows: [],
-    // Burn-rate warning row — created once, reinserted beside the primary
-    // window row whenever the projection is active.
-    burn: new Gtk.MenuItem({ label: '' }),
+    // Burn-rate rows: one per window, keyed by window.id. Recreated lazily
+    // the first time we see a window's id (e.g. '5h', 'weekly'). Each row
+    // sits directly under its window's bar; the primary window's row
+    // additionally drives the chip's warning flip.
+    burnRows: new Map(),
     throttled: new Gtk.MenuItem({ label: '' }),
     error:     new Gtk.MenuItem({ label: '' }),
   };
-  for (const k of ['header', 'burn', 'throttled', 'error']) {
+  for (const k of ['header', 'throttled', 'error']) {
     _menuItems[k].set_sensitive(false);
   }
 
   _menuItems.header.set_label(`Plan: ${planCfg.label}`);
   _menuItems.header.show();
-  _menuItems.burn.hide();
   _menuItems.throttled.hide();
   _menuItems.error.hide();
 
@@ -867,20 +896,21 @@ function updateMenu({ windows, error, lastGood, lastGoodAt, offline }) {
   // Rebuild the window rows. Remove the old Gtk widgets from the menu first
   // (Gtk.Menu keeps strong refs, so unparented items would leak). The
   // throttled item is our anchor: window rows always sit immediately before it.
+  // Burn rows are tracked by window.id so each window can have its own
+  // ⚠ / informational row directly under its bar.
   const menu = _menuItems.throttled.get_parent();
   for (const row of _menuItems.windowRows) {
     menu.remove(row.label);
     menu.remove(row.bar.item);
   }
   _menuItems.windowRows = [];
-  if (_menuItems.burn.get_parent()) menu.remove(_menuItems.burn);
+  for (const burnRow of _menuItems.burnRows.values()) {
+    if (burnRow.get_parent()) menu.remove(burnRow);
+  }
 
   if (effective && effective.length > 0) {
     const siblings = menu.get_children();
     let throttledIdx = siblings.indexOf(_menuItems.throttled);
-    // Burn-rate projection for the primary window — only with fresh data
-    // (never while stale/offline, when the trend would mislead).
-    const burn = (!stale && !offline) ? computeBurn(effective[0]) : null;
     for (const w of effective) {
       const label = new Gtk.MenuItem({ label: '' });
       label.set_sensitive(false);
@@ -893,14 +923,22 @@ function updateMenu({ windows, error, lastGood, lastGoodAt, offline }) {
       menu.insert(label, throttledIdx);
       menu.insert(bar.item, throttledIdx + 1);
       throttledIdx += 2;
-      // The burn-rate row sits directly under the primary window's bar and
-      // shows whenever there's enough history — informational when healthy,
-      // a ⚠ warning when the trend exhausts before reset.
-      if (w === effective[0] && burn) {
-        _menuItems.burn.set_label(burnRowLabel(burn));
-        menu.insert(_menuItems.burn, throttledIdx);
+      // Burn-rate row for this window, sitting directly under its bar.
+      // Only with fresh data — never while stale/offline, when the trend
+      // would mislead. Each window's row is computed from its own history
+      // (different roles: 5h drives the chip flip, weekly is informational).
+      const burn = (!stale && !offline) ? computeBurn(w, burnHistory.get(w.id)) : null;
+      if (burn) {
+        let burnRow = _menuItems.burnRows.get(w.id);
+        if (!burnRow) {
+          burnRow = new Gtk.MenuItem({ label: '' });
+          burnRow.set_sensitive(false);
+          _menuItems.burnRows.set(w.id, burnRow);
+        }
+        burnRow.set_label(burnRowLabel(burn));
+        menu.insert(burnRow, throttledIdx);
         throttledIdx += 1;
-        _menuItems.burn.show();
+        burnRow.show();
       }
     }
     menu.show_all();
@@ -957,7 +995,10 @@ function refresh(force) {
       const windows = parsePayload(payload);
       lastGoodWindows = windows;
       lastGoodAt = Date.now();
-      recordBurnSample(windows[0]);
+      // Record a sample per window so each window's burn rate is computed
+      // from its own history. A 5h window's pacing must not pollute the
+      // weekly rate (and vice versa).
+      for (const w of windows) recordBurnSample(w);
       _hooks.setChip({ windows });
       _hooks.updateMenu({ windows });
       consecutiveFailures = 0;
@@ -1129,7 +1170,7 @@ export const __test = {
     lastGoodAt = 0;
     isOffline = false;
     _lastBucket = null;
-    burnHistory.length = 0;
+    burnHistory.clear();
     nowFn = Date.now;
   },
   getState() {
@@ -1148,7 +1189,14 @@ export const __test = {
   computeBurn,
   burnRowLabel,
   bucketForChip,
-  getBurnHistory: () => burnHistory.slice(),
+  getBurnHistory: (id) => {
+    // id may be a window object (uses .id) or a string id. Returns a
+    // snapshot array of that window's samples, or [] if no history yet.
+    if (!id) return [];
+    const key = typeof id === 'string' ? id : id.id;
+    const h = burnHistory.get(key);
+    return h ? h.slice() : [];
+  },
   setNow(fn) { nowFn = fn || Date.now; },
   // Fires the armed poll timeout exactly as GLib would (same teardown, same
   // refresh() call), so tests drive the loop deterministically instead of

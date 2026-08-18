@@ -68,9 +68,15 @@ const TEST_CONFIG = {
 };
 
 // Payload with explicit interval usage (for burn-rate tests). startTime is
-// the epoch start in ms; remainsMs the ms until the window resets.
-function burnPayload({ used, total = 500, remainsMs = 5 * 3600e3, startTime = 0 }) {
+// the epoch start in ms; remainsMs the ms until the window resets. The
+// weekly knobs let a test drive weekly usage independent of the 5h window
+// (both are in the same payload and both get a sample recorded).
+function burnPayload({
+  used, total = 500, remainsMs = 5 * 3600e3, startTime = 0,
+  weeklyUsed = 0, weeklyTotal = 5000, weeklyRemainsMs = 6 * 86400e3, weeklyStartTime = 0,
+}) {
   const remainingPct = Math.max(0, Math.round(100 * (total - used) / total));
+  const weeklyRemainingPct = Math.max(0, Math.round(100 * (weeklyTotal - weeklyUsed) / weeklyTotal));
   return {
     model_remains: [{
       model_name: 'general',
@@ -80,10 +86,11 @@ function burnPayload({ used, total = 500, remainsMs = 5 * 3600e3, startTime = 0 
       start_time: startTime,
       remains_time: remainsMs,
       current_interval_status: 1,
-      current_weekly_total_count: 5000,
-      current_weekly_usage_count: 0,
-      current_weekly_remaining_percent: 100,
-      weekly_remains_time: 561600000,
+      current_weekly_total_count: weeklyTotal,
+      current_weekly_usage_count: weeklyUsed,
+      current_weekly_remaining_percent: weeklyRemainingPct,
+      weekly_start_time: weeklyStartTime,
+      weekly_remains_time: weeklyRemainsMs,
       current_weekly_status: 1,
     }],
   };
@@ -413,16 +420,16 @@ await test('T11: burn projection warns when the usage trend exhausts before rese
     app.__test.refresh(true);
     resolveNext(burnPayload({ used: 40, startTime: epochStart, remainsMs: 3 * 3600e3 }));
     await flush();
-    assert(app.__test.getBurnHistory().length === 1, 'first burn sample recorded');
+    assert(app.__test.getBurnHistory('5h').length === 1, 'first burn sample recorded');
 
     advance(10 * 60e3);                     // 10 minutes of steady burning
     app.__test.refresh(true);
     resolveNext(burnPayload({ used: 240, startTime: epochStart, remainsMs: 3 * 3600e3 }));
     await flush();
-    assert(app.__test.getBurnHistory().length === 2, 'second burn sample recorded');
+    assert(app.__test.getBurnHistory('5h').length === 2, 'second burn sample recorded');
 
-    const w = { total: 500, used: 240, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 52 };
-    const burn = app.__test.computeBurn(w);
+    const w = { id: '5h', total: 500, used: 240, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 52 };
+    const burn = app.__test.computeBurn(w, app.__test.getBurnHistory(w.id));
     assert(burn !== null, 'burn projection computed');
     // 200 tokens in 10 min = 1200/h; 260 left → ~13 min to exhaust < 3h reset.
     assert(Math.round(burn.ratePerHour) === 1200, `recent slope rate is 1200/h, got ${burn.ratePerHour}`);
@@ -446,8 +453,8 @@ await test('T12: low burn rate projects no exhaustion warning', async () => {
     resolveNext(burnPayload({ used: 45, startTime: epochStart, remainsMs: 3 * 3600e3 }));
     await flush();
 
-    const w = { total: 500, used: 45, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 91 };
-    const burn = app.__test.computeBurn(w);
+    const w = { id: '5h', total: 500, used: 45, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 91 };
+    const burn = app.__test.computeBurn(w, app.__test.getBurnHistory(w.id));
     assert(burn !== null, 'projection computed (a rate exists)');
     // 5 tok/10 min = 30/h; epoch avg 45/40 min = 67.5/h → 455/67.5 ≈ 6.7h > 3h reset.
     assert(burn.exhaustBeforeReset === false, 'does not warn: exhausts long after the reset');
@@ -472,16 +479,16 @@ await test('T13: epoch rollover clears the burn history', async () => {
     app.__test.refresh(true);
     resolveNext(burnPayload({ used: 200, startTime: epoch1, remainsMs: 60e3 }));
     await flush();
-    assert(app.__test.getBurnHistory().length === 2, 'history spans the epoch');
+    assert(app.__test.getBurnHistory('5h').length === 2, 'history spans the epoch');
 
     advance(5 * 60e3);                      // window resets: fresh epoch, usage drops
     app.__test.refresh(true);
     resolveNext(burnPayload({ used: 5, startTime: now(), remainsMs: 5 * 3600e3 }));
     await flush();
-    assert(app.__test.getBurnHistory().length === 1, 'history cleared on rollover');
+    assert(app.__test.getBurnHistory('5h').length === 1, 'history cleared on rollover');
 
-    const w = { total: 500, used: 5, startAt: now(), resetAt: now() + 5 * 3600e3, remaining_pct: 99 };
-    assert(app.__test.computeBurn(w) === null, 'no projection with a single fresh sample');
+    const w = { id: '5h', total: 500, used: 5, startAt: now(), resetAt: now() + 5 * 3600e3, remaining_pct: 99 };
+    assert(app.__test.computeBurn(w, app.__test.getBurnHistory(w.id)) === null, 'no projection with a single fresh sample');
   });
 });
 
@@ -501,8 +508,8 @@ await test('T15: enabled:false disables the projection; use_epoch_average:false 
     app.__test.refresh(true);
     resolveNext(burnPayload({ used: 240, startTime: epochStart, remainsMs: 3 * 3600e3 }));
     await flush();
-    const w = { total: 500, used: 240, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 52 };
-    assert(app.__test.computeBurn(w) === null, 'disabled: no projection despite a steep trend');
+    const w = { id: '5h', total: 500, used: 240, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 52 };
+    assert(app.__test.computeBurn(w, app.__test.getBurnHistory(w.id)) === null, 'disabled: no projection despite a steep trend');
   });
 
   // no epoch-average floor: a flat recent trend returns an informational
@@ -523,8 +530,8 @@ await test('T15: enabled:false disables the projection; use_epoch_average:false 
     app.__test.refresh(true);
     resolveNext(burnPayload({ used: 200, startTime: epochStart, remainsMs: 3 * 3600e3 }));
     await flush();
-    const w = { total: 500, used: 200, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 60 };
-    const burn = app.__test.computeBurn(w);
+    const w = { id: '5h', total: 500, used: 200, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 60 };
+    const burn = app.__test.computeBurn(w, app.__test.getBurnHistory(w.id));
     assert(burn !== null, 'idle user still gets an informational row');
     assert(burn.ratePerHour === 0, `idle user has rate 0, got ${burn.ratePerHour}`);
     assert(burn.exhaustBeforeReset === false, 'idle user does not warn (rate=0 → Infinity exhaustMs)');
@@ -546,8 +553,8 @@ await test('T15: enabled:false disables the projection; use_epoch_average:false 
     app.__test.refresh(true);
     resolveNext(burnPayload({ used: 200, startTime: epochStart, remainsMs: 3 * 3600e3 }));
     await flush();
-    const w = { total: 500, used: 200, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 60 };
-    const burn = app.__test.computeBurn(w);
+    const w = { id: '5h', total: 500, used: 200, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 60 };
+    const burn = app.__test.computeBurn(w, app.__test.getBurnHistory(w.id));
     assert(burn !== null && burn.exhaustBeforeReset === true,
       'with floor: whole-epoch average still projects exhaustion before reset');
   });
@@ -569,8 +576,8 @@ await test('T14: min_history_ms gate suppresses premature projections', async ()
     resolveNext(burnPayload({ used: 240, startTime: epochStart, remainsMs: 3 * 3600e3 }));
     await flush();
 
-    const w = { total: 500, used: 240, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 52 };
-    assert(app.__test.computeBurn(w) === null,
+    const w = { id: '5h', total: 500, used: 240, startAt: epochStart, resetAt: now() + 3 * 3600e3, remaining_pct: 52 };
+    assert(app.__test.computeBurn(w, app.__test.getBurnHistory(w.id)) === null,
       'history only spans 10 min < 1h gate — the steep slope must not fire yet');
   });
 });
@@ -620,7 +627,7 @@ await test('T16: idle user with live API shape (no start_time) still gets an inf
       if (i < 4) advance(2 * 60e3);
     }
 
-    const hist = app.__test.getBurnHistory();
+    const hist = app.__test.getBurnHistory('5h');
     assert(hist.length === 5, `5 samples recorded, got ${hist.length}`);
     assert(hist[0].startAt === 0, `startAt=0 (live shape), got ${hist[0].startAt}`);
 
@@ -630,7 +637,7 @@ await test('T16: idle user with live API shape (no start_time) still gets an inf
       remaining_pct: last.remainingPct, resetAt: last.resetAt, startAt: last.startAt,
       throttled: false,
     };
-    const burn = app.__test.computeBurn(w);
+    const burn = app.__test.computeBurn(w, app.__test.getBurnHistory(w.id));
     assert(burn !== null, 'idle user with no start_time still gets an informational projection');
     assert(burn.ratePerHour === 0, `idle user rate is 0, got ${burn.ratePerHour}`);
     assert(burn.exhaustBeforeReset === false, 'idle user does not warn');
@@ -683,7 +690,7 @@ await test('T17: live Coding Plan shape — used=0, remaining_pct drops → pct-
       if (i < 4) advance(2 * 60e3);
     }
 
-    const hist = app.__test.getBurnHistory();
+    const hist = app.__test.getBurnHistory('5h');
     assert(hist.length === 5, `5 samples recorded, got ${hist.length}`);
     assert(hist.every((s) => s.used === 0), 'all samples have used=0 (live shape)');
 
@@ -693,7 +700,7 @@ await test('T17: live Coding Plan shape — used=0, remaining_pct drops → pct-
       remaining_pct: last.remainingPct, resetAt: last.resetAt, startAt: last.startAt,
       throttled: false,
     };
-    const burn = app.__test.computeBurn(w);
+    const burn = app.__test.computeBurn(w, app.__test.getBurnHistory(w.id));
     assert(burn !== null, 'live Coding Plan shape must produce a projection');
     assert(burn.mode === 'pct', `pct mode, got ${burn.mode}`);
     // 0.5 pct per 2 min = 15 pct/h
@@ -705,6 +712,86 @@ await test('T17: live Coding Plan shape — used=0, remaining_pct drops → pct-
     assert(label.includes('%/h'), `pct unit in label, got: ${label}`);
     assert(!label.includes('tok/h'), `no token unit in pct mode, got: ${label}`);
     assert(!label.includes('⚠'), 'no warning glyph for a healthy 15%/h trend');
+  });
+});
+
+await test('T18: weekly burn rate is tracked independently of the 5h window', async () => {
+  // Heavy weekly usage on a slow slope must register a weekly burn even
+  // when the 5h window is idle. The 5h burn is informational (or absent);
+  // the weekly burn uses the weekly history.
+  reset();
+  await withClock(1700000000000, async ({ now, advance }) => {
+    const weeklyEpoch = now() - 2 * 86400e3;    // 2 days into the week
+    const weeklyResetMs = 5 * 86400e3;          // 5 days left in the week
+    app.__test.refresh(true);
+    resolveNext(burnPayload({
+      used: 0, weeklyUsed: 1000, weeklyStartTime: weeklyEpoch, weeklyRemainsMs: weeklyResetMs,
+    }));
+    await flush();
+
+    advance(60 * 60e3);                          // 1h later
+    app.__test.refresh(true);
+    resolveNext(burnPayload({
+      used: 0, weeklyUsed: 1200, weeklyStartTime: weeklyEpoch, weeklyRemainsMs: weeklyResetMs - 60 * 60e3,
+    }));
+    await flush();
+
+    // 5h window: idle (used 0 throughout), no projection here.
+    const w5h = { id: '5h', total: 500, used: 0, startAt: now() - 60 * 60e3,
+                  resetAt: now() + 4 * 3600e3, remaining_pct: 100 };
+    const burn5h = app.__test.computeBurn(w5h, app.__test.getBurnHistory('5h'));
+    // 5h window is idle (used=0) — still gets an informational row at 0 tok/h.
+    assert(burn5h !== null && burn5h.ratePerHour === 0, '5h window: idle informational projection');
+
+    // Weekly window: 200 tokens in 1h = 200/h. model_remains returns
+    // 5h-then-weekly, so the parsed window carries the weekly fields.
+    const ww = { id: 'weekly', total: 5000, used: 1200, startAt: weeklyEpoch,
+                 resetAt: now() + weeklyResetMs - 60 * 60e3, remaining_pct: 76 };
+    const burnWeekly = app.__test.computeBurn(ww, app.__test.getBurnHistory('weekly'));
+    assert(burnWeekly !== null, 'weekly window has a projection');
+    assert(Math.round(burnWeekly.ratePerHour) === 200, `weekly rate ~200/h, got ${burnWeekly.ratePerHour}`);
+    assert(burnWeekly.mode === 'token', `weekly token mode, got ${burnWeekly.mode}`);
+    const label = app.__test.burnRowLabel(burnWeekly);
+    assert(label.includes('200 tok/h'), `weekly row label shows rate, got: ${label}`);
+    // 200 tok/h for 5 days → exhausts ~19h into a 5d reset, so it DOES warn.
+    assert(label.includes('⚠'), 'weekly row warns when 200/h burns ~19h of 5d remaining');
+  });
+});
+
+await test('T19: per-window histories are independent — 5h rollover does not clear weekly', async () => {
+  // The 5h window resets every 5h; the weekly window resets every 7d. When
+  // the 5h window rolls over, the weekly history must survive. (Per-window
+  // Map keyed by window.id is what preserves this.)
+  reset();
+  await withClock(1700000000000, async ({ now, advance }) => {
+    const weeklyEpoch = now() - 1 * 86400e3;
+    // Two 5h samples, two weekly samples — both spans min_history_ms.
+    app.__test.refresh(true);
+    resolveNext(burnPayload({
+      used: 100, startTime: now() - 30 * 60e3, remainsMs: 4 * 3600e3,
+      weeklyUsed: 800, weeklyStartTime: weeklyEpoch,
+    }));
+    await flush();
+    advance(10 * 60e3);
+    app.__test.refresh(true);
+    resolveNext(burnPayload({
+      used: 200, startTime: now() - 40 * 60e3, remainsMs: 3 * 3600e3,
+      weeklyUsed: 900, weeklyStartTime: weeklyEpoch,
+    }));
+    await flush();
+    assert(app.__test.getBurnHistory('5h').length === 2, '5h: 2 samples');
+    assert(app.__test.getBurnHistory('weekly').length === 2, 'weekly: 2 samples');
+
+    // 5h window rolls over (fresh epoch = new startAt, used drops to 5).
+    advance(5 * 60e3);
+    app.__test.refresh(true);
+    resolveNext(burnPayload({
+      used: 5, startTime: now(), remainsMs: 5 * 3600e3,
+      weeklyUsed: 950, weeklyStartTime: weeklyEpoch,
+    }));
+    await flush();
+    assert(app.__test.getBurnHistory('5h').length === 1, '5h: cleared on rollover');
+    assert(app.__test.getBurnHistory('weekly').length === 3, 'weekly: preserved across 5h rollover');
   });
 });
 

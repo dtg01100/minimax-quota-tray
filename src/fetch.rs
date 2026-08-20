@@ -1,9 +1,8 @@
 //! HTTPS fetch of the MiniMax quota endpoint + parse into Window shape.
 //! Reqwest with rustls-tls (pure Rust TLS, no OpenSSL/GnuTLS).
 //!
-//! The HTTP call is blocking (reqwest blocking) and dispatched on a
-//! background thread so the GLib main loop never stalls. The result is
-//! delivered back to the main thread via `glib::idle_add_once`.
+//! The HTTP call is blocking (reqwest blocking) and intended to be wrapped
+//! in `tokio::task::spawn_blocking` from the polling loop.
 
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
@@ -30,8 +29,9 @@ pub fn build_client() -> Result<Client> {
         .context("building reqwest client")
 }
 
-/// Synchronous fetch — blocks the calling thread. Use with `dispatch` to
-/// keep it off the GLib main thread.
+/// Synchronous fetch — blocks the calling thread. Callers should run this
+/// on a blocking thread (`tokio::task::spawn_blocking`) so the runtime
+/// isn't blocked.
 pub fn fetch_windows_blocking(
     client: &Client,
     endpoint: &str,
@@ -52,37 +52,10 @@ pub fn fetch_windows_blocking(
     parse_coding_plan(&body).context("parsing payload")
 }
 
-/// Run a blocking fetch on a background thread, then call `on_done` on the
-/// GLib main thread. The on_done closure runs in the main loop's idle slot.
-///
-/// `on_done` does NOT need to be Send — it's called from the main thread
-/// via `glib::idle_add_once`. The background thread captures only the HTTP
-/// inputs (all Send) and hands the result off.
-pub fn dispatch<F>(
-    client: Client,
-    endpoint: String,
-    api_key: String,
-    on_done: F,
-) where
-    F: FnOnce(Result<(Window, Window)>) + Send + 'static,
-{
-    std::thread::Builder::new()
-        .name("minimax-fetch".into())
-        .spawn(move || {
-            let result = fetch_windows_blocking(&client, &endpoint, &api_key);
-            glib::idle_add_once(move || on_done(result));
-        })
-        .expect("spawn fetch thread");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    /// The fetch layer is mostly the parse layer + an HTTP client builder;
-    /// full end-to-end coverage lives in tests/integration.rs (against a
-    /// local httpmock). Here we exercise the cheap paths.
 
     #[test]
     fn build_client_succeeds() {
@@ -90,15 +63,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_error_propagates_from_blocking_fetch_signature() {
-        // We can't easily run the blocking fetch without a server, but we
-        // can verify the parse layer is what would surface as the error.
+    fn parse_error_propagates() {
         let v: Value = serde_json::from_str("{}").unwrap();
         assert!(parse_coding_plan(&v).is_err());
     }
 
     #[test]
-    fn empty_payload_returns_parse_error_not_panic() {
+    fn empty_model_remains_returns_parse_error_not_panic() {
         let v = json!({"model_remains": []});
         assert!(parse_coding_plan(&v).is_err());
     }

@@ -1,61 +1,64 @@
 //! End-to-end integration tests for the MiniMax quota tray.
 //!
-//! These tests require:
-//! - A Secret Service daemon reachable on the session D-Bus
-//!   (gnome-keyring-daemon running)
-//! - `magick` (ImageMagick) in PATH for icon rendering
-//! - The library files `libayatana-appindicator3.so.1` /
-//!   `libgtk-3.so.0` reachable on the system library path
+//! These tests require a session D-Bus and write to ~/.config. Marked
+//! `#[ignore]` by default so `cargo test` doesn't fail in stripped-down
+//! CI containers.
 //!
 //! Run with: `cargo test --test integration -- --ignored --nocapture`
-//!
-//! Marked `#[ignore]` by default so `cargo test` doesn't fail in
-//! stripped-down CI environments where these services aren't running.
 
 use std::process::Command;
 
-/// Test that the icon renderer can produce a PNG from the SVG template.
-/// Requires ImageMagick (`magick`).
+/// Test that the stripped-down binary actually runs. With no D-Bus
+/// session and no keyring, the daemon logs a few warnings but stays
+/// alive — proving the codebase didn't regress to a panic-on-startup.
 #[test]
 #[ignore]
-fn magick_renders_icon() {
-    let out = Command::new("magick")
-        .args(["--version"])
-        .output()
-        .expect("magick must be installed");
-    assert!(out.status.success(),
-            "magick --version failed: {}", String::from_utf8_lossy(&out.stderr));
+fn binary_starts_under_session_dbus() {
+    let mut child = Command::new("./target/release/minimax-quota-tray")
+        .env("HOME", "/tmp/minimax-integration-home")
+        .spawn()
+        .expect("binary must exist");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let _ = child.kill();
+    let out = child.wait_with_output().expect("wait on child");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The startup log includes the SNI warning (no watcher in headless
+    // test) and the plan label — both are proof the daemon reached its
+    // main loop without panicking.
+    assert!(stderr.contains("minimax-quota-tray")
+            || stderr.contains("refresh every"),
+            "binary should reach steady state; got: {stderr}");
 }
 
-
-
-/// Smoke test that the binary's arg-less startup loads
-/// libayatana-appindicator — that confirms our FFI + dynamic linking
-/// work. In a headless test environment without a display, the binary
-/// then hangs in gtk::init() (which is correct — the call succeeded,
-/// the window system just isn't there to attach to). The
-/// libayatana-appindicator warning is the proof we loaded the .so.
+/// Measure RSS in MB after a short warmup. Used as a regression guard
+/// against accidentally re-introducing a heavy library (libgtk, etc.)
+/// that would inflate memory by an order of magnitude.
 #[test]
 #[ignore]
-fn binary_loads_libraries() {
-    use std::io::Read;
-    // Write output to a tempfile via shell redirection so SIGKILL doesn't
-    // drop unflushed buffers.
-    let log = std::env::temp_dir().join("minimax-binary-stderr.log");
-    let _ = std::fs::remove_file(&log);
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "./target/release/minimax-quota-tray 2>{} & PID=$!; sleep 1; kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null; true",
-            log.display()
-        ))
+fn rss_under_target() {
+    let mut child = Command::new("./target/release/minimax-quota-tray")
+        .env("HOME", "/tmp/minimax-integration-home")
         .spawn()
-        .expect("spawn wrapper");
+        .expect("binary must exist");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let pid = child.id();
+    let rss_kb = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse::<u64>().ok())
+        });
+    let _ = child.kill();
     let _ = child.wait();
 
-    let mut buf = String::new();
-    let mut f = std::fs::File::open(&log).expect("open log");
-    f.read_to_string(&mut buf).expect("read log");
-    assert!(buf.contains("libayatana-appindicator"),
-            "binary should load libayatana-appindicator; got: {buf}");
+    if let Some(rss) = rss_kb {
+        let rss_mb = rss as f64 / 1024.0;
+        // The SNI-only binary should be ~7-10 MB. Allow up to 20 MB as a
+        // headroom for debug allocations, env, etc. If this regresses,
+        // someone re-introduced a heavy library.
+        assert!(rss_mb < 20.0,
+                "RSS {rss_mb:.1} MB exceeds 20 MB target — investigate a possible heavy dependency");
+    }
 }

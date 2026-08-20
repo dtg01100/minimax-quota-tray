@@ -1,34 +1,31 @@
-//! Entry point. Wires together config, keyring, fetch, tray, scheduler.
+//! Entry point — tokio runtime, no GLib, no GTK.
 //!
-//! Threading: GLib main thread runs the Gtk main loop. HTTP runs on a
-//! background thread (reqwest blocking) and bounces results back via
-//! `glib::idle_add_once`. Tray is main-thread-only (gtk widgets aren't
-//! Send) and lives in a `thread_local!` slot accessed only from main-thread
-//! callbacks. AppState is shared between threads via `Arc<Mutex<>>`.
+//! Threading model: a tokio runtime runs an async refresh loop. The D-Bus
+//! connection (via zbus) handles its own I/O on the tokio reactor. No
+//! thread_local state — the SNI handle is shared via `Arc<Tray>`.
+//!
+//! Refresh schedule: a tokio task sleeps for the next interval, then runs
+//! the fetch on the same task. Adaptive intervals (yellow/2, red/4) +
+//! exponential backoff on errors live in `scheduler::next_interval`.
 
 mod burn;
 mod config;
 mod fetch;
-mod icon;
-mod indicator;
 mod keyring;
-mod notify;
 mod parse;
 mod scheduler;
-mod tray;
+mod sni;
 mod util;
 
-use gio;
-use glib;
-use gtk::prelude::*;
-use std::cell::RefCell;
-use std::sync::{Arc, Mutex};
+use anyhow::{Context, Result};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-use crate::burn::{BurnResult, Sample, Window};
+use crate::burn::{Sample, Window};
 use crate::config::Config;
-use crate::tray::{Tray, TrayState};
+use crate::sni::Tray;
 
-/// Per-window burn sample history. ~16h at 120s baseline. Cleared on rollover.
+/// Per-window burn sample history. ~16h at 120s baseline.
 const BURN_MAX_SAMPLES: usize = 480;
 
 #[derive(Default)]
@@ -38,256 +35,160 @@ struct AppState {
     last_good: Option<(Window, Window)>,
     last_good_at: i64,
     fail_streak: u32,
-    poll_source: Option<glib::SourceId>,
     http_client: Option<fetch::HttpClient>,
 }
 
-/// Main-thread-only slot holding the Tray. Gtk widgets are !Send, so we
-/// access Tray via this thread_local from main-thread callbacks.
-thread_local! {
-    static TRAY_SLOT: RefCell<Option<Tray>> = const { RefCell::new(None) };
-}
-
-fn with_tray<R>(f: impl FnOnce(&mut Tray) -> R) -> Option<R> {
-    TRAY_SLOT.with(|cell| cell.borrow_mut().as_mut().map(f))
-}
-
-fn main() {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .init();
 
-    if let Err(e) = run() {
+    if let Err(e) = run().await {
         eprintln!("fatal: {e:#}");
         std::process::exit(1);
     }
-}
-
-fn run() -> anyhow::Result<()> {
-    gtk::init()?;
-
-    let cfg = config::load_or_init()?;
-    TRAY_SLOT.with(|cell| *cell.borrow_mut() = Some(Tray::new(&cfg)));
-    let state = Arc::new(Mutex::new(AppState {
-        http_client: Some(fetch::build_client()?),
-        ..Default::default()
-    }));
-    let cfg = Arc::new(cfg);
-
-    // Refresh action — used by both menu and the poll timer.
-    let refresh_now = {
-        let state = Arc::clone(&state);
-        let cfg = Arc::clone(&cfg);
-        move || refresh(&state, &cfg)
-    };
-
-    let on_dashboard = {
-        let cfg = Arc::clone(&cfg);
-        move || {
-            if let Some(plan) = cfg.plans.get(&cfg.plan) {
-                if let Err(e) = gio::AppInfo::launch_default_for_uri(
-                    &plan.dashboard_url,
-                    None::<&gio::AppLaunchContext>,
-                ) {
-                    log::warn!("opening dashboard failed: {e}");
-                }
-            }
-        }
-    };
-
-    let on_set_key = {
-        let refresh_now = refresh_now.clone();
-        move || {
-            let dialog = gtk::Dialog::new();
-            dialog.set_title("Set MiniMax API Key");
-            dialog.add_button("Cancel", gtk::ResponseType::Cancel);
-            dialog.add_button("Save", gtk::ResponseType::Ok);
-            let entry = gtk::Entry::new();
-            entry.set_visibility(false);
-            entry.set_input_purpose(gtk::InputPurpose::Password);
-            let content = dialog.get_content_area();
-            content.add(&entry);
-            dialog.show_all();
-            let resp = dialog.run();
-            let text = entry.get_buffer().get_text().to_string();
-            dialog.close();
-            if resp == gtk::ResponseType::Ok && !text.is_empty() {
-                if let Err(e) = keyring::set(&text) {
-                    log::warn!("set key failed: {e}");
-                }
-                refresh_now();
-            }
-        }
-    };
-
-    let on_clear_key = {
-        let refresh_now = refresh_now.clone();
-        move || {
-            if let Err(e) = keyring::clear() {
-                log::warn!("clear key failed: {e}");
-            }
-            refresh_now();
-        }
-    };
-
-    let on_quit = {
-        let state = Arc::clone(&state);
-        move || {
-            if let Some(src) = state.lock().unwrap().poll_source.take() {
-                src.remove();
-            }
-            gtk::main_quit();
-        }
-    };
-
-    with_tray(|t| t.connect_signals(
-        refresh_now.clone(),
-        on_dashboard,
-        on_set_key,
-        on_clear_key,
-        on_quit,
-    ));
-
-    refresh_now();
-    gtk::main();
     Ok(())
 }
 
-/// Run a refresh cycle. The HTTP work happens on a background thread;
-/// this function (and its closure) runs on the main thread.
-fn refresh(state: &Arc<Mutex<AppState>>, cfg: &Arc<Config>) {
-    let cfg_v = (**cfg).clone();
-    let api_key = match keyring::get() {
-        Some(k) => k,
-        None => {
-            render_error(&cfg_v, "No API key — choose Set API Key…");
-            schedule_next(state, cfg_v.refresh_seconds * 1000);
-            return;
+async fn run() -> Result<()> {
+    let cfg = Arc::new(config::load_or_init()?);
+    let http_client = fetch::build_client().context("build HTTP client")?;
+    let state = Arc::new(Mutex::new(AppState {
+        http_client: Some(http_client),
+        ..Default::default()
+    }));
+    let tray = Arc::new(Tray::new().await.context("create SNI tray")?);
+
+    // Run an initial render so the icon appears immediately.
+    render_initial(&tray, &cfg).await;
+
+    // Spawn the refresh loop.
+    tokio::spawn(refresh_loop(cfg, state, tray));
+
+    // Wait for SIGINT/SIGTERM. tokio::signal handles both on Unix.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => log::info!("ctrl-c, exiting"),
+        _ = sigterm.recv() => log::info!("SIGTERM, exiting"),
+    }
+    Ok(())
+}
+
+/// Run the periodic refresh loop. Sleeps for the adaptive interval
+/// between fetches. Errors don't kill the loop — they just bump the
+/// backoff counter.
+async fn refresh_loop(
+    cfg: Arc<Config>,
+    state: Arc<Mutex<AppState>>,
+    tray: Arc<Tray>,
+) {
+    loop {
+        let interval_ms = do_refresh(&cfg, &state, &tray).await;
+        tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+    }
+}
+
+/// One refresh cycle: fetch → record samples → compute burn → render.
+/// Returns the next interval in milliseconds.
+async fn do_refresh(
+    cfg: &Config,
+    state: &Arc<Mutex<AppState>>,
+    tray: &Arc<Tray>,
+) -> u64 {
+    // secret-service internally spins up its own async runtime, which
+    // clashes with our tokio runtime. Run on a blocking thread.
+    let api_key = match tokio::task::spawn_blocking(keyring::get).await {
+        Ok(Some(k)) => k,
+        _ => {
+            render_error(tray, cfg, "No API key").await;
+            return cfg.refresh_seconds * 1000;
         }
     };
-    let endpoint = match cfg_v.plans.get(&cfg_v.plan) {
+    let endpoint = match cfg.plans.get(&cfg.plan) {
         Some(p) => p.endpoint.clone(),
         None => {
-            render_error(&cfg_v, &format!("Unknown plan: {}", cfg_v.plan));
-            schedule_next(state, cfg_v.refresh_seconds * 1000);
-            return;
+            render_error(tray, cfg, &format!("Unknown plan: {}", cfg.plan)).await;
+            return cfg.refresh_seconds * 1000;
         }
     };
-
     let client = {
-        let s = state.lock().unwrap();
-        s.http_client.clone()
-    };
-    let client = match client {
-        Some(c) => c,
-        None => {
-            render_error(&cfg_v, "HTTP client not initialized");
-            return;
+        let s = state.lock().await;
+        match &s.http_client {
+            Some(c) => c.clone(),
+            None => {
+                drop(s);
+                render_error(tray, cfg, "HTTP client not initialized").await;
+                return cfg.refresh_seconds * 1000;
+            }
         }
     };
 
-    let state_bg = Arc::clone(state);
-    let cfg_bg = Arc::clone(cfg);
+    // Fetch happens on the tokio thread; the reqwest blocking call is
+    // wrapped in spawn_blocking so we don't tie up the runtime worker.
+    let result = tokio::task::spawn_blocking(move || {
+        fetch::fetch_windows_blocking(&client, &endpoint, &api_key)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("fetch task panicked: {e}")));
 
-    // Fetch happens off-thread; result lands on main thread via idle_add_once.
-    // The closure captures only Send data (Arc<Mutex<AppState>> + Arc<Config>)
-    // and never references the Tray directly — that's accessed via with_tray()
-    // when render_state() runs (which IS on the main thread).
-    fetch::dispatch(client, endpoint, api_key, move |result| {
-        let mut s = state_bg.lock().unwrap();
-        let cfg_v = (*cfg_bg).clone();
-        let render = match result {
-            Ok((five_h, weekly)) => {
-                s.fail_streak = 0;
-                s.last_good = Some((five_h, weekly));
-                s.last_good_at = now_ms();
-
-                record_sample(&mut s.five_h_history, &five_h);
-                record_sample(&mut s.weekly_history, &weekly);
-
-                let burn_5h = compute_with_history(&five_h, &s.five_h_history, &cfg_v.burn_warning);
-                let burn_weekly = compute_with_history(&weekly, &s.weekly_history, &cfg_v.burn_warning);
-
-                let interval = scheduler::next_interval(
-                    cfg_v.refresh_seconds,
-                    cfg_v.refresh_max_backoff_seconds,
-                    s.last_good.map(|(w, _)| w.remaining_pct).unwrap_or(100),
-                    cfg_v.thresholds.yellow,
-                    cfg_v.thresholds.red,
-                    0,
-                );
-                let state_for_render = TrayState {
-                    cfg: &cfg_v,
-                    five_h: Some(five_h),
-                    weekly: Some(weekly),
-                    burn_5h,
-                    burn_weekly,
-                    error: None,
-                    throttled: false,
-                    now_ms: now_ms(),
-                };
-                drop(s);
-                (interval, state_for_render)
-            }
-            Err(e) => {
-                s.fail_streak = s.fail_streak.saturating_add(1);
-                let fail_streak = s.fail_streak;
-                let last_good = s.last_good;
-                let five_h_hist = s.five_h_history.clone();
-                let weekly_hist = s.weekly_history.clone();
-                let last_good_at = s.last_good_at;
-                drop(s);
-
-                let (burn_5h, burn_weekly, five_h, weekly) =
-                    if let Some((fh, wk)) = last_good {
-                        (
-                            compute_with_history(&fh, &five_h_hist, &cfg_v.burn_warning),
-                            compute_with_history(&wk, &weekly_hist, &cfg_v.burn_warning),
-                            Some(fh),
-                            Some(wk),
-                        )
-                    } else {
-                        (None, None, None, None)
-                    };
-
-                let err_str = e.to_string();
-                let age = now_ms() - last_good_at;
-                let state_for_render = TrayState {
-                    cfg: &cfg_v,
-                    five_h,
-                    weekly,
-                    burn_5h,
-                    burn_weekly,
-                    error: Some(if last_good.is_some() {
-                        format!("{err_str} (last good {} ago)", crate::util::fmt_age(age))
-                    } else {
-                        err_str
-                    }),
-                    throttled: false,
-                    now_ms: now_ms(),
-                };
-
-                let interval = scheduler::next_interval(
-                    cfg_v.refresh_seconds,
-                    cfg_v.refresh_max_backoff_seconds,
-                    last_good.map(|(w, _)| w.remaining_pct).unwrap_or(100),
-                    cfg_v.thresholds.yellow,
-                    cfg_v.thresholds.red,
-                    fail_streak,
-                );
-                (interval, state_for_render)
-            }
-        };
-        let (interval, state_for_render) = render;
-        render_state(state_for_render);
-        schedule_next(&state_bg, interval * 1000);
-    });
+    let mut s = state.lock().await;
+    match result {
+        Ok((five_h, weekly)) => {
+            s.fail_streak = 0;
+            s.last_good = Some((five_h, weekly));
+            s.last_good_at = now_ms();
+            record_sample(&mut s.five_h_history, &five_h);
+            record_sample(&mut s.weekly_history, &weekly);
+            let burn_5h = burn::decide_burn_row(
+                Some(&five_h), &s.five_h_history, now_ms(), &cfg.burn_warning);
+            let burn_weekly = burn::decide_burn_row(
+                Some(&weekly), &s.weekly_history, now_ms(), &cfg.burn_warning);
+            let pct = five_h.remaining_pct;
+            let icon = bucket_icon(pct, &cfg);
+            let title = title_for(&five_h, burn_5h.as_ref());
+            let interval = scheduler::next_interval(
+                cfg.refresh_seconds,
+                cfg.refresh_max_backoff_seconds,
+                pct, cfg.thresholds.yellow, cfg.thresholds.red, 0,
+            );
+            drop(s);
+            let _ = tray.update(&title, &icon, "Active").await;
+            interval * 1000
+        }
+        Err(e) => {
+            s.fail_streak = s.fail_streak.saturating_add(1);
+            let fail_streak = s.fail_streak;
+            let pct = s.last_good.map(|(w, _)| w.remaining_pct).unwrap_or(100);
+            let err_str = e.to_string();
+            drop(s);
+            render_error(tray, cfg, &err_str).await;
+            scheduler::next_interval(
+                cfg.refresh_seconds,
+                cfg.refresh_max_backoff_seconds,
+                pct, cfg.thresholds.yellow, cfg.thresholds.red, fail_streak,
+            ) * 1000
+        }
+    }
 }
 
-fn render_state(state: TrayState<'_>) {
-    with_tray(|t| t.update(state));
+async fn render_initial(tray: &Arc<Tray>, cfg: &Config) {
+    let has_key = tokio::task::spawn_blocking(keyring::get)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let title = if has_key {
+        "MiniMax: connecting…".to_string()
+    } else {
+        "MiniMax: no API key".to_string()
+    };
+    let _ = tray.update(&title, "dialog-information-symbolic", "Passive").await;
+    log::info!("started; plan={} (refresh every {}s)", cfg.plan, cfg.refresh_seconds);
 }
 
-fn render_error(_cfg: &Config, msg: &str) {
+async fn render_error(tray: &Arc<Tray>, _cfg: &Config, msg: &str) {
+    let title = format!("MiniMax: {msg}");
+    let _ = tray.update(&title, "dialog-error-symbolic", "Active").await;
     log::warn!("{msg}");
 }
 
@@ -297,9 +198,7 @@ fn record_sample(history: &mut Vec<Sample>, w: &Window) {
         let rolled = w.start_at != last.start_at
             || w.used + 1 < last.used
             || w.remaining_pct + 1 < last.remaining_pct;
-        if rolled {
-            history.clear();
-        }
+        if rolled { history.clear(); }
     }
     history.push(Sample {
         t: now_ms(),
@@ -315,27 +214,56 @@ fn record_sample(history: &mut Vec<Sample>, w: &Window) {
     }
 }
 
-fn compute_with_history(w: &Window, history: &[Sample], cfg: &burn::BurnConfig) -> Option<BurnResult> {
-    burn::decide_burn_row(Some(w), history, now_ms(), cfg)
+/// Pick a theme icon name based on the bucket.
+fn bucket_icon(remaining_pct: i64, cfg: &Config) -> String {
+    let used = 100 - remaining_pct;
+    if used >= cfg.thresholds.red {
+        "dialog-error-symbolic".to_string()
+    } else if used >= cfg.thresholds.yellow {
+        "dialog-warning-symbolic".to_string()
+    } else {
+        "dialog-information-symbolic".to_string()
+    }
 }
 
-fn schedule_next(state: &Arc<Mutex<AppState>>, ms: u64) {
-    let mut s = state.lock().unwrap();
-    if let Some(prev) = s.poll_source.take() {
-        prev.remove();
+/// Build the title text — what shows next to the icon in the tray.
+fn title_for(w: &Window, burn: Option<&burn::BurnResult>) -> String {
+    let base = format!("MiniMax: {}%", w.remaining_pct);
+    match burn {
+        Some(b) if b.rate_per_hour > 0.0 && b.exhaust_before_reset => {
+            // Warn about exhaustion.
+            let mins = (b.exhaust_ms / 60_000.0).max(0.0) as i64;
+            let when = if mins < 60 {
+                format!("{}m", mins)
+            } else {
+                format!("{}h {}m", mins / 60, mins % 60)
+            };
+            if b.unit == "pct" {
+                format!("MiniMax: {}% ⚠ exhausts in {}", w.remaining_pct, when)
+            } else {
+                let r = if b.rate_per_hour >= 1000.0 {
+                    format!("{:.1}k", b.rate_per_hour / 1000.0)
+                } else {
+                    format!("{:.0}", b.rate_per_hour)
+                };
+                format!("MiniMax: {}% ⚠ {}/h exhausts in {}", w.remaining_pct, r, when)
+            }
+        }
+        Some(b) if b.rate_per_hour > 0.0 => {
+            // Show burn rate inline.
+            if b.unit == "pct" {
+                format!("MiniMax: {}% ({:.0}%/h)", w.remaining_pct, b.rate_per_hour)
+            } else {
+                let r = if b.rate_per_hour >= 1000.0 {
+                    format!("{:.1}k", b.rate_per_hour / 1000.0)
+                } else {
+                    format!("{:.0}", b.rate_per_hour)
+                };
+                format!("MiniMax: {}% ({} tok/h)", w.remaining_pct, r)
+            }
+        }
+        _ => base,
     }
-    let state_wk = Arc::clone(state);
-    let id = glib::timeout_add_local(
-        std::time::Duration::from_millis(ms),
-        move || {
-            // Rebuild cfg by reading from disk. Cheap (Config::load() is a
-            // small JSON read); avoids holding a long-lived Arc in the closure.
-            let cfg = config::load();
-            refresh(&state_wk, &Arc::new(cfg));
-            glib::ControlFlow::Continue
-        },
-    );
-    s.poll_source = Some(id);
 }
 
 fn now_ms() -> i64 {

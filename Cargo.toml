@@ -6,32 +6,24 @@ description = "GNOME tray indicator for MiniMax quota — Rust port of the gjs o
 license = "MIT"
 
 [dependencies]
-# GUI
-gtk = { version = "0.9", features = ["v3_24"] }
-glib = "0.20"
-gio = "0.20"
+# StatusNotifierItem over the session D-Bus — pure Rust via zbus.
+# Works on GNOME (with AppIndicator extension), KDE, XFCE, etc. No more
+# GTK / libappindicator dependency.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 # Async / HTTP / JSON
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "blocking", "json"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "blocking"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# System / keyring / etc.
+# Keyring — Secret Service (freedesktop, not GNOME-specific).
 secret-service = { version = "3", features = ["rt-tokio-crypto-rust"] }
-keyring = { version = "3", features = ["linux-native"] }   # fallback
-dirs = "5"
+
 anyhow = "1"
 thiserror = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 log = "0.4"
 env_logger = "0.11"
-notify-rust = "4.18.0"
-# StatusNotifierItem — minimal FFI to libayatana-appindicator.so loaded via
-# libloading. Avoids the gtk version mismatch that the official
-# libayatana-appindicator crate has (it pulls in gtk 0.15). We only need
-# ~4 symbols out of the ~50 the library exports.
-libloading = "0.8"
 
 [dev-dependencies]
 approx = "0.5"

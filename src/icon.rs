@@ -102,15 +102,26 @@ pub fn render_pixmap(pct: i64, bucket: Bucket) -> Option<(u32, u32, Vec<u8>)> {
     // resvg 0.48: render(tree, transform, &mut pixmap) — fits to pixmap size.
     resvg::render(&tree, resvg::tiny_skia::Transform::default(), &mut pixmap.as_mut());
 
-    // Convert RGBA → ARGB32 in memory order (SNI's expected byte layout).
-    let mut argb = Vec::with_capacity((ICON_SIZE * ICON_SIZE * 4) as usize);
+    // Convert RGBA → host-endian uint32 layout (BGRA bytes on x86).
+    //
+    // The SNI spec says "ARGB32 in network byte order" — but the actual
+    // reference implementations (KDE plasma's kstatusnotifieritem, the
+    // gjs appindicator extension's Cogl pipeline) all pass the bytes in
+    // *host-endian* uint32 order, which is `[B, G, R, A]` on little-endian
+    // (x86) and `[A, R, G, B]` on big-endian. The receiving end
+    // (Cogl's ARGB_8888 → Cairo → GdkPixbuf) interprets the bytes as a
+    // native uint32, so we must send the host layout — otherwise alpha
+    // gets swapped with blue and the icon becomes mostly transparent,
+    // which Cogl/the watcher report as a missing icon (the "three dots"
+    // placeholder).
+    let mut out = Vec::with_capacity((ICON_SIZE * ICON_SIZE * 4) as usize);
     for pixel in pixmap.pixels() {
-        argb.push(pixel.alpha());
-        argb.push(pixel.red());
-        argb.push(pixel.green());
-        argb.push(pixel.blue());
+        out.push(pixel.blue());
+        out.push(pixel.green());
+        out.push(pixel.red());
+        out.push(pixel.alpha());
     }
-    Some((ICON_SIZE, ICON_SIZE, argb))
+    Some((ICON_SIZE, ICON_SIZE, out))
 }
 
 /// Cache key — bucket + remaining pct. We round pct to a step so we
@@ -162,12 +173,33 @@ mod tests {
     }
 
     #[test]
-    fn render_pixmap_has_some_non_zero_alpha() {
+    fn render_pixmap_has_visible_pixels() {
         // The track circle should make most pixels at least partially visible.
+        // On host-endian (x86 = BGRA bytes per pixel), the alpha channel
+        // is the LAST byte of each 4-byte group. Cogl/GTK interprets these
+        // bytes as a host uint32.
         let (_w, _h, bytes) = render_pixmap(50, Bucket::Normal).unwrap();
         let any_visible = bytes.chunks_exact(4)
             .any(|px| px[3] > 0);
-        assert!(any_visible, "rendered pixmap should have visible pixels");
+        assert!(any_visible, "rendered pixmap should have visible pixels (alpha > 0)");
+    }
+
+    #[test]
+    fn render_pixmap_byte_order_is_host_endian() {
+        // The receiving Cogl pipeline reads the bytes as a host-endian
+        // uint32 in ARGB_8888 format. On x86 (little-endian), the in-memory
+        // byte order is BGRA: [B, G, R, A]. Verify the ring-fill pixels
+        // have the right bytes in that order.
+        //
+        // Ring color is #a8d1a3 (RGB = 168, 209, 163) at 100% fill, so we
+        // expect at least one pixel with B=0xa3, G=0xd1, R=0xa8, A=0xff.
+        let (_w, _h, bytes) = render_pixmap(100, Bucket::Normal).unwrap();
+        let any_ring_pixel = bytes.chunks_exact(4)
+            .any(|px| {
+                px[0] == 0xa3 && px[1] == 0xd1 && px[2] == 0xa8 && px[3] == 0xff
+            });
+        assert!(any_ring_pixel,
+                "expected at least one BGRA pixel (0xa3, 0xd1, 0xa8, 0xff) in the 100% fill ring");
     }
 
     #[test]

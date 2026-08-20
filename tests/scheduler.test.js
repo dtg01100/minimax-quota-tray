@@ -884,6 +884,141 @@ await test('T20: idle Coding-Plan user (total=0) labels the row with %/h, not to
   });
 });
 
+// Pct-only providers (Coding Plan, anything returning 0/0 for token counts)
+// suppress the burn row when ratePerHour === 0. At 120s polls, a weekly
+// user's per-poll drop is ~0.01–0.05%, well below 1% precision — the percent
+// barely ticks and the slope is meaningless. Token-counting providers
+// compute their rate from real count deltas, so the suppression only fires
+// for pct-only providers, never for token plans. Verifies the menu-level
+// suppression rule via decideBurnRow() (computeBurn() still returns an
+// object; updateMenu() filters it out for pct-only idle windows).
+await test('T21: pct-only burn row suppression — weekly + idle 5h hidden, active 5h + token plans shown', async () => {
+  reset();
+  app.__test.setConfig({
+    ...TEST_CONFIG,
+    burn_warning: { enabled: true, min_history_ms: 1, lookback_ms: 3600e3, use_epoch_average: true },
+  });
+  await withClock(1700000000000, async ({ now, advance }) => {
+    // Build up history with live Coding Plan shape (total/used = 0 for
+    // both windows, remaining_pct dropping on 5h, flat on weekly).
+    // start_time and weekly_start_time are hoisted out of the loop so the
+    // rollover detector in recordBurnSample doesn't fire on every iteration
+    // (it would see the epoch "advance" by 2 min each poll and clear the
+    // history). The real API returns the same start_time for the whole epoch.
+    const fiveHrStart = now() - 30 * 60e3;
+    const weeklyEpoch = now() - 2 * 86400e3;
+    for (let i = 0; i < 5; i++) {
+      const fiveHrRemaining = 80 - i * 1;        // 5h ticks down 1%/2min
+      const weeklyRemaining = 90;                // weekly flat — integer precision kills it
+      app.__test.refresh(true);
+      const payload = {
+        model_remains: [{
+          model_name: 'general',
+          current_interval_total_count: 0,
+          current_interval_usage_count: 0,
+          current_interval_remaining_percent: fiveHrRemaining,
+          start_time: fiveHrStart,
+          remains_time: 4 * 3600e3 - i * 2 * 60e3,
+          current_interval_status: 1,
+          current_weekly_total_count: 0,
+          current_weekly_usage_count: 0,
+          current_weekly_remaining_percent: weeklyRemaining,
+          weekly_start_time: weeklyEpoch,
+          weekly_remains_time: 5 * 86400e3 - i * 2 * 60e3,
+          current_weekly_status: 1,
+        }],
+      };
+      assert(pendingResolvers.length > 0, `expected pending fetch at iteration ${i}`);
+      pendingResolvers.shift()(payload);
+      await flush();
+      if (i < 4) advance(2 * 60e3);
+    }
+    // 5h is now non-zero rate (pct ticks down each poll); weekly is flat.
+    assert(app.__test.getBurnHistory('5h').length === 5, '5h: 5 samples recorded');
+    assert(app.__test.getBurnHistory('weekly').length === 5, 'weekly: 5 samples recorded');
+    const fiveH = { id: '5h', total: 0, used: 0,
+                    startAt: fiveHrStart, resetAt: now() + 4 * 3600e3 - 8 * 60e3,
+                    remaining_pct: 76 };
+    const week = { id: 'weekly', total: 0, used: 0,
+                   startAt: weeklyEpoch, resetAt: now() + 5 * 86400e3 - 8 * 60e3,
+                   remaining_pct: 90 };
+    assert(app.__test.burnRowVisible(fiveH) === true,
+      'pct-only 5h with active ticks: burn row visible');
+    assert(app.__test.burnRowVisible(week) === false,
+      'pct-only weekly (flat at integer): burn row suppressed even with history');
+  });
+
+  // Token Plan: 5h active. Rate is non-zero (used grows). Row shown.
+  reset();
+  await withClock(1700000000000, async ({ now, advance }) => {
+    const epochStart = now() - 30 * 60e3;
+    for (let i = 0; i < 3; i++) {
+      app.__test.refresh(true);
+      resolveNext(burnPayload({ used: 100 + i * 20, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+      await flush();
+      if (i < 2) advance(10 * 60e3);
+    }
+    assert(app.__test.getBurnHistory('5h').length === 3, 'token-plan 5h: 3 samples');
+    const last = app.__test.getBurnHistory('5h').slice(-1)[0];
+    const w = { id: '5h', total: last.total, used: last.used,
+                startAt: last.startAt, resetAt: last.resetAt, remaining_pct: last.remainingPct };
+    assert(app.__test.burnRowVisible(w) === true, 'token-plan 5h active: burn row visible');
+  });
+
+  // Token Plan: 5h idle (used unchanged, rate=0, unit='token'). Row still
+  // shown — the suppression is for pct-only idle, not token idle.
+  reset();
+  await withClock(1700000000000, async ({ now, advance }) => {
+    const epochStart = now() - 30 * 60e3;
+    for (let i = 0; i < 3; i++) {
+      app.__test.refresh(true);
+      resolveNext(burnPayload({ used: 100, startTime: epochStart, remainsMs: 3 * 3600e3 }));
+      await flush();
+      if (i < 2) advance(10 * 60e3);
+    }
+    assert(app.__test.getBurnHistory('5h').length === 3, 'token-plan 5h idle: 3 samples');
+    const last = app.__test.getBurnHistory('5h').slice(-1)[0];
+    const w = { id: '5h', total: last.total, used: last.used,
+                startAt: last.startAt, resetAt: last.resetAt, remaining_pct: last.remainingPct };
+    assert(app.__test.burnRowVisible(w) === true, 'token-plan 5h idle: row still shown (unit=token)');
+  });
+
+  // Coding Plan: 5h idle (pct flat, rate=0, unit='pct'). Row suppressed.
+  reset();
+  await withClock(1700000000000, async ({ now, advance }) => {
+    const fiveHrStart = now() - 30 * 60e3;
+    for (let i = 0; i < 3; i++) {
+      app.__test.refresh(true);
+      const payload = {
+        model_remains: [{
+          model_name: 'general',
+          current_interval_total_count: 0,
+          current_interval_usage_count: 0,
+          current_interval_remaining_percent: 100,   // flat — idle
+          start_time: fiveHrStart,
+          remains_time: 5 * 3600e3 - i * 2 * 60e3,
+          current_interval_status: 1,
+          current_weekly_total_count: 0,
+          current_weekly_usage_count: 0,
+          current_weekly_remaining_percent: 100,
+          weekly_remains_time: 6 * 86400e3,
+          current_weekly_status: 1,
+        }],
+      };
+      assert(pendingResolvers.length > 0, `expected pending fetch at iteration ${i}`);
+      pendingResolvers.shift()(payload);
+      await flush();
+      if (i < 2) advance(2 * 60e3);
+    }
+    assert(app.__test.getBurnHistory('5h').length === 3, 'pct-only 5h idle: 3 samples');
+    const last = app.__test.getBurnHistory('5h').slice(-1)[0];
+    const w = { id: '5h', total: last.total, used: last.used,
+                startAt: last.startAt, resetAt: last.resetAt, remaining_pct: last.remainingPct };
+    assert(app.__test.burnRowVisible(w) === false,
+      'pct-only 5h idle (rate=0): row suppressed — no signal is no info');
+  });
+});
+
 await test('T8: failed fetch shows the error row, backs off, stays single-flight', async () => {
   reset();
   fetchMode = 'reject';

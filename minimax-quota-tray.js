@@ -335,7 +335,7 @@ function fmtRate(tokensPerHour) {
 // The quota windows are fixed-length epochs (start_time / end_time /
 // remains_time), so `used` grows monotonically inside an epoch and resets
 // at the boundary. recordBurnSample() appends one sample per successful
-// refresh and clears the per-window history on epoch rollover; computeBurn()
+// refresh and clears that window's history on epoch rollover; computeBurn()
 // forms the rate as max(recent slope, whole-epoch average) and projects
 // whether the trend exhausts the window before it resets.
 //
@@ -343,7 +343,6 @@ function fmtRate(tokensPerHour) {
 // with very different lengths and reset cadences. Sharing one history
 // between them would let a 5h window's samples pollute the weekly rate
 // (and vice versa). The window id is its stable label ('5h', 'weekly');
-
 // if a provider renames or reorders them, the projection simply doesn't
 // fire for the new label rather than misprojecting.
 
@@ -423,6 +422,11 @@ function slopePerHour(samples, key) {
 // from `burnHistory.get(window.id)`). Computing a 5h rate from a weekly
 // history would read like a steep burn (weekly usage is heavy) and a
 // weekly rate from a 5h history would look idle for most of the week.
+//
+// Pct-only providers (Coding Plan and any provider whose count fields
+// are 0/0) only get a burn row when there's actual signal — see
+// updateMenu()'s suppression rule. The window still gets a sample history
+// recorded (so token-based providers retain per-window projections).
 function computeBurn(window, history) {
   if (!window) return null;
   if (!history) return null;
@@ -573,10 +577,35 @@ let _lastBucket = null;
 // Each window's samples are taken on every successful refresh, within the
 // current window epoch, cleared on epoch rollover. Drives the per-window
 // ⚠ burn-rate row and the chip's warning flip when the primary window's
-// trend projects exhaustion before reset.
+// trend projects exhaustion before reset. Pct-only providers (Coding
+// Plan and any provider returning 0/0 for token counts) suppress the
+// burn row when there's no usable signal — see updateMenu().
 // 480 samples ≈ 16h at the 120s baseline, 2h at the 15s urgent floor —
 // always covers the 1h recent-slope lookback and then some.
 const BURN_MAX_SAMPLES = 480;
+// Decision: should the burn row for `window` be shown? Extracted so the
+// renderer (updateMenu) and the test harness (without a real Gtk display)
+// can both run the same rule without duplicating it. Returns:
+//   null — not enough data to compute a burn (no row)
+//   { showBurn: true|false, burn } — showBurn is the suppression decision;
+//     burn is the raw computeBurn() result for label rendering when shown
+//
+// The pct-only suppression rule is the user-facing reason this helper
+// exists: pct-only providers (Coding Plan and any provider whose count
+// fields are 0/0) can't fit a meaningful slope at weekly scale — at
+// 120s polls, per-poll drops are ~0.01–0.05% on weekly usage, well below
+// the 1% precision of *_remaining_percent. The window produces a rate=0
+// idle row even while the user is actively consuming (the percent just
+// hasn't crossed a 1% boundary yet); "0%/h" on a window that hasn't
+// ticked is misleading, not informative. Suppress it. Token-counting
+// providers (Token Plan, anything with real count fields) compute their
+// rate from actual token deltas, so the rule never fires for them.
+function decideBurnRow(window, stale, offline) {
+  const burn = (!stale && !offline) ? computeBurn(window, burnHistory.get(window.id)) : null;
+  if (!burn) return null;
+  const showBurn = !(burn.unit === 'pct' && burn.ratePerHour === 0);
+  return { showBurn, burn };
+}
 // Clock seam for the burn-rate projection. The projection is time-based
 // (sample timestamps, epoch averages, reset countdowns), and the test
 // harness substitutes a fake clock so the math is deterministic. Stubbing
@@ -754,8 +783,11 @@ function setChip({ windows, error, fetching, offline }) {
     // Burn flip only with fresh data — same gate as the menu row, so the
     // chip never warns from a stale payload + current history (an outage
     // spanning a rollover would otherwise flip it on garbage). The chip
-    // only reflects the primary window's burn; the weekly window's row
-    // (in the menu) can warn independently.
+    // only reflects the primary window's burn (windows[0], by convention
+    // the 5h interval). Suppressed pct-only idle rows don't affect the
+    // chip — computeBurn() still returns an object for them, the chip's
+    // bucketForChip only fires on exhaustBeforeReset which is naturally
+    // false at rate=0.
     const burn = (!error && !offline) ? computeBurn(primary, burnHistory.get(primary.id)) : null;
     bucket = bucketForChip(primary, burn);
     const color = RING_COLOR[bucket];
@@ -939,15 +971,26 @@ function updateMenu({ windows, error, lastGood, lastGoodAt, offline }) {
       // Only with fresh data — never while stale/offline, when the trend
       // would mislead. Each window's row is computed from its own history
       // (different roles: 5h drives the chip flip, weekly is informational).
-      const burn = (!stale && !offline) ? computeBurn(w, burnHistory.get(w.id)) : null;
-      if (burn) {
+      //
+      // Pct-only providers (Coding Plan, anything returning 0/0 for token
+      // counts): the integer *_remaining_percent field doesn't tick often
+      // enough to fit a meaningful slope over the 1h lookback at typical
+      // consumption rates. The window can produce a pctRate=0 idle row
+      // even while the user is actively consuming — the percent just
+      // hasn't crossed a 1% boundary yet. Suppress the row in that case;
+      // a "0%/h" label on a window that hasn't ticked is misleading, not
+      // informative. Token-counting providers (Token Plan, anything with
+      // real count fields) keep the row — their rate is computed from
+      // actual token deltas and stays meaningful at any window length.
+      const decision = decideBurnRow(w, stale, offline);
+      if (decision && decision.showBurn) {
         let burnRow = _menuItems.burnRows.get(w.id);
         if (!burnRow) {
           burnRow = new Gtk.MenuItem({ label: '' });
           burnRow.set_sensitive(false);
           _menuItems.burnRows.set(w.id, burnRow);
         }
-        burnRow.set_label(burnRowLabel(burn));
+        burnRow.set_label(burnRowLabel(decision.burn));
         menu.insert(burnRow, throttledIdx);
         throttledIdx += 1;
         burnRow.show();
@@ -1209,6 +1252,24 @@ export const __test = {
     const h = burnHistory.get(key);
     return h ? h.slice() : [];
   },
+  // True iff a burn row for `id` was shown in the most recent updateMenu()
+  // call. Tests use this to verify suppression decisions (pct-only idle
+  // windows, weekly pct-only with no signal, etc.) without depending on
+  // Gtk widget state. The decision is recorded by updateMenu() after
+  // running the suppression rule — see the comment there.
+  // True iff the suppression rule in decideBurnRow() would let the burn row
+  // for `window` through. The test harness intercepts _hooks.updateMenu (so
+  // the real updateMenu() never runs there), which means there's no automatic
+  // state to inspect. This seam runs decideBurnRow() directly against the
+  // same window state updateMenu() would receive, letting tests verify the
+  // suppression rule without a real Gtk display.
+  burnRowVisible: (window) => {
+    if (!window) return false;
+    const w = typeof window === 'string' ? { id: window } : window;
+    const decision = decideBurnRow(w, false, false);
+    return !!(decision && decision.showBurn);
+  },
+  decideBurnRow,
   setNow(fn) { nowFn = fn || Date.now; },
   // Fires the armed poll timeout exactly as GLib would (same teardown, same
   // refresh() call), so tests drive the loop deterministically instead of

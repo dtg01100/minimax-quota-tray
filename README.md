@@ -19,7 +19,6 @@ Talks directly to the MiniMax API — no agent or plugin system required.
     · on pace to have ~62% left at reset (15%/h)
     weekly: 100% left · resets in 6d 8h
     ███████████████████████
-    · on pace to have ~96% left at reset (1%/h)
     ───
     Refresh now
     Open dashboard
@@ -27,11 +26,12 @@ Talks directly to the MiniMax API — no agent or plugin system required.
     ───
     Quit
   ```
-- **Burn-rate rows** — once the tray has ~10 minutes of polling history
-  for a window, it estimates the burn rate using that window's own sample
-  history, and a row under the window's bar always shows the projection.
-  The 5h and weekly windows each get their own row, computed independently
-  — a quiet 5h window doesn't pollute the weekly rate, and vice versa.
+- **Burn-rate row** — once the tray has ~10 minutes of polling history
+  for a window, it estimates the burn rate from that window's own sample
+  history, and a row under the window's bar shows the projection. Each
+  window has its own history — a quiet 5h window doesn't pollute the
+  weekly rate, and vice versa. The 5h window's row is the one that drives
+  the chip's warning flip; other windows' rows are informational.
   - healthy (token-based plan): `· on pace to have ~48% left at reset (40 tok/h)`
   - healthy (Coding Plan, pct-based): `· on pace to have ~62% left at reset (15%/h)`
     *(verified live 2026-08-18: the Coding Plan returns
@@ -40,12 +40,18 @@ Talks directly to the MiniMax API — no agent or plugin system required.
     Both windows track consumption via `*_remaining_percent` only, so
     the rate is %/h on the Coding Plan. Token plans / any provider that
     exposes real count fields will use the `tok/h` variant.)*
-  - idle (no recent token usage): `· on pace to have ~98% left at reset (0 tok/h)`
+  - **Pct-only windows with no signal are suppressed** — on the Coding
+    Plan at 120s polls, per-poll drops are ~0.01–0.05% on weekly usage,
+    well below the 1% precision of `*_remaining_percent`. The percent
+    barely ticks, so the slope over the 1h lookback is meaningless. A
+    pct-only window only gets a row when its rate is non-zero (i.e. the
+    percent has actually crossed a 1% boundary recently). Token-counting
+    providers keep the row for all windows — their rate is computed from
+    real count deltas, which stays meaningful at any window length.
   - warning (projected exhaustion before reset):
     `⚠ 1.2k tok/h → exhausts ~1h 5m before reset` (or `⚠ 60%/h → exhausts ~22m before reset`)
     — and the top-bar chip flips to the warning color based on the 5h window
-    alone, even when the remaining-% thresholds look fine. The weekly row
-    can warn independently of the chip.
+    alone, even when the remaining-% thresholds look fine.
 
   The projection resets on every window rollover; it's an estimate, not a
   promise — bursty usage will make it conservative or optimistic accordingly.
@@ -110,7 +116,10 @@ projected-% at reset label, and the chip bucket flip — driven under a
 stubbed clock so the slope math is deterministic). The burn-rate
 coverage exercises both windows independently: T18 verifies the weekly
 rate is computed from weekly samples (a quiet 5h doesn't pollute it),
-and T19 verifies the 5h rollover does not clear the weekly history.
+T19 verifies the 5h rollover does not clear the weekly history, and T21
+verifies the pct-only suppression rule — pct-only windows with no signal
+(skip the weekly row on Coding Plan, skip idle 5h on any pct-only API)
+while token-counting providers keep the row for all windows.
 
 `tests/regression-scheduler.test.js` documents the bug this guards against:
 it runs a faithful replica of the pre-fix scheduler (extracted from commit
@@ -164,13 +173,21 @@ if the cancel-before-arm logic is ever removed.
   bar — informational (`on pace to have ~X% left at reset`) whenever
   there's enough data, switching to a `⚠` warning when the trend projects
   the window exhausting before it resets. Each window (5h, weekly) gets
-  its own row, computed from its own history — a quiet 5h window does not
-  pollute the weekly rate. The 5h window's warning also flips the chip
-  to yellow. The rate is the max of the recent slope over `lookback_ms`
-  (default 1h) and the whole-epoch average; set `use_epoch_average: false`
-  to react to short-term spikes only. `enabled: false` turns the feature
-  off entirely. Note the projection needs history — it appears ~10 min
-  after startup and resets on every window rollover (per window).
+  its own history so a quiet 5h window does not pollute the weekly rate.
+  The 5h window's warning also flips the chip to yellow. The rate is the
+  max of the recent slope over `lookback_ms` (default 1h) and the
+  whole-epoch average; set `use_epoch_average: false` to react to
+  short-term spikes only. `enabled: false` turns the feature off entirely.
+  Note the projection needs history — it appears ~10 min after startup
+  and resets on every window rollover (per window).
+  **Pct-only suppression:** on providers whose count fields are 0/0
+  (Coding Plan and any pct-only API), the integer-percent signal can't
+  fit a meaningful slope at weekly scale — per-poll drops are ~0.01–0.05%
+  on weekly usage, well below 1% precision. A pct-only window only gets
+  a row when its rate is actually non-zero. The 5h window keeps the row
+  whenever there's been a recent tick; the weekly row stays hidden on
+  Coding Plan. Token-counting providers keep the row for all windows
+  since their rate is computed from real count deltas.
 - **Polling cadence** — `refresh_seconds` is the baseline (default 120s, peer-aligned).
   The actual interval is adaptive: when remaining quota drops below the
   yellow threshold, polls speed up to `refresh_seconds / 2`; below the

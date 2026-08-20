@@ -5,27 +5,44 @@
 //! No more ImageMagick / disk caching / external processes — entirely
 //! in-memory, entirely in Rust.
 //!
-//! The icon shape itself mirrors the gjs original: a circular ring
-//! stroked with the bucket color, with the unfilled portion shown in
-//! dark grey. The filled percentage is the remaining quota percent.
+//! The icon shape mirrors the gjs original: a ring (the remaining %
+//! shown as a stroked arc around a center dot) layered on top of a
+//! faded full-circle "track" so the unfilled portion reads as the same
+//! color at 25% opacity, not as a contrasting grey. Round caps on the
+//! progress arc terminate cleanly. The dasharray is corrected by half a
+//! stroke-width so the visible rounded cap aligns where the dasharray
+//! says (otherwise round caps overshoot and the arc visibly extends past
+//! the 12-o'clock start point at pct=100).
+//!
+//! Colors are pinned to the gjs `RING_COLOR` table so the rendered icon
+//! matches what the gjs version produced: same green / yellow / red.
 
 use anyhow::Result;
 use usvg::{Options, Tree};
 
-/// Colors per bucket (matches the gjs `RING_COLOR`).
+/// Colors per bucket — must match the gjs `RING_COLOR` table in
+/// `minimax-quota-tray.js`. Same hex, same role. The throttled color is
+/// the same red as the static `quota-throttled.svg` dot so the ring and
+/// the static fallback look identical.
 const RING_COLOR: &[(&str, &str)] = &[
-    ("normal", "#a8d1a3"),     // pastel green
-    ("warning", "#f0c674"),    // amber
-    ("throttled", "#e57373"),  // red
+    ("normal", "#3a9d4d"),     // gjs RING_COLOR.normal
+    ("warning", "#f6d32d"),    // gjs RING_COLOR.warning
+    ("throttled", "#e01b24"),  // matches icons/quota-throttled.svg
 ];
 
-const TRACK_COLOR: &str = "#3a3a3a";  // dark grey for the unfilled portion
-
-/// Icon dimensions — must match what StatusNotifierItem expects (22×22
-/// is the standard symbolic icon size).
+/// Icon dimensions — 22×22 is the standard symbolic icon size and matches
+/// the gjs version (its `viewBox` is 0 0 22 22).
 const ICON_SIZE: u32 = 22;
+/// Outer ring radius — matches gjs (`<circle r="9">`).
 const RING_RADIUS: f32 = 9.0;
-const RING_STROKE: f32 = 3.0;
+/// Outer ring stroke width — matches gjs `stroke-width="2.5"`.
+const RING_STROKE: f32 = 2.5;
+/// Center dot radius — matches gjs `<circle r="3.5" fill="${color}">`.
+const INNER_DOT_RADIUS: f32 = 3.5;
+/// Track opacity — gjs uses `stroke-opacity="0.25"` so the unfilled
+/// portion reads as the same color faded into the background, not as a
+/// separate dark grey that fights the panel theme.
+const TRACK_OPACITY: f32 = 0.25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bucket {
@@ -66,20 +83,41 @@ fn bucket_name(b: Bucket) -> &'static str {
     }
 }
 
-/// SVG template for the ring icon. `pct` is the percentage of the ring
-/// that's filled (i.e., remaining quota %). The unfilled portion is the
-/// dark track color.
+/// SVG template for the ring icon — three layers, identical to the gjs
+/// `renderRingSvg()` output so the resvg-rendered icon matches what the
+/// gjs version produced via `magick -density 600`:
+///
+///   1. Faded full-circle track (`stroke` = color, `stroke-opacity`
+///      = 0.25). Same color as the progress arc, so the unfilled
+///      portion reads as "this much left" rather than as a separate
+///      grey ring that fights the panel theme.
+///   2. Progress arc (`stroke` = color, `stroke-linecap` = "round",
+///      `stroke-dasharray` = `(arc - halfStroke) (circumference -
+///      arc + halfStroke)`). The dasharray correction compensates for
+///      one round cap so the visible rounded terminus aligns with the
+///      12-o'clock start at pct=100 and the tail sits cleanly at
+///      pct<100 — matches gjs `arc - halfStroke`.
+///   3. Inner dot (`r=3.5`, `fill` = color). The dot is what makes the
+///      icon read as "ring with center" instead of an empty arc — the
+///      gjs version draws it explicitly; without it, the panel
+///      background shows through the middle and the icon looks like
+///      a thin curved line.
 fn svg_for(pct: i64, color: &str) -> String {
-    // Circumference of the ring at r=9.
-    let circ = 2.0 * std::f32::consts::PI * 9.0;
+    let circ = 2.0 * std::f32::consts::PI * RING_RADIUS;
     let filled = (pct.clamp(0, 100) as f32 / 100.0) * circ;
-    let remaining = circ - filled;
+    // Round caps add ~half a stroke-width to each visible end, so the
+    // foreground arc visually overshoots its dasharray length. Subtract
+    // halfStroke so the visible rounded cap lands where the dasharray
+    // specifies (matches gjs `arc - halfStroke`).
+    let half_stroke = RING_STROKE / 2.0;
+    let fg_arc = (filled - half_stroke).max(0.0);
+    let fg_rest = circ - fg_arc;
     format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{ICON_SIZE}" height="{ICON_SIZE}" viewBox="0 0 {ICON_SIZE} {ICON_SIZE}">
-  <circle cx="11" cy="11" r="{RING_RADIUS}" fill="none" stroke="{TRACK_COLOR}" stroke-width="{RING_STROKE}"/>
-  <circle cx="11" cy="11" r="{RING_RADIUS}" fill="none" stroke="{color}" stroke-width="{RING_STROKE}"
-          stroke-dasharray="{filled:.3} {remaining:.3}" stroke-linecap="round"
-          transform="rotate(-90 11 11)"/>
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {ICON_SIZE} {ICON_SIZE}" width="{ICON_SIZE}" height="{ICON_SIZE}">
+  <circle cx="11" cy="11" r="{RING_RADIUS}" fill="none" stroke="{color}" stroke-width="{RING_STROKE}" stroke-opacity="{TRACK_OPACITY}"/>
+  <circle cx="11" cy="11" r="{RING_RADIUS}" fill="none" stroke="{color}" stroke-width="{RING_STROKE}" stroke-linecap="round"
+          stroke-dasharray="{fg_arc:.3} {fg_rest:.3}" transform="rotate(-90 11 11)"/>
+  <circle cx="11" cy="11" r="{INNER_DOT_RADIUS}" fill="{color}"/>
 </svg>"#
     )
 }
@@ -145,11 +183,81 @@ mod tests {
 
     #[test]
     fn svg_contains_ring_elements() {
-        let s = svg_for(80, "#a8d1a3");
+        let s = svg_for(80, "#3a9d4d");
         assert!(s.contains("<svg"));
-        assert!(s.contains("stroke=\"#a8d1a3\""));
-        // 80% of 2π·9 ≈ 45.24
-        assert!(s.contains("45.2"), "expected filled length ~45.24; got: {s}");
+        assert!(s.contains("stroke=\"#3a9d4d\""));
+        // 80% of 2π·9 ≈ 45.239, minus halfStroke (1.25) ≈ 43.989.
+        // Dasharray correction matches the gjs `arc - halfStroke` rule.
+        assert!(s.contains("43.989") || s.contains("43.990"),
+                "expected corrected dasharray ~43.99; got: {s}");
+    }
+
+    #[test]
+    fn svg_has_inner_dot() {
+        // The ring-with-center-dot look is what makes the icon read as
+        // a status indicator instead of a thin curve. gjs draws it as
+        // an explicit filled `<circle r="3.5" fill="${color}">`.
+        let s = svg_for(80, "#3a9d4d");
+        assert!(s.contains("r=\"3.5\""),
+                "inner dot circle missing (r=3.5); got: {s}");
+        assert!(s.contains("fill=\"#3a9d4d\""),
+                "inner dot fill should match ring color; got: {s}");
+    }
+
+    #[test]
+    fn svg_uses_round_caps_on_progress_arc() {
+        // Round caps are what makes the progress terminus look like a
+        // rounded dot instead of a flat dasharray cut. The track (full
+        // circle) doesn't need them — only the foreground arc.
+        let s = svg_for(80, "#3a9d4d");
+        assert!(s.contains("stroke-linecap=\"round\""),
+                "progress arc should use stroke-linecap=round; got: {s}");
+    }
+
+    #[test]
+    fn svg_track_is_faded_color_not_separate_grey() {
+        // The gjs version uses stroke-opacity=0.25 with the same color
+        // as the progress arc, so the unfilled portion reads as the
+        // same color faded into the panel. The earlier Rust version
+        // used a separate dark grey (#3a3a3a) which fights the panel
+        // theme on light backgrounds.
+        let s = svg_for(80, "#3a9d4d");
+        assert!(s.contains("stroke-opacity=\"0.25\""),
+                "track should use stroke-opacity=0.25; got: {s}");
+        assert!(!s.contains("#3a3a3a"),
+                "track should NOT use the legacy dark grey color; got: {s}");
+    }
+
+    #[test]
+    fn svg_stroke_width_matches_gjs() {
+        // gjs uses stroke-width="2.5". The earlier Rust version used 3.0
+        // which made the ring look chunkier than the gjs original.
+        let s = svg_for(80, "#3a9d4d");
+        assert!(s.contains("stroke-width=\"2.5\""),
+                "ring stroke-width should be 2.5 (matches gjs); got: {s}");
+    }
+
+    #[test]
+    fn ring_colors_match_gjs() {
+        // Pinned to gjs RING_COLOR table. If you change these, change
+        // the gjs version too — the two implementations need to look
+        // identical when the user toggles between them.
+        assert_eq!(bucket_hex(Bucket::Normal), "#3a9d4d");
+        assert_eq!(bucket_hex(Bucket::Warning), "#f6d32d");
+        assert_eq!(bucket_hex(Bucket::Throttled), "#e01b24");
+    }
+
+    #[test]
+    fn dasharray_at_zero_pct_is_only_round_cap() {
+        // At pct=0 the foreground arc has no length to draw; the
+        // dasharray is `0 (circumference - 0) = 0 circ`. The visible
+        // result should be just the faded track (no progress arc) plus
+        // the center dot.
+        let s = svg_for(0, "#3a9d4d");
+        // fg_arc = max(0, 0 - 1.25) = 0; fg_rest = circ - 0 = circ.
+        // dasharray should contain 0.000 and ~56.5 (the circumference).
+        assert!(s.contains("0.000"),
+                "expected zero-length dasharray at pct=0; got: {s}");
     }
 
     #[test]
@@ -191,15 +299,16 @@ mod tests {
         // byte order is BGRA: [B, G, R, A]. Verify the ring-fill pixels
         // have the right bytes in that order.
         //
-        // Ring color is #a8d1a3 (RGB = 168, 209, 163) at 100% fill, so we
-        // expect at least one pixel with B=0xa3, G=0xd1, R=0xa8, A=0xff.
+        // Ring color is #3a9d4d (RGB = 58, 157, 77) — matches the gjs
+        // RING_COLOR.normal. Expected bytes for an opaque ring pixel:
+        // B=0x4d, G=0x9d, R=0x3a, A=0xff.
         let (_w, _h, bytes) = render_pixmap(100, Bucket::Normal).unwrap();
         let any_ring_pixel = bytes.chunks_exact(4)
             .any(|px| {
-                px[0] == 0xa3 && px[1] == 0xd1 && px[2] == 0xa8 && px[3] == 0xff
+                px[0] == 0x4d && px[1] == 0x9d && px[2] == 0x3a && px[3] == 0xff
             });
         assert!(any_ring_pixel,
-                "expected at least one BGRA pixel (0xa3, 0xd1, 0xa8, 0xff) in the 100% fill ring");
+                "expected at least one BGRA pixel (0x4d, 0x9d, 0x3a, 0xff) in the 100% fill ring");
     }
 
     #[test]
@@ -219,5 +328,27 @@ mod tests {
         assert_eq!(bucket_name(Bucket::Normal), "normal");
         assert_eq!(bucket_name(Bucket::Warning), "warning");
         assert_eq!(bucket_name(Bucket::Throttled), "throttled");
+    }
+}
+#[cfg(test)]
+mod dump_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Throwaway: render a few sample icons to /tmp so the gjs-vs-Rust
+    /// visual diff can be inspected directly. Not normally run.
+    #[test]
+    #[ignore = "dump helper, run with `cargo test --release dump_icons -- --ignored`"]
+    fn dump_icons_for_visual_inspection() {
+        for (pct, bucket) in [(100, Bucket::Normal),
+                              (80,  Bucket::Normal),
+                              (50,  Bucket::Normal),
+                              (80,  Bucket::Warning),
+                              (50,  Bucket::Throttled)] {
+            let (_w, _h, bytes) = render_pixmap(pct, bucket).unwrap();
+            std::fs::write(
+                format!("/tmp/icon_{}_{:?}.argb", pct, bucket), &bytes).unwrap();
+        }
+        assert!(Path::new("/tmp/icon_100_Normal.argb").exists());
     }
 }

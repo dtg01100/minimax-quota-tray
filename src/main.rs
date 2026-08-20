@@ -145,8 +145,16 @@ async fn do_refresh(
             let burn_weekly = burn::decide_burn_row(
                 Some(&weekly), &s.weekly_history, now_ms(), &cfg.burn_warning);
             let pct = five_h.remaining_pct;
+            // The burn result feeds the bucket_for call so a high
+            // remaining% with a burn rate that would exhaust the window
+            // before reset flips the chip to yellow (Warning) — matches
+            // gjs bucketForChip's `(burn && burn.exhaustBeforeReset)`.
+            // Without this the icon stays green even when the title
+            // text already shows `⚠ exhausts in Xm`, which is the
+            // visible divergence we close here.
             let bucket = icon::bucket_for(pct, false,
-                                          cfg.thresholds.yellow, cfg.thresholds.red);
+                                          cfg.thresholds.yellow, cfg.thresholds.red,
+                                          burn_5h.as_ref());
             // Match gjs setChip(): when the window is exhausted (pct <= 0)
             // gjs shows the static `quota-throttled` SVG dot — it does
             // NOT render a red ring. We mirror that by sending no

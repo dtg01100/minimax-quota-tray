@@ -51,13 +51,15 @@ pub enum Bucket {
     Throttled,
 }
 
-/// Compute the bucket from remaining% + the window's `throttled` flag.
+/// Compute the bucket from remaining% + the window's `throttled` flag +
+/// optional burn-rate projection. Matches gjs `bucketForChip()`:
 ///
-/// Matches gjs `bucketForChip()`:
 ///   - throttled: pct <= 0 OR `throttled` flag set (window exhausted)
-///   - warning:   used% >= yellow (gjs ORs red+yellow thresholds; the
-///                red condition is folded into the yellow check because
-///                100-red < 100-yellow, so used >= yellow subsumes it)
+///   - warning:   used% >= yellow OR burn projects exhaustion before
+///                reset (gjs ORs the burn flip with the threshold checks
+///                — if the trend would empty the window before it
+///                resets, the chip flips to yellow even when remaining%
+///                looks healthy)
 ///   - normal:    otherwise
 ///
 /// Important: gjs does NOT switch to a red ring when remaining drops
@@ -66,15 +68,30 @@ pub enum Bucket {
 /// Rust port returned `Throttled` for `used >= red` which produced a
 /// red ring at low-but-not-zero percentages (e.g. 15% with default
 /// thresholds), diverging from gjs. The fix: only `Throttled` when
-/// the window is exhausted; otherwise Warning/Normal based on yellow.
+/// the window is exhausted; otherwise Warning/Normal based on yellow
+/// or the burn projection.
 ///
 /// The `red` parameter is kept in the signature for API stability but
 /// is unused — the gjs OR-with-yellow subsumes it.
-pub fn bucket_for(remaining_pct: i64, throttled: bool, yellow: i64, _red: i64) -> Bucket {
+pub fn bucket_for(
+    remaining_pct: i64,
+    throttled: bool,
+    yellow: i64,
+    _red: i64,
+    burn: Option<&crate::burn::BurnResult>,
+) -> Bucket {
     if throttled || remaining_pct <= 0 { return Bucket::Throttled; }
     let used = 100 - remaining_pct;
-    if used >= yellow { Bucket::Warning }
-    else { Bucket::Normal }
+    if used >= yellow { return Bucket::Warning; }
+    // Burn-driven flip: a healthy-looking remaining% but a burn rate
+    // that would exhaust the window before it resets → yellow. The
+    // title text already carries `⚠ exhausts in Xm` (see title_for),
+    // so flipping the icon too matches gjs — chip color and chip text
+    // both flip together when the burn rate signals trouble.
+    if burn.map_or(false, |b| b.exhaust_before_reset) {
+        return Bucket::Warning;
+    }
+    Bucket::Normal
 }
 
 fn bucket_hex(b: Bucket) -> &'static str {
@@ -197,18 +214,50 @@ mod tests {
         //   - used >= yellow (60%)       → Warning
         //   - else                       → Normal
         // The red threshold (85%) does NOT switch to a red ring in gjs —
-        // it stays yellow until pct hits 0.
-        assert_eq!(bucket_for(0, false, 60, 85), Bucket::Throttled);
-        assert_eq!(bucket_for(50, false, 60, 85), Bucket::Normal);
-        assert_eq!(bucket_for(35, false, 60, 85), Bucket::Warning);
+        // it stays yellow until pct hits 0. The `burn` parameter is
+        // None in these cases (no burn-flip needed for the threshold
+        // checks themselves).
+        assert_eq!(bucket_for(0, false, 60, 85, None), Bucket::Throttled);
+        assert_eq!(bucket_for(50, false, 60, 85, None), Bucket::Normal);
+        assert_eq!(bucket_for(35, false, 60, 85, None), Bucket::Warning);
         // Critical regression: pct=14 (below red threshold but > 0) used
         // to return Throttled → red ring. gjs returns Warning → yellow
         // ring. The faithful reproduction requires Warning here.
-        assert_eq!(bucket_for(14, false, 60, 85), Bucket::Warning);
-        assert_eq!(bucket_for(80, true, 60, 85), Bucket::Throttled);
-        assert_eq!(bucket_for(1, false, 60, 85), Bucket::Warning);
-        assert_eq!(bucket_for(40, false, 60, 85), Bucket::Warning);
-        assert_eq!(bucket_for(41, false, 60, 85), Bucket::Normal);
+        assert_eq!(bucket_for(14, false, 60, 85, None), Bucket::Warning);
+        assert_eq!(bucket_for(80, true, 60, 85, None), Bucket::Throttled);
+        assert_eq!(bucket_for(1, false, 60, 85, None), Bucket::Warning);
+        assert_eq!(bucket_for(40, false, 60, 85, None), Bucket::Warning);
+        assert_eq!(bucket_for(41, false, 60, 85, None), Bucket::Normal);
+    }
+
+    #[test]
+    fn bucket_burn_flip_to_warning() {
+        use crate::burn::BurnResult;
+        // A high remaining% (90) with no burn-flip → Normal (green ring).
+        let healthy = BurnResult {
+            rate_per_hour: 0.0,
+            mode: "pct",
+            unit: "pct",
+            exhaust_ms: f64::INFINITY,
+            remaining_ms: 3_600_000,
+            exhaust_before_reset: false,
+            projected_pct_left: 90.0,
+        };
+        assert_eq!(bucket_for(90, false, 60, 85, Some(&healthy)),
+                   Bucket::Normal);
+        // Same healthy remaining% but the burn projects exhaustion
+        // before reset → flips to Warning (yellow ring), matching gjs
+        // bucketForChip's `(burn && burn.exhaustBeforeReset)` clause.
+        let alarming = BurnResult { exhaust_before_reset: true, ..healthy };
+        assert_eq!(bucket_for(90, false, 60, 85, Some(&alarming)),
+                   Bucket::Warning);
+        // Burn flip is OR'd with the threshold check — a burn flip on
+        // an already-low remaining% still lands at Warning (idempotent).
+        assert_eq!(bucket_for(20, false, 60, 85, Some(&alarming)),
+                   Bucket::Warning);
+        // Burn flip can't override Throttled — pct <= 0 still wins.
+        assert_eq!(bucket_for(0, false, 60, 85, Some(&alarming)),
+                   Bucket::Throttled);
     }
 
     #[test]

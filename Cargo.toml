@@ -1,0 +1,43 @@
+[package]
+name = "minimax-quota-tray"
+version = "0.2.0"
+edition = "2021"
+description = "GNOME tray indicator for MiniMax quota — Rust port of the gjs original"
+license = "MIT"
+
+[dependencies]
+# GUI
+gtk = { version = "0.9", features = ["v3_24"] }
+libappindicator = "0.9"
+glib = "0.20"
+
+# Async / HTTP / JSON
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# System / keyring / etc.
+secret-service = { version = "3", features = ["rt-tokio-crypto-rust"] }
+keyring = { version = "3", features = ["linux-native"] }   # fallback
+dirs = "5"
+anyhow = "1"
+thiserror = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+approx = "0.5"
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"     # minimize binary size
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release-debug]
+inherits = "release"
+strip = false       # keep symbols so we can read stack traces

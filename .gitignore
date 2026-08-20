@@ -1,10 +1,11 @@
-__pycache__/
-*.pyc
-*.pyo
+# Build artifacts
+target/
+**/*.rs.bk
+
+# OS / editor cruft
 .DS_Store
 *.swp
 *.swo
-.vscode/
-.idea/
-config.json
+
+# Local-only files (don't ship)
 *.local

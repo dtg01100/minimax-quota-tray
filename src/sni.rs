@@ -99,11 +99,15 @@ impl StatusNotifierItem {
     }
 
     /// SNI requires Menu to be a valid object path even when we don't
-    /// serve a menu. `/Menu` is the conventional sentinel used by KDE
-    /// plasma's reference implementation.
+    /// serve a menu. `/NO_DBUSMENU` is the magic sentinel recognized by
+    /// the libappindicator / appindicator-gnome shell extension: the
+    /// extension checks for it via the dbusMenu proxy and skips dbusmenu
+    /// introspection entirely. (KDE's `/Menu` and the older `/NoMenu`
+    /// both cause the extension to try to follow the path and emit
+    /// `Unknown object` errors in the journal.)
     #[zbus(property)]
     async fn menu(&self) -> zbus::zvariant::OwnedObjectPath {
-        zbus::zvariant::OwnedObjectPath::try_from("/Menu").unwrap()
+        zbus::zvariant::OwnedObjectPath::try_from("/NO_DBUSMENU").unwrap()
     }
 
     /// Standard SNI attributes — not strictly required but listed in the

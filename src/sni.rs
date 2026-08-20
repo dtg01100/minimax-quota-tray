@@ -165,12 +165,12 @@ impl Tray {
             .await
             .context("look up SNI interface ref")?;
 
-        // Register with the watcher so the tray learns about us. If no
-        // watcher is running (no graphical session), this fails gracefully
-        // — the daemon logic runs anyway; we just won't show an icon.
+        // Belt-and-suspenders: explicitly register with the watcher too.
+        // The SNI spec says the watcher monitors for well-known bus names,
+        // but on some implementations (including the AppIndicator GNOME
+        // extension) explicit registration is faster / more reliable.
         if let Err(e) = register_with_watcher(&conn).await {
-            log::warn!("StatusNotifierWatcher not reachable: {e}");
-            log::warn!("the icon won't appear, but polling/refresh still works");
+        log::debug!("explicit RegisterStatusNotifierItem failed (auto-discovery still applies): {e}");
         }
 
         Ok(Self { state, iface_ref, _conn: conn })
@@ -209,18 +209,22 @@ impl Tray {
     }
 }
 
-/// Call `Register(hostname)` on the org.kde.StatusNotifierWatcher.
+/// Optional: explicitly register with the watcher's
+/// RegisterStatusNotifierItem() method. The SNI spec says clients don't
+/// need to do this — the watcher auto-discovers via the bus name — but
+/// some implementations are more reliable with explicit registration.
 async fn register_with_watcher(conn: &Connection) -> Result<()> {
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| ".".to_string());
+    let pid = std::process::id();
+    let service = format!("org.kde.StatusNotifierItem-{pid}-1");
     conn.call_method(
         Some(WATCHER_NAME),
         WATCHER_PATH,
         Some("org.kde.StatusNotifierWatcher"),
-        "Register",
-        &(hostname,),
+        "RegisterStatusNotifierItem",
+        &(service,),
     )
     .await
-    .context("call Register on watcher")?;
+    .context("call RegisterStatusNotifierItem on watcher")?;
     Ok(())
 }
 

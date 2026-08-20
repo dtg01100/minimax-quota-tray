@@ -21,6 +21,7 @@
 //! burn rate info inline for now.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use zbus::{interface, object_server::{Interface, InterfaceRef}, Connection};
@@ -35,6 +36,9 @@ struct State {
     title: String,
     icon_name: String,
     status: String,
+    /// Cached pixmap (width, height, ARGB bytes) — refreshed on each
+    /// update(). SNI clients re-read on the NewIcon signal.
+    pixmap: Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>,
 }
 
 /// The SNI object — exposes the required properties over D-Bus. State is
@@ -71,10 +75,15 @@ impl StatusNotifierItem {
         self.state.lock().await.icon_name.clone()
     }
 
-    /// No embedded pixmap — the icon comes from the theme. SNI requires
-    /// the property be present; an empty array means "use IconName".
+    /// Rasterized ARGB32 icon. Updated on each refresh; the tray redraws
+    /// after the NewIcon signal.
     async fn icon_pixmap(&self) -> Vec<(i32, i32, Vec<u8>)> {
-        Vec::new()
+        let state = self.state.lock().await;
+        let guard = state.pixmap.lock().await;
+        match &*guard {
+            Some((w, h, bytes)) => vec![(*w as i32, *h as i32, bytes.clone())],
+            None => Vec::new(),
+        }
     }
 
     /// No custom theme path; use the system icon theme.
@@ -128,6 +137,7 @@ impl Tray {
             title: "MiniMax".to_string(),
             icon_name: "dialog-information-symbolic".to_string(),
             status: "Passive".to_string(),
+            pixmap: Arc::new(Mutex::new(None)),
         }));
 
         // Unique bus name: org.kde.StatusNotifierItem-<pid>-<n>.
@@ -166,14 +176,30 @@ impl Tray {
         Ok(Self { state, iface_ref, _conn: conn })
     }
 
-    /// Update the icon, title, and status. Emits NewIcon/NewTitle/NewStatus
-    /// signals so the tray redraws. Called from the polling loop.
-    pub async fn update(&self, title: &str, icon_name: &str, status: &str) -> Result<()> {
+    /// Update the title, icon name, status, and (optionally) the rasterized
+    /// icon pixmap. Emits NewIcon/NewTitle/NewStatus signals so the tray
+    /// redraws. Called from the polling loop.
+    ///
+    /// If `pixmap` is `Some`, it replaces the cached pixmap (SNI clients
+    /// will read it on the NewIcon signal). If `None`, the previous
+    /// pixmap is preserved — useful for error renders that don't change
+    /// the icon.
+    pub async fn update(
+        &self,
+        title: &str,
+        icon_name: &str,
+        status: &str,
+        pixmap: Option<(u32, u32, Vec<u8>)>,
+    ) -> Result<()> {
         {
             let mut s = self.state.lock().await;
             s.title = title.to_string();
             s.icon_name = icon_name.to_string();
             s.status = status.to_string();
+        }
+        if let Some(p) = pixmap {
+            let state = self.state.lock().await;
+            *state.pixmap.lock().await = Some(p);
         }
         let emitter = self.iface_ref.signal_emitter();
         StatusNotifierItem::new_icon(emitter).await.context("emit NewIcon")?;

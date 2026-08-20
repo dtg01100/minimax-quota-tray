@@ -11,6 +11,12 @@ license = "MIT"
 # GTK / libappindicator dependency.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
+# Native SVG → ARGB pixel buffer, sent via StatusNotifierItem IconPixmap.
+# Minimal features: no text, no system fonts, no embedded raster images
+# (we only render simple geometric SVGs).
+resvg = { version = "0.48", default-features = false }
+usvg = { version = "0.48", default-features = false }
+
 # Async / HTTP / JSON
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "blocking"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }

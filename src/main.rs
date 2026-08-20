@@ -11,6 +11,7 @@
 mod burn;
 mod config;
 mod fetch;
+mod icon;
 mod keyring;
 mod parse;
 mod scheduler;
@@ -144,15 +145,21 @@ async fn do_refresh(
             let burn_weekly = burn::decide_burn_row(
                 Some(&weekly), &s.weekly_history, now_ms(), &cfg.burn_warning);
             let pct = five_h.remaining_pct;
-            let icon = bucket_icon(pct, &cfg);
+            let bucket = icon::bucket_for(pct, false,
+                                          cfg.thresholds.yellow, cfg.thresholds.red);
+            // The fallback theme icon name is sent as IconName; the actual
+            // rendered pixmap goes through IconPixmap (SNI clients prefer
+            // the pixmap when both are present).
+            let icon_name = bucket_name(bucket);
             let title = title_for(&five_h, burn_5h.as_ref());
+            let pixmap = icon::render_pixmap(pct, bucket);
             let interval = scheduler::next_interval(
                 cfg.refresh_seconds,
                 cfg.refresh_max_backoff_seconds,
                 pct, cfg.thresholds.yellow, cfg.thresholds.red, 0,
             );
             drop(s);
-            let _ = tray.update(&title, &icon, "Active").await;
+            let _ = tray.update(&title, icon_name, "Active", pixmap).await;
             interval * 1000
         }
         Err(e) => {
@@ -182,13 +189,26 @@ async fn render_initial(tray: &Arc<Tray>, cfg: &Config) {
     } else {
         "MiniMax: no API key".to_string()
     };
-    let _ = tray.update(&title, "dialog-information-symbolic", "Passive").await;
+    // Render a generic "no data" icon at 100%.
+    let pixmap = icon::render_pixmap(100, icon::Bucket::Normal);
+    let _ = tray.update(&title, "dialog-information-symbolic", "Passive", pixmap).await;
     log::info!("started; plan={} (refresh every {}s)", cfg.plan, cfg.refresh_seconds);
+}
+
+fn bucket_name(b: icon::Bucket) -> &'static str {
+    use icon::Bucket;
+    match b {
+        Bucket::Normal => "dialog-information-symbolic",
+        Bucket::Warning => "dialog-warning-symbolic",
+        Bucket::Throttled => "dialog-error-symbolic",
+    }
 }
 
 async fn render_error(tray: &Arc<Tray>, _cfg: &Config, msg: &str) {
     let title = format!("MiniMax: {msg}");
-    let _ = tray.update(&title, "dialog-error-symbolic", "Active").await;
+    // Render the throttled icon at 0% (full red ring).
+    let pixmap = icon::render_pixmap(0, icon::Bucket::Throttled);
+    let _ = tray.update(&title, "dialog-error-symbolic", "Active", pixmap).await;
     log::warn!("{msg}");
 }
 
@@ -211,18 +231,6 @@ fn record_sample(history: &mut Vec<Sample>, w: &Window) {
     if history.len() > BURN_MAX_SAMPLES {
         let drop = history.len() - BURN_MAX_SAMPLES;
         history.drain(0..drop);
-    }
-}
-
-/// Pick a theme icon name based on the bucket.
-fn bucket_icon(remaining_pct: i64, cfg: &Config) -> String {
-    let used = 100 - remaining_pct;
-    if used >= cfg.thresholds.red {
-        "dialog-error-symbolic".to_string()
-    } else if used >= cfg.thresholds.yellow {
-        "dialog-warning-symbolic".to_string()
-    } else {
-        "dialog-information-symbolic".to_string()
     }
 }
 

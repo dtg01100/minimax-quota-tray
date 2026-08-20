@@ -147,12 +147,20 @@ async fn do_refresh(
             let pct = five_h.remaining_pct;
             let bucket = icon::bucket_for(pct, false,
                                           cfg.thresholds.yellow, cfg.thresholds.red);
-            // The fallback theme icon name is sent as IconName; the actual
-            // rendered pixmap goes through IconPixmap (SNI clients prefer
-            // the pixmap when both are present).
+            // Match gjs setChip(): when the window is exhausted (pct <= 0)
+            // gjs shows the static `quota-throttled` SVG dot — it does
+            // NOT render a red ring. We mirror that by sending no
+            // IconPixmap for the Throttled bucket so the tray falls
+            // through to the IconName (= `quota-throttled`, installed
+            // by install.sh under hicolor/scalable/apps). Renders for
+            // Normal/Warning go through IconPixmap (the green/yellow
+            // ring with center dot).
             let icon_name = bucket_name(bucket);
             let title = title_for(&five_h, burn_5h.as_ref());
-            let pixmap = icon::render_pixmap(pct, bucket);
+            let pixmap = match bucket {
+                icon::Bucket::Throttled => None,
+                _ => icon::render_pixmap(pct, bucket),
+            };
             let interval = scheduler::next_interval(
                 cfg.refresh_seconds,
                 cfg.refresh_max_backoff_seconds,
@@ -189,13 +197,11 @@ async fn render_initial(tray: &Arc<Tray>, cfg: &Config) {
     } else {
         "MiniMax: no API key".to_string()
     };
-    // Render a "no data" icon at 100% — ring goes IconPixmap, theme name
-    // uses the project's dedicated `quota-normal` (installed by
-    // install.sh into ~/.local/share/icons/hicolor/scalable/apps/) so
-    // trays that prefer IconName over IconPixmap still show the right
-    // glyph instead of a generic Adwaita dialog icon.
-    let pixmap = icon::render_pixmap(100, icon::Bucket::Normal);
-    let _ = tray.update(&title, "quota-normal", "Passive", pixmap).await;
+    // Match gjs setChip() with no primary window: IconName =
+    // `quota-normal` (the static green dot), no IconPixmap. Showing a
+    // 100%-filled ring at startup would falsely imply "100% remaining"
+    // when we have no data yet — gjs shows the static dot in this state.
+    let _ = tray.update(&title, "quota-normal", "Passive", None).await;
     log::info!("started; plan={} (refresh every {}s)", cfg.plan, cfg.refresh_seconds);
 }
 
@@ -217,11 +223,11 @@ fn bucket_name(b: icon::Bucket) -> &'static str {
 
 async fn render_error(tray: &Arc<Tray>, _cfg: &Config, msg: &str) {
     let title = format!("MiniMax: {msg}");
-    // Render the throttled ring at 0% (full red ring) for IconPixmap;
-    // the IconName fallback uses the project's quota-error dot so any
-    // tray that ignores IconPixmap still shows a recognizable error glyph.
-    let pixmap = icon::render_pixmap(0, icon::Bucket::Throttled);
-    let _ = tray.update(&title, "quota-error", "Active", pixmap).await;
+    // Match gjs setChip() error branch: IconName = `quota-error`
+    // (the static error dot), no IconPixmap. gjs explicitly falls
+    // through to the static icon for the error state — it doesn't
+    // try to render a ring with bogus data.
+    let _ = tray.update(&title, "quota-error", "Active", None).await;
     log::warn!("{msg}");
 }
 

@@ -51,11 +51,29 @@ pub enum Bucket {
     Throttled,
 }
 
-pub fn bucket_for(remaining_pct: i64, throttled: bool, yellow: i64, red: i64) -> Bucket {
-    if throttled { return Bucket::Throttled; }
+/// Compute the bucket from remaining% + the window's `throttled` flag.
+///
+/// Matches gjs `bucketForChip()`:
+///   - throttled: pct <= 0 OR `throttled` flag set (window exhausted)
+///   - warning:   used% >= yellow (gjs ORs red+yellow thresholds; the
+///                red condition is folded into the yellow check because
+///                100-red < 100-yellow, so used >= yellow subsumes it)
+///   - normal:    otherwise
+///
+/// Important: gjs does NOT switch to a red ring when remaining drops
+/// below the red threshold — it keeps the yellow ring until pct hits 0,
+/// then falls through to the static `quota-throttled` dot. The earlier
+/// Rust port returned `Throttled` for `used >= red` which produced a
+/// red ring at low-but-not-zero percentages (e.g. 15% with default
+/// thresholds), diverging from gjs. The fix: only `Throttled` when
+/// the window is exhausted; otherwise Warning/Normal based on yellow.
+///
+/// The `red` parameter is kept in the signature for API stability but
+/// is unused — the gjs OR-with-yellow subsumes it.
+pub fn bucket_for(remaining_pct: i64, throttled: bool, yellow: i64, _red: i64) -> Bucket {
+    if throttled || remaining_pct <= 0 { return Bucket::Throttled; }
     let used = 100 - remaining_pct;
-    if used >= red { Bucket::Throttled }
-    else if used >= yellow { Bucket::Warning }
+    if used >= yellow { Bucket::Warning }
     else { Bucket::Normal }
 }
 
@@ -174,11 +192,23 @@ mod tests {
 
     #[test]
     fn bucket_thresholds() {
+        // Mirrors gjs bucketForChip():
+        //   - pct <= 0 OR throttled flag → Throttled
+        //   - used >= yellow (60%)       → Warning
+        //   - else                       → Normal
+        // The red threshold (85%) does NOT switch to a red ring in gjs —
+        // it stays yellow until pct hits 0.
         assert_eq!(bucket_for(0, false, 60, 85), Bucket::Throttled);
         assert_eq!(bucket_for(50, false, 60, 85), Bucket::Normal);
         assert_eq!(bucket_for(35, false, 60, 85), Bucket::Warning);
-        assert_eq!(bucket_for(14, false, 60, 85), Bucket::Throttled);
+        // Critical regression: pct=14 (below red threshold but > 0) used
+        // to return Throttled → red ring. gjs returns Warning → yellow
+        // ring. The faithful reproduction requires Warning here.
+        assert_eq!(bucket_for(14, false, 60, 85), Bucket::Warning);
         assert_eq!(bucket_for(80, true, 60, 85), Bucket::Throttled);
+        assert_eq!(bucket_for(1, false, 60, 85), Bucket::Warning);
+        assert_eq!(bucket_for(40, false, 60, 85), Bucket::Warning);
+        assert_eq!(bucket_for(41, false, 60, 85), Bucket::Normal);
     }
 
     #[test]
@@ -344,7 +374,14 @@ mod dump_tests {
                               (80,  Bucket::Normal),
                               (50,  Bucket::Normal),
                               (80,  Bucket::Warning),
-                              (50,  Bucket::Throttled)] {
+                              // Boundary: pct=14 used to be Throttled (red ring);
+                              // now Warning (yellow ring) — the gjs faithful fix.
+                              (14,  Bucket::Warning),
+                              // Exhausted: pct=0 → Throttled bucket, but render_pixmap
+                              // is intentionally not called in main.rs (skipped to fall
+                              // through to the static quota-throttled SVG). This dumps
+                              // the pixmap anyway for comparison reference.
+                              (0,   Bucket::Throttled)] {
             let (_w, _h, bytes) = render_pixmap(pct, bucket).unwrap();
             std::fs::write(
                 format!("/tmp/icon_{}_{:?}.argb", pct, bucket), &bytes).unwrap();

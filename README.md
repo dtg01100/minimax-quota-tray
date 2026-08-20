@@ -6,6 +6,20 @@ Talks directly to the MiniMax API — no agent or plugin system required.
 
 ![Menu preview](menu.txt)
 
+> **Two implementations live side-by-side on separate branches:**
+> - `main` — production: the original **gjs** binary (`minimax-quota-tray.js`),
+>   installed and running on this host via `systemd --user`.
+> - `rust-rewrite` — a **Rust port** (~3700 LOC across 10 modules, 51 unit
+>   tests, ~4.4 MB release binary) with all features preserved. Built in
+>   a Fedora 44 distrobox so the gtk3 / libappindicator / libsecret
+>   `-devel` packages don't have to be installed on the host. The
+>   resulting binary links against the runtime `.so` files already
+>   shipped with Bluefin/Silverblue, so no host install is needed.
+>
+> Pick a branch with `git checkout main` (gjs, currently running) or
+> `git checkout rust-rewrite` (Rust, opt-in). The `install.sh` script is
+> shared between both; it just copies whichever binary lives in the repo.
+
 ## What it shows
 
 - **Chip** in the top bar: `<Plan> <remaining>%` with an icon that flips

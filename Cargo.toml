@@ -8,11 +8,11 @@ license = "MIT"
 [dependencies]
 # GUI
 gtk = { version = "0.9", features = ["v3_24"] }
-libappindicator = "0.9"
 glib = "0.20"
+gio = "0.20"
 
 # Async / HTTP / JSON
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "blocking", "json"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,6 +26,12 @@ thiserror = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 log = "0.4"
 env_logger = "0.11"
+notify-rust = "4.18.0"
+# StatusNotifierItem — minimal FFI to libayatana-appindicator.so loaded via
+# libloading. Avoids the gtk version mismatch that the official
+# libayatana-appindicator crate has (it pulls in gtk 0.15). We only need
+# ~4 symbols out of the ~50 the library exports.
+libloading = "0.8"
 
 [dev-dependencies]
 approx = "0.5"

@@ -51,32 +51,38 @@ struct StatusNotifierItem {
 #[interface(name = "org.kde.StatusNotifierItem")]
 impl StatusNotifierItem {
     /// "ApplicationStatus" — we're a long-running background service indicator.
+    #[zbus(property)]
     async fn category(&self) -> String {
         "ApplicationStatus".to_string()
     }
 
     /// Stable identifier for this tray icon.
+    #[zbus(property)]
     async fn id(&self) -> String {
         "minimax-quota-tray".to_string()
     }
 
     /// Human-readable title. Updated by `update()` to show e.g. "MiniMax: 80%".
+    #[zbus(property)]
     async fn title(&self) -> String {
         self.state.lock().await.title.clone()
     }
 
     /// "Active" when there's fresh data, "Passive" otherwise.
+    #[zbus(property)]
     async fn status(&self) -> String {
         self.state.lock().await.status.clone()
     }
 
     /// Theme icon name. Updated per refresh.
+    #[zbus(property)]
     async fn icon_name(&self) -> String {
         self.state.lock().await.icon_name.clone()
     }
 
     /// Rasterized ARGB32 icon. Updated on each refresh; the tray redraws
     /// after the NewIcon signal.
+    #[zbus(property)]
     async fn icon_pixmap(&self) -> Vec<(i32, i32, Vec<u8>)> {
         let state = self.state.lock().await;
         let guard = state.pixmap.lock().await;
@@ -87,18 +93,22 @@ impl StatusNotifierItem {
     }
 
     /// No custom theme path; use the system icon theme.
+    #[zbus(property)]
     async fn icon_theme_path(&self) -> String {
         String::new()
     }
 
     /// SNI requires Menu to be a valid object path even when we don't
-    /// serve a menu. `/NoMenu` is the conventional sentinel.
+    /// serve a menu. `/Menu` is the conventional sentinel used by KDE
+    /// plasma's reference implementation.
+    #[zbus(property)]
     async fn menu(&self) -> zbus::zvariant::OwnedObjectPath {
-        zbus::zvariant::OwnedObjectPath::try_from("/NoMenu").unwrap()
+        zbus::zvariant::OwnedObjectPath::try_from("/Menu").unwrap()
     }
 
     /// Standard SNI attributes — not strictly required but listed in the
     /// introspection of well-behaved SNI implementations.
+    #[zbus(property)]
     async fn item_is_menu(&self) -> bool { false }
 
     /// Activated by the tray when the user clicks the icon (if supported).

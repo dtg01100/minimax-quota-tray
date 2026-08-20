@@ -44,13 +44,27 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        // Defaults must match the live API surface that
+        // `config.example.json` ships with — if a user runs the binary
+        // before `install.sh` has copied the example file, the binary
+        // writes THIS default to ~/.config/minimax-quota/config.json
+        // (see load_or_init). Wrong endpoints here = silent "no data"
+        // until the user fixes the config manually.
         let mut plans = std::collections::HashMap::new();
         plans.insert(
             "coding_plan".to_string(),
             PlanConfig {
-                endpoint: "https://api.minimax.chat/v1/coding_plan/remains".to_string(),
-                dashboard_url: "https://MiniMax.io/platform/code-plan".to_string(),
-                label: "MiniMax Coding Plan".to_string(),
+                endpoint: "https://api.minimax.io/v1/api/openplatform/coding_plan/remains".to_string(),
+                dashboard_url: "https://platform.minimax.io/console/plan".to_string(),
+                label: "Coding Plan".to_string(),
+            },
+        );
+        plans.insert(
+            "token_plan".to_string(),
+            PlanConfig {
+                endpoint: "https://api.minimax.io/v1/token_plan/remains".to_string(),
+                dashboard_url: "https://platform.minimax.io/console/plan".to_string(),
+                label: "Token Plan".to_string(),
             },
         );
         Self {

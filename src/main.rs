@@ -189,26 +189,39 @@ async fn render_initial(tray: &Arc<Tray>, cfg: &Config) {
     } else {
         "MiniMax: no API key".to_string()
     };
-    // Render a generic "no data" icon at 100%.
+    // Render a "no data" icon at 100% — ring goes IconPixmap, theme name
+    // uses the project's dedicated `quota-normal` (installed by
+    // install.sh into ~/.local/share/icons/hicolor/scalable/apps/) so
+    // trays that prefer IconName over IconPixmap still show the right
+    // glyph instead of a generic Adwaita dialog icon.
     let pixmap = icon::render_pixmap(100, icon::Bucket::Normal);
-    let _ = tray.update(&title, "dialog-information-symbolic", "Passive", pixmap).await;
+    let _ = tray.update(&title, "quota-normal", "Passive", pixmap).await;
     log::info!("started; plan={} (refresh every {}s)", cfg.plan, cfg.refresh_seconds);
 }
 
+/// Theme icon name for a bucket. Mirrors the gjs `ICON` table — the
+/// names must match the SVGs in icons/ that install.sh installs under
+/// ~/.local/share/icons/hicolor/scalable/apps/. Some SNI clients
+/// (including older AppIndicator extension builds) prefer IconName over
+/// IconPixmap when both are present, so the fallback theme name has to
+/// be the project's dedicated icon — otherwise a tray that ignores
+/// IconPixmap ends up showing a generic Adwaita dialog/info glyph.
 fn bucket_name(b: icon::Bucket) -> &'static str {
     use icon::Bucket;
     match b {
-        Bucket::Normal => "dialog-information-symbolic",
-        Bucket::Warning => "dialog-warning-symbolic",
-        Bucket::Throttled => "dialog-error-symbolic",
+        Bucket::Normal => "quota-normal",
+        Bucket::Warning => "quota-warning",
+        Bucket::Throttled => "quota-throttled",
     }
 }
 
 async fn render_error(tray: &Arc<Tray>, _cfg: &Config, msg: &str) {
     let title = format!("MiniMax: {msg}");
-    // Render the throttled icon at 0% (full red ring).
+    // Render the throttled ring at 0% (full red ring) for IconPixmap;
+    // the IconName fallback uses the project's quota-error dot so any
+    // tray that ignores IconPixmap still shows a recognizable error glyph.
     let pixmap = icon::render_pixmap(0, icon::Bucket::Throttled);
-    let _ = tray.update(&title, "dialog-error-symbolic", "Active", pixmap).await;
+    let _ = tray.update(&title, "quota-error", "Active", pixmap).await;
     log::warn!("{msg}");
 }
 

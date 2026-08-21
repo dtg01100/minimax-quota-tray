@@ -30,6 +30,13 @@ pub struct Thresholds {
 pub struct Config {
     pub plan: String,
     pub refresh_seconds: u64,
+    /// Floor for the polling cadence (gjs `refresh_min_seconds`,
+    /// default 15). The adaptive cut (yellow/2, red/4) plus the
+    /// `max_backoff_seconds` backoff never push the interval below
+    /// this — protects the API from rapid-fire polling when usage
+    /// is near-exhausted.
+    #[serde(default = "default_refresh_min_seconds")]
+    pub refresh_min_seconds: u64,
     pub refresh_max_backoff_seconds: u64,
 
     #[serde(default)]
@@ -70,6 +77,7 @@ impl Default for Config {
         Self {
             plan: "coding_plan".to_string(),
             refresh_seconds: 120,
+            refresh_min_seconds: default_refresh_min_seconds(),
             refresh_max_backoff_seconds: 600,
             plans,
             thresholds: Thresholds { yellow: 60, red: 85 },
@@ -77,6 +85,10 @@ impl Default for Config {
         }
     }
 }
+
+/// Default for `refresh_min_seconds` — matches the gjs default in
+/// `config.example.json` (`refresh_min_seconds: 15`).
+fn default_refresh_min_seconds() -> u64 { 15 }
 
 /// `~/.config/minimax-quota/config.json` — uses HOME env var to avoid
 /// pulling in the dirs crate at config-load time.
@@ -109,6 +121,16 @@ pub fn load_or_init() -> Result<Config> {
             .context("creating config dir")?;
         std::fs::write(&path, serde_json::to_vec_pretty(&cfg)?)
             .with_context(|| format!("writing default config to {}", path.display()))?;
+        // Force 0600 — matches gjs's `f.set_attribute_uint32('unix::mode',
+        // 0o600, ...)`. `std::fs::write` inherits the process umask
+        // (typically 0644). The config has no secrets, but matching
+        // gjs's permission flip keeps first-run installs consistent
+        // with subsequent runs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         log::info!("wrote default config at {}", path.display());
         return Ok(cfg);
     }
@@ -157,8 +179,36 @@ mod tests {
         let cfg = load();
         assert_eq!(cfg.plan, "coding_plan");
         assert_eq!(cfg.refresh_seconds, 120);
+        assert_eq!(cfg.refresh_min_seconds, 15,
+                   "default refresh_min_seconds must be 15 (gjs parity)");
         assert!(cfg.plans.contains_key("coding_plan"));
         std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn refresh_min_seconds_field_is_optional_in_json() {
+        // Old configs that omit `refresh_min_seconds` should fall
+        // back to the default (matches gjs `?? 15` semantics in
+        // `nextIntervalSeconds`).
+        let _g = lock_home();
+        let tmp = std::env::temp_dir().join("minimax-cfg-no-min");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let path = tmp.join("config.json");
+        write_at(&path, r#"{
+            "plan": "coding_plan",
+            "refresh_seconds": 120,
+            "refresh_max_backoff_seconds": 600,
+            "plans": {
+                "coding_plan": {
+                    "endpoint": "https://example.invalid/coding",
+                    "dashboard_url": "https://example.invalid/dash",
+                    "label": "Coding Plan"
+                }
+            }
+        }"#);
+        let cfg = load_at(&path);
+        assert_eq!(cfg.refresh_min_seconds, 15);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -216,6 +266,30 @@ mod tests {
         let cfg = load_or_init().unwrap();
         assert!(config_path().exists(), "config should have been written");
         assert_eq!(cfg.plan, "coding_plan");
+        std::env::remove_var("HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// gjs explicitly chmods the default-written config to 0600
+    /// (see its `f.set_attribute_uint32('unix::mode', 0o600, ...)`).
+    /// `std::fs::write` honors the umask (typically 0644), so we
+    /// flip it after writing. The config carries no secrets, but
+    /// matching the gjs permission keeps first-run installs
+    /// consistent with later ones (and matches `install.sh`'s
+    /// `install -m 0600`).
+    #[test]
+    #[cfg(unix)]
+    fn load_or_init_writes_default_config_with_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = lock_home();
+        let tmp = std::env::temp_dir().join("minimax-cfg-0600");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("HOME", &tmp);
+        let _ = load_or_init().unwrap();
+        let path = config_path();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600,
+                   "default-written config must be 0600 (gjs parity)");
         std::env::remove_var("HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }

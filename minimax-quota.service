@@ -7,7 +7,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/gjs -m %h/.local/bin/minimax-quota-tray.js
+ExecStart=%h/.local/bin/minimax-quota-tray
 Restart=on-failure
 RestartSec=5
 # No hardcoded env vars. After=graphical-session.target above ensures

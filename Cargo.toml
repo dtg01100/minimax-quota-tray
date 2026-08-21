@@ -20,6 +20,9 @@ usvg = { version = "0.48", default-features = false }
 # Async / HTTP / JSON
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "blocking"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
+# StreamExt::next() for consuming zbus::proxy::SignalStream (the
+# Stream trait isn't in scope by default; futures-util provides it).
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

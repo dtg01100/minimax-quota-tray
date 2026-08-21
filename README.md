@@ -1,24 +1,28 @@
 # MiniMax Quota Tray
 
-A standalone GNOME Shell tray indicator for MiniMax API quota. Supports
+A standalone freedesktop tray indicator for MiniMax API quota. Supports
 both the **Coding Plan** and the **Token Plan** via your own API key.
 Talks directly to the MiniMax API — no agent or plugin system required.
 
 ![Menu preview](menu.txt)
 
-> **Two implementations live side-by-side on separate branches:**
-> - `main` — production: the original **gjs** binary (`minimax-quota-tray.js`),
->   installed and running on this host via `systemd --user`.
-> - `rust-rewrite` — a **Rust port** (~3700 LOC across 10 modules, 51 unit
->   tests, ~4.4 MB release binary) with all features preserved. Built in
->   a Fedora 44 distrobox so the gtk3 / libappindicator / libsecret
->   `-devel` packages don't have to be installed on the host. The
->   resulting binary links against the runtime `.so` files already
->   shipped with Bluefin/Silverblue, so no host install is needed.
->
-> Pick a branch with `git checkout main` (gjs, currently running) or
-> `git checkout rust-rewrite` (Rust, opt-in). The `install.sh` script is
-> shared between both; it just copies whichever binary lives in the repo.
+Implements the [KDE StatusNotifierItem][sni] + `com.canonical.dbusmenu`
+protocols, so it works on any panel that speaks SNI: KDE Plasma,
+GNOME Shell (with the [AppIndicator][appindicator] extension), XFCE,
+swaybar, Waybar, Cairo-Dock, etc. No GTK/Qt deps in the Rust binary —
+the host's panel does all the rendering from the dbusmenu tree.
+
+[sni]: https://www.freedesktop.org/wiki/Specifications/StatusNotifierItem/
+[appindicator]: https://github.com/ubuntu/gnome-shell-extension-appindicator
+
+> The gjs implementation has been retired. The Rust port is the
+> only supported implementation on `main`. (~5000 LOC across 14
+> modules, 126 unit tests, ~5.5 MB release binary, ~10 MB RSS.) No GUI
+> library at all — talks to D-Bus directly and renders the icon as ARGB
+> bytes via `resvg` (or a raw BGRA circle routine for the static
+> states). No `~/.so` link deps beyond libc + libsecret + libdbus;
+> works on any Linux distro without needing gtk3/libappindicator/etc.
+> installed.
 
 ## What it shows
 
@@ -72,13 +76,24 @@ Talks directly to the MiniMax API — no agent or plugin system required.
 
 ## Requirements
 
-- GNOME Shell 45+ (tested on 50.3)
-- `gjs` ≥ 1.86 (for ESM imports)
-- `libgtk-3`, `libsecret`, `libsoup-3.0` (GObject Introspection typelibs)
-- `libayatana-appindicator` (or the **AppIndicator** GNOME Shell extension
-  enabled from <https://extensions.gnome.org>)
-- `secret-tool` (from `libsecret-tools`)
-- A MiniMax API key
+### Runtime
+
+- Linux, glibc ≥ 2.31 (uses epoll + io_uring syscalls)
+- A panel that speaks `org.kde.StatusNotifierItem`:
+  - **KDE Plasma** — works natively, no setup
+  - **GNOME Shell** — needs the [AppIndicator extension][appindicator] (the
+    gnome-shell-extension-appindicator package on Fedora/Ubuntu)
+  - **XFCE** with `xfce4-panel` + the `xfce4-statusnotifier-plugin`
+  - **swaybar**, **Waybar**, **Cairo-Dock**, **trayer-srg** — all work
+    natively (they speak SNI directly)
+- `libsecret` for the keyring (any libsecret provider — GNOME Keyring,
+  KWallet, KeePassXC's secret-service bridge)
+- A MiniMax API key (stored in the keyring, in `~/.config/minimax-quota/key`,
+  or in `MINIMAX_API_KEY` env var)
+
+### Build (for `install.sh`, which compiles from source)
+
+- Rust toolchain (install via [rustup](https://rustup.rs/))
 
 ## Install
 
@@ -88,11 +103,14 @@ cd minimax-quota-tray
 ./install.sh
 ```
 
-The installer copies the script to `~/.local/bin/`, the systemd unit to
-`~/.config/systemd/user/`, and writes a default config to
-`~/.config/minimax-quota/config.json` (skipped if it already exists).
-After it finishes, click the chip in your top bar → **Set API Key…** to
-store your key in GNOME Keyring.
+The installer compiles the Rust binary if needed
+(`cargo build --release` — first build is ~1-2 min, subsequent rebuilds
+are seconds since `target/` is cached), copies it to `~/.local/bin/`,
+installs the systemd unit to `~/.config/systemd/user/`, and writes a
+default config to `~/.config/minimax-quota/config.json` (skipped if it
+already exists). After it finishes, click the chip in your panel →
+**Set API Key…** to store your key in your libsecret provider
+(GNOME Keyring, KWallet, etc.).
 
 If you're not in a graphical session, run the installer from a desktop
 session or start the service manually after logging in:
@@ -107,7 +125,8 @@ systemctl --user enable --now minimax-quota.service
 ```
 
 Stops and disables the service, removes the installed files, and
-optionally purges your config dir and the stored key from GNOME Keyring.
+optionally purges your config dir and the stored key from your libsecret
+provider.
 
 ## Tests
 
@@ -211,50 +230,82 @@ if the cancel-before-arm logic is ever removed.
 
 ## How it works
 
+The Rust binary implements both the `org.kde.StatusNotifierItem`
+interface (the chip properties + click handlers) and the
+`com.canonical.dbusmenu` interface (the menu tree) directly over
+D-Bus. The host panel reads SNI properties and walks the dbusmenu tree
+to render a native menu.
+
 ```
    ┌──────────────────────────┐
-   │   minimax-quota-tray.js  │   gjs ESM, GTK 3, Soup 3, Secret-1
+   │   minimax-quota-tray      │   ~5.5 MB ELF, no GUI library;
+   │                          │   links libc + libsecret + libdbus only
    └────────────┬─────────────┘
                 │
    ┌────────────┴─────────────┐
-   │  AyatanaAppIndicator3     │   StatusNotifierItem via the
-   │                           │   AppIndicator GNOME extension
+   │  zbus + custom dbusmenu    │   StatusNotifierItem properties
+   │  server (no proxy)        │   + com.canonical.dbusmenu tree
    └────────────┬─────────────┘
                 │
-   GTK Menu  ←  Soup-3.0  →  api.minimax.io/v1/{coding_plan|token_plan}/remains
+   Host's SNI panel ←  reqwest →  api.minimax.io/v1/{coding_plan|token_plan}/remains
                 ↓
-   Secret-1 (read) → GNOME Keyring (login)
-   secret-tool    ← writes via Gio.Subprocess stdin pipe
+   secret-service crate  →  libsecret (any provider)
 ```
 
-No custom widgets in the menu — SNI menus render `Gtk.ProgressBar` and
-`Gtk.DrawingArea` inconsistently (the trough blends with the background,
-`draw` signals don't fire reliably). The bar is Unicode block characters
-(`█` / `░`) with Pango color markup applied to the menu item's child
-`GtkLabel` via `item.get_child().set_markup()`.
+```
+   ┌──────────────────────────┐
+   │   minimax-quota-tray      │   ~5.5 MB ELF, no GUI library;
+   │                          │   links libc + libsecret + libdbus only
+   └────────────┬─────────────┘
+                │
+   ┌────────────┴─────────────┐
+   │  zbus + custom dbusmenu    │   StatusNotifierItem properties
+   │  server (no proxy)        │   + com.canonical.dbusmenu tree
+   └────────────┬─────────────┘
+                │
+   Host's SNI panel ←  reqwest →  api.minimax.io/v1/{coding_plan|token_plan}/remains
+                ↓
+   secret-service crate  →  libsecret (any provider)
+```
 
-The keyring write goes through `secret-tool` (GNOME's own CLI) via
-`Gio.Subprocess` with `STDIN_PIPE` — direct argv, no shell, no temp
-file. The `Secret-1` gjs binding for `password_store_sync` has
-unreliable arg semantics across libsecret versions, so writes are
-shelled out; reads use `Secret.password_lookup_sync` directly.
+The Rust port doesn't draw anything itself — the host's panel reads the
+SNI properties and renders an icon, and walks the dbusmenu tree to
+build a native menu (a KDE Plasma `KMenu`, a Waybar menu, etc.). This
+is why the Rust binary is ~5.5 MB instead of the 25+ MB you'd get with
+a linked-in GTK.
+
+The keyring write goes through `secret-tool` (libsecret's CLI) via
+`tokio::process::Command` with `Stdio::piped()` — direct argv, no
+shell, no temp file. The `secret-service` rust crate's `create_item`
+has unreliable arg semantics across libsecret versions, so writes are
+shelled out; reads use the crate directly.
 
 ## Troubleshooting
 
-- **Three dots where the icon should be** — the static status icons
-  (`icons/quota-{normal,warning,throttled,offline,error}.svg`) aren't being
-  resolved by the icon theme. The installer copies them into
-  `~/.local/share/icons/hicolor/scalable/apps/` and refreshes the icon
-  cache; if that step was skipped, the icons won't appear. Inspect with
-  `gjs -c "imports.gi.versions.GTK='3.0'; const t=Gtk.IconTheme.get_default(); print(t.lookup_icon('quota-normal', 16, 0)?.get_filename() ?? 'NOT FOUND');"`
-- **`Argument password may not be null`** — your GNOME Keyring is locked.
-  Unlock it or re-enter the key from the menu (click chip → **Set API Key…**).
-- **`Requiring Gtk, version 3.0: ... '4.0' is already loaded`** — make
-  sure nothing in your pipeline imports `gi://Gdk` without
-  `?version=3.0`. Drop the bare `Gdk` import.
+- **Right-click on the icon does nothing** — your panel doesn't speak
+  SNI, or it's SNI-aware but the AppIndicator bridge is missing. On
+  GNOME you need the AppIndicator extension; on KDE Plasma it works
+  natively; on swaybar/Waybar it works natively too.
+
+- **Icon shows three dots** — the Rust binary writes ring PNGs to
+  `$TMPDIR` (default `/tmp`) at startup. If `TMPDIR` is read-only or
+  tmpfs is too small, the icons fall back to a static dot. Check
+  `/tmp/minimax-quota-*.png` exists and is readable.
+
+- **`Argument password may not be null`** — your keyring daemon is
+  locked. Unlock it or re-enter the key from the menu (click chip →
+  **Set API Key…**).
+
 - **`secret_service_create_item_dbus_path: assertion ... collection_path != NULL`**
-  — the GNOME Keyring daemon isn't reachable. Check that
-  `gnome-keyring-daemon --components=secrets` is running.
+  — no libsecret daemon is reachable. Check that gnome-keyring-daemon
+  (`--components=secrets`), kwalletd, or KeePassXC's secret-service
+  bridge is running.
+
+- **`MINIMAX_API_KEY` env var works but keyring doesn't** — your
+  panel session doesn't have the libsecret `$DBUS_SESSION_BUS_ADDRESS`
+  reachable, so the binary falls through to the env var. This is
+  fine — just keep the env var set in your shell rc file or systemd
+  unit's `Environment=` line.
 
 ## Porting to another provider
 
@@ -281,13 +332,18 @@ the active one.
 ### What requires code changes
 
 All provider-specific code lives in two short sections of
-`minimax-quota-tray.js`. Everything else (tray UI, keyring, scheduler,
-network monitor) stays as-is.
+`src/fetch.rs` (HTTP shape) and `src/parse.rs` (JSON → window
+mapping). Everything else (tray UI, keyring, scheduler, network
+monitor) stays as-is.
 
-#### 1. Auth header — `fetchQuota()` (around line 172)
+#### 1. Auth header — `src/fetch.rs::fetch_windows_blocking()` (around line 33)
 
-```js
-message.request_headers.append('Authorization', `Bearer ${apiKey}`);
+```rust
+let resp = client
+    .get(endpoint)
+    .bearer_auth(api_key)
+    .send()
+    .context("HTTP request")?;
 ```
 
 Common alternatives:
@@ -305,7 +361,7 @@ If you need more than one header per request, append more
 auth, skip the keyring entirely and load the token from a file or env var in
 `loadApiKey()`.
 
-#### 2. Response parser — `parsePayload()` and `parseWindow()` (lines 199–224)
+#### 2. Response parser — `src/parse.rs::parse_coding_plan()` and friends
 
 This is the only piece tightly coupled to MiniMax's JSON shape. The MiniMax
 `/remains` endpoint returns:
@@ -404,18 +460,18 @@ global per user):
 
 | What                          | Where                                             |
 | ----------------------------- | ------------------------------------------------- |
-| Script filename               | `minimax-quota-tray.js` → e.g. `openai-quota.js`  |
+| Script filename               | `minimax-quota-tray` → e.g. `openai-quota-tray`     |
 | systemd unit                  | `minimax-quota.service`                           |
 | Config dir                    | `~/.config/minimax-quota/`                        |
 | Keyring schema name           | `org.dlafreniere.minimax-quota`                   |
 | Keyring `application` attr    | `minimax-quota`                                   |
 | Keyring item label            | `MiniMax API Key`                                 |
 
-Change them in: the script's `KEY_SCHEMA`, `KEY_ATTRIBUTES`, `KEY_LABEL`,
-`CONFIG_DIR`/`CONFIG_PATH`; the `ExecStart=` line in the `.service` unit;
-and `install.sh` / `uninstall.sh` (the paths and `secret-tool` argv). Pick
-a single provider-specific token (e.g. `openai-quota`) and use it
-consistently across all six — that's what keeps multiple forks from
+Change them in: `src/keyring.rs` (`LABEL`, `attrs()`), the config
+schema (`src/config.rs`), the `ExecStart=` line in `minimax-quota.service`,
+and `install.sh` / `uninstall.sh` (the paths and `secret-tool` argv).
+Pick a single provider-specific token (e.g. `openai-quota`) and use
+it consistently across all six — that's what keeps multiple forks from
 stomping on each other's keyring entries.
 
 ### Worked example: porting to a hypothetical `/v1/usage` endpoint
@@ -444,35 +500,27 @@ Authorization: Bearer <key>
 }
 ```
 
-`fetchQuota()`: already uses Bearer — no change if Provider X is the same.
+`fetch_windows_blocking()`: already uses Bearer — no change if Provider X is the same.
 
-`parsePayload()` rewrite (drop-in replacement for lines 219–224):
+`parse_coding_plan()` rewrite — drop-in for the parser. The shape
+the UI consumes is the same; map your provider's payload into a
+`Vec<Window>` and the rest of the code is unchanged. The fields
+the UI needs:
 
-```js
-function parsePayload(payload) {
-  if (!payload.daily) throw new Error('Provider X returned no daily window');
-  const makeWindow = (key, label) => {
-    const w = payload[key];
-    return {
-      // `label` is what shows in the menu ("daily: 80% left · resets in 18h").
-      // `id` is optional and only used by the parser for its own bookkeeping;
-      // the UI never looks at it.
-      label,
-      total: Number(w.limit) || 0,
-      used:  Number(w.used)  || 0,
-      remaining_pct: Math.max(0, Math.min(100, 100 * (1 - w.used / w.limit))),
-      resetAt: Date.now() + Number(w.reset_in_ms || 0),
-      throttled: false,
-    };
-  };
-  // First window = primary (drives the top-bar chip). Put the more urgent
-  // window first if you want the chip to reflect it.
-  return [makeWindow('daily',   'daily'),
-          makeWindow('monthly', 'monthly')];
+```rust
+pub struct Window {
+    pub id: &'static str,    // unique within the windows vec
+    pub total: i64,
+    pub used: i64,
+    pub remaining_pct: i64,  // 0..100; drives chip + bar
+    pub reset_at: i64,       // absolute ms; drives "resets in X"
+    pub start_at: i64,       // optional; epoch start for burn projection
 }
 ```
 
-That's it — no other code in the project needs to move.
+Always return 1–2 windows. The UI is laid out for a short-window +
+long-window pair. To run with a single window, return one entry —
+the menu and burn-rate row render automatically for each window.
 
 ## License
 

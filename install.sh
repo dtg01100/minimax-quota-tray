@@ -2,44 +2,49 @@
 #
 # install.sh — install minimax-quota-tray for the current user.
 #
+# Builds the Rust release binary if it's not already built, copies it to
+# ~/.local/bin/, installs the systemd user unit, and writes a default
+# config. No gjs / gtk / libayatana-appindicator required at install time.
+#
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-BIN_DEST="$HOME/.local/bin/minimax-quota-tray.js"
+BIN_SRC="$ROOT/target/release/minimax-quota-tray"
+BIN_DEST="$HOME/.local/bin/minimax-quota-tray"
 SERVICE_DEST="$HOME/.config/systemd/user/minimax-quota.service"
 CONFIG_DIR="$HOME/.config/minimax-quota"
 CONFIG_DEST="$CONFIG_DIR/config.json"
 
 # Sanity checks
-command -v gjs >/dev/null 2>&1 || {
-  echo "error: gjs not installed" >&2
-  echo "  try: dnf install gjs   (Fedora)   /   apt install gjs   (Debian/Ubuntu)" >&2
-  exit 1
-}
-command -v secret-tool >/dev/null 2>&1 || {
-  echo "error: secret-tool not installed" >&2
-  echo "  try: dnf install libsecret-tools   /   apt install libsecret-tools" >&2
+command -v cargo >/dev/null 2>&1 || {
+  echo "error: cargo (Rust toolchain) not found" >&2
+  echo "  install via rustup: https://rustup.rs/" >&2
   exit 1
 }
 command -v systemctl >/dev/null 2>&1 || {
   echo "error: systemctl not found (not a systemd system?)" >&2
   exit 1
 }
-# Soft preflight warnings: the app degrades gracefully if these are absent,
-# but the user should know before the tray silently falls back.
-command -v magick >/dev/null 2>&1 || {
-  echo "warning: ImageMagick (magick) not found — dynamic ring icons will fall back to static dots" >&2
-  echo "  try: dnf install ImageMagick   /   apt install imagemagick" >&2
-}
-command -v gnome-keyring-daemon >/dev/null 2>&1 || {
-  echo "warning: gnome-keyring-daemon not detected — secret-tool writes may fail at runtime" >&2
-  echo "  ensure GNOME Keyring (gnome-keyring-daemon --components=secrets) is running" >&2
+# Rust binary links against libsecret + libdbus — both ubiquitous on
+# modern Linux. Warn (don't fail) if libsecret-tools is missing, since
+# the binary degrades gracefully (env-var fallback, see README).
+command -v secret-tool >/dev/null 2>&1 || {
+  echo "warning: secret-tool not installed — only MINIMAX_API_KEY env var will work" >&2
+  echo "  try: dnf install libsecret-tools   /   apt install libsecret-tools" >&2
 }
 
-# Install binary
+# Build the release binary if it's not there or the source is newer.
+# `cargo build --release` is incremental — a fresh checkout will take
+# ~1-2 min (cold link), subsequent rebuilds are seconds.
+if [ ! -x "$BIN_SRC" ] || [ -n "$(find "$ROOT/src" -newer "$BIN_SRC" 2>/dev/null | head -1)" ]; then
+  echo "building minimax-quota-tray (release)…"
+  (cd "$ROOT" && cargo build --release)
+fi
+
+# Install binary (rename so it doesn't carry the .js suffix anymore)
 install -d "$HOME/.local/bin"
-install -m 0755 "$ROOT/minimax-quota-tray.js" "$BIN_DEST"
+install -m 0755 "$BIN_SRC" "$BIN_DEST"
 echo "installed: $BIN_DEST"
 
 # Install systemd unit
@@ -47,24 +52,8 @@ install -d "$HOME/.config/systemd/user"
 install -m 0644 "$ROOT/minimax-quota.service" "$SERVICE_DEST"
 echo "installed: $SERVICE_DEST"
 
-# Install status icons into the hicolor theme so the AppIndicator can resolve
-# them by name without absolute paths.
-if [ -d "$ROOT/icons" ]; then
-  install -d "$HOME/.local/share/icons/hicolor/scalable/apps"
-  for f in "$ROOT"/icons/*.svg; do
-    install -m 0644 "$f" "$HOME/.local/share/icons/hicolor/scalable/apps/"
-  done
-  # Refresh the icon cache if the tool is available; otherwise most desktops
-  # will pick the icons up on demand.
-  command -v gtk-update-icon-cache >/dev/null 2>&1 \
-    && gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
-  echo "installed icons: $(ls "$ROOT"/icons/*.svg | wc -l) into ~/.local/share/icons/hicolor/scalable/apps/"
-fi
-
 # First-run config (don't clobber an existing one)
 if [ ! -f "$CONFIG_DEST" ]; then
-  # 0700 so the directory matches what the app enforces on subsequent runs
-  # (it only chmods the file, not the parent).
   install -d -m 0700 "$CONFIG_DIR"
   install -m 0600 "$ROOT/config.example.json" "$CONFIG_DEST"
   echo "wrote default config: $CONFIG_DEST"
@@ -77,7 +66,7 @@ if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
   systemctl --user enable --now minimax-quota.service || true
   echo
   echo "Service enabled and started."
-  echo "Next: click the chip in your top bar → 'Set API Key…' to store your key."
+  echo "Next: click the chip in your panel → 'Set API Key…' to store your key."
 else
   echo
   echo "Service installed but not started (no graphical session detected)."

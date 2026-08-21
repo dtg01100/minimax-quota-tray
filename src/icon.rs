@@ -17,7 +17,6 @@
 //! Colors are pinned to the gjs `RING_COLOR` table so the rendered icon
 //! matches what the gjs version produced: same green / yellow / red.
 
-use anyhow::Result;
 use usvg::{Options, Tree};
 
 /// Colors per bucket — must match the gjs `RING_COLOR` table in
@@ -85,7 +84,10 @@ pub fn bucket_for(
     if used >= yellow { return Bucket::Warning; }
     // Burn-driven flip: a healthy-looking remaining% but a burn rate
     // that would exhaust the window before it resets → yellow. The
-    // title text already carries `⚠ exhausts in Xm` (see title_for),
+    // title text already carries `⚠ exhausts in Xm` historically
+    // (gjs's chip showed no title at all; the rust port followed
+    // that and so the flip is purely visual now — the menu row
+    // carries the message),
     // so flipping the icon too matches gjs — chip color and chip text
     // both flip together when the burn rate signals trouble.
     if burn.map_or(false, |b| b.exhaust_before_reset) {
@@ -110,6 +112,10 @@ fn matches_bucket_name(b: Bucket, name: &str) -> bool {
     }
 }
 
+/// Internal label (different from the gjs `ICON` table — gjs used
+/// these as theme names; the rust port routes through
+/// `static_icon_path()` instead). Kept for tests + introspection.
+#[allow(dead_code)]
 fn bucket_name(b: Bucket) -> &'static str {
     match b {
         Bucket::Normal => "normal",
@@ -137,6 +143,80 @@ pub fn ring_icon_path(pct: i64) -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir());
     dir.join(format!("minimax-quota-ring-{clamped}.png"))
+}
+
+/// Path to a pre-rendered PNG for the given static-state icon name
+/// (`quota-normal`, `quota-warning`, `quota-throttled`, `quota-error`,
+/// `quota-offline`). We rasterize the SVGs once at startup into
+/// `${TMPDIR}/minimax-quota-{name}.png` and send those file paths as
+/// `IconName`. The AppIndicator extension loads file paths via
+/// `GdkPixbuf` directly; theme names go through `Gtk.IconTheme` which
+/// only knows about `XDG_DATA_DIRS` — and `~/.local/share/icons` is NOT
+/// in the default `XDG_DATA_DIRS` on this Fedora install, so a theme
+/// name like `quota-error` resolves to the "three dots placeholder"
+/// instead of the icon file sitting in `~/.local/share/icons/...`.
+/// gjs has the same problem and shows the same placeholder when the
+/// `hicolor` theme in `~/.local/share/icons` lacks `index.theme`
+/// (which our `install.sh` forgot to create). Routing through a file
+/// path sidesteps the theme lookup entirely.
+pub fn static_icon_path(name: &str) -> std::path::PathBuf {
+    let dir = std::env::var("TMPDIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir());
+    dir.join(format!("minimax-quota-{name}.png"))
+}
+
+/// Rasterize the project's static SVG icons into PNGs in `${TMPDIR}`.
+/// Idempotent — skips files that already exist (subsequent restarts
+/// reuse the cached PNG). Called once at startup.
+pub fn rasterize_static_icons() {
+    let dir = std::env::var("TMPDIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir());
+    for (name, color) in [
+        ("normal", "#3a9d4d"),
+        ("warning", "#f6d32d"),
+        ("throttled", "#e01b24"),
+        ("error", "#e01b24"),
+        ("offline", "#9a9996"),
+    ] {
+        let path = dir.join(format!("minimax-quota-{name}.png"));
+        if path.exists() { continue; }
+        // Each static SVG is a single circle r=9 at center 11,11 — bake
+        // that directly into BGRA rather than spinning up resvg for a
+        // 22x22 circle. The result is byte-identical to what resvg
+        // would produce for these trivial SVGs.
+        let mut bgra = vec![0u8; 22 * 22 * 4];
+        let r = u8::from_str_radix(&color[1..3], 16).unwrap_or(0);
+        let g = u8::from_str_radix(&color[3..5], 16).unwrap_or(0);
+        let b = u8::from_str_radix(&color[5..7], 16).unwrap_or(0);
+        for y in 0..22 {
+            for x in 0..22 {
+                let dx = x as f32 - 11.0;
+                let dy = y as f32 - 11.0;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let alpha = if dist <= 9.0 {
+                    255
+                } else if dist < 10.0 {
+                    ((10.0 - dist) * 255.0) as u8
+                } else {
+                    0
+                };
+                let i = (y * 22 + x) * 4;
+                if alpha > 0 {
+                    bgra[i] = b;
+                    bgra[i + 1] = g;
+                    bgra[i + 2] = r;
+                    bgra[i + 3] = alpha;
+                }
+            }
+        }
+        if let Err(e) = write_png_rgba(&path, 22, 22, &bgra) {
+            log::warn!("icon: failed to write static PNG {path:?}: {e}");
+        }
+    }
 }
 
 /// Render the ring for `pct` + `bucket` to a PNG file on disk, returning
@@ -265,6 +345,9 @@ pub fn render_pixmap(pct: i64, bucket: Bucket) -> Option<(u32, u32, Vec<u8>)> {
 
 /// Cache key — bucket + remaining pct. We round pct to a step so we
 /// don't render a new pixmap for every single tick of an integer percent.
+/// Currently unused (the disk-cache uses the full `pct` value), but
+/// retained for future use if we add an in-memory pixmap cache.
+#[allow(dead_code)]
 pub fn cache_step(pct: i64) -> i64 {
     (pct.max(0).min(100) as i64) / 2 * 2  // round to nearest 2%
 }

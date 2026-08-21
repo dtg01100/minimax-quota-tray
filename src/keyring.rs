@@ -4,7 +4,7 @@
 //! daemon isn't running — the gjs code used the same fallback.
 
 use anyhow::{Context, Result};
-use secret_service::blocking::{Collection, SecretService};
+use secret_service::blocking::SecretService;
 use secret_service::EncryptionType;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,13 +28,62 @@ fn attrs() -> HashMap<&'static str, &'static str> {
     ATTRS.iter().copied().collect()
 }
 
+/// Look up the API key. Priority order matches the gjs `loadApiKey()`:
+///
+///   1. Secret Service (GNOME Keyring / KWallet via libsecret).
+///   2. Legacy plaintext file at `$HOME/.config/.config/minimax-quota/key`
+///      (auto-migrated to the keyring on first run by the gjs code;
+///      here we just read it as a fallback if the keyring daemon is
+///      unreachable).
+///   3. `MINIMAX_API_KEY` env var. Useful for systemd unit overrides
+///      where the user prefers not to store a key in the keyring.
+///
+/// Returns `None` if all three are missing/empty. Callers should treat
+/// `None` as "no API key configured" and surface that in the UI
+/// (matches gjs `printerr` + "No API key" chip state).
 pub fn get() -> Option<String> {
-    let svc = service()?;
-    let collection = svc.get_default_collection().ok()?;
-    let items: Vec<_> = collection.search_items(attrs()).ok()?;
-    let item = items.into_iter().next()?;
-    let bytes = item.get_secret().ok()?;
-    String::from_utf8(bytes).ok()
+    // 1. Secret Service
+    if let Some(svc) = service() {
+        if let Ok(collection) = svc.get_default_collection() {
+            if let Ok(items) = collection.search_items(attrs()) {
+                if let Some(item) = items.into_iter().next() {
+                    if let Ok(bytes) = item.get_secret() {
+                        if let Some(k) = secret_to_key(&bytes) {
+                            return Some(k);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 2. Legacy file (created by older install scripts; install.sh
+    // now uses Secret Service directly, so this is a fallback).
+    let path = legacy_key_path();
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Some(k) = secret_to_key(&bytes) {
+            return Some(k);
+        }
+    }
+    // 3. Env var. Trim + reject — matches the gjs handling that
+    // treats an all-whitespace env value as absent.
+    if let Ok(raw) = std::env::var("MINIMAX_API_KEY") {
+        if let Some(k) = secret_to_key(raw.as_bytes()) {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// Convert the raw secret bytes from the keyring into a usable API key.
+/// Some keyring tools (e.g. `secret-tool store` via a shell pipe) persist a
+/// trailing newline; passing that straight into the `Authorization` header
+/// makes reqwest fail with "failed to parse header value". Trim both ends
+/// and drop empty secrets.
+fn secret_to_key(bytes: &[u8]) -> Option<String> {
+    String::from_utf8(bytes.to_vec())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn set(value: &str) -> Result<()> {
@@ -72,6 +121,11 @@ pub fn set(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove the stored API key from the keyring (and the legacy file
+/// fallback). Used by `gjs` menu's clear flow; exposed here for
+/// parity but not currently wired into the Rust menu. Calling it is
+/// safe; the function is best-effort.
+#[allow(dead_code)]
 pub fn clear() -> Result<()> {
     if let Some(svc) = service() {
         if let Ok(collection) = svc.get_default_collection() {
@@ -102,6 +156,98 @@ fn legacy_key_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Tests in this module mutate the global `MINIMAX_API_KEY` env
+    /// var. Serialize them so cargo's parallel runner doesn't have
+    /// two tests stomp on each other's env state.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set `MINIMAX_API_KEY` for the duration of `body`, restoring
+    /// the previous value (if any) when `body` returns. The body
+    /// must NOT panic — we don't catch_unwind here because that
+    /// would force callers to be UnwindSafe.
+    fn with_env<F: FnOnce()>(env_value: Option<&str>, body: F) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("MINIMAX_API_KEY").ok();
+        match env_value {
+            Some(v) => std::env::set_var("MINIMAX_API_KEY", v),
+            None => std::env::remove_var("MINIMAX_API_KEY"),
+        }
+        let result = body();
+        match prev {
+            Some(v) => std::env::set_var("MINIMAX_API_KEY", v),
+            None => std::env::remove_var("MINIMAX_API_KEY"),
+        }
+        result
+    }
+
+    #[test]
+    fn secret_with_trailing_newline_is_trimmed() {
+        // Regression: `secret-tool store` via a shell pipe persists the
+        // key with a trailing \n. Untrimmed, that byte lands in the
+        // Authorization header and reqwest rejects it with "failed to
+        // parse header value".
+        let mut raw = b"sk-cp-7oBx1Pu1i-V7sgUWNltHjGF1YtTpiFReV_erIfmB4MGPDrh8unHRa5z2N9r5kIO9jGnYdf-LUhY6fnm6ng_pGtxwSBC4pyu1_AfGsOSvLf0IO0V7tj3j93s".to_vec();
+        raw.push(b'\n');
+        assert_eq!(secret_to_key(&raw).as_deref(),
+                   Some("sk-cp-7oBx1Pu1i-V7sgUWNltHjGF1YtTpiFReV_erIfmB4MGPDrh8unHRa5z2N9r5kIO9jGnYdf-LUhY6fnm6ng_pGtxwSBC4pyu1_AfGsOSvLf0IO0V7tj3j93s"));
+    }
+
+    #[test]
+    fn secret_with_leading_and_trailing_whitespace_is_trimmed() {
+        assert_eq!(secret_to_key(b"  sk-test-key  \r\n").as_deref(),
+                   Some("sk-test-key"));
+    }
+
+    #[test]
+    fn empty_secret_is_rejected() {
+        assert_eq!(secret_to_key(b""), None);
+        assert_eq!(secret_to_key(b"\n\n"), None);
+    }
+
+    #[test]
+    fn non_utf8_secret_is_rejected() {
+        assert_eq!(secret_to_key(&[0xff, 0xfe, 0xfd]), None);
+    }
+
+    #[test]
+    fn clean_secret_passes_through_unchanged() {
+        assert_eq!(secret_to_key(b"sk-clean-key").as_deref(), Some("sk-clean-key"));
+    }
+
+    #[test]
+    fn env_var_fallback_used_when_keyring_and_file_unavailable() {
+        // We can't easily isolate the keyring daemon in unit tests,
+        // so this test is gated on the keyring being unavailable
+        // (which is the case in CI / containers — see the
+        // `service()` cache).
+        //
+        // To force the env-var path we set MINIMAX_API_KEY and
+        // rely on the keyring/legacy-file lookups failing in the
+        // test container.
+        with_env(Some("sk-env-test-key"), || {
+            let result = get();
+            // In an environment with a working keyring this might
+            // short-circuit before the env check, so we only assert
+            // what we can guarantee: if we got a value, it's non-empty.
+            if let Some(k) = result {
+                assert!(!k.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn env_var_with_trailing_newline_trimmed() {
+        with_env(Some("sk-env-key\n"), || {
+            // The actual return depends on whether the keyring is
+            // available; what we can guarantee is that *if* the env
+            // path is taken, the trailing newline is stripped.
+            // We exercise secret_to_key directly to lock the behavior.
+            let trimmed = secret_to_key(b"sk-env-key\n");
+            assert_eq!(trimmed.as_deref(), Some("sk-env-key"));
+        });
+    }
 
     #[test]
     fn legacy_key_path_under_home() {

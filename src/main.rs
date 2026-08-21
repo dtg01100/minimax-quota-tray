@@ -150,10 +150,11 @@ async fn run() -> Result<()> {
 
     let cfg = Arc::new(config::load_or_init()?);
     log::info!(
-        "started: endpoint={} label={:?} shape_windows={} auth={:?} rings={:?}/{:?}/{:?}",
+        "started: endpoint={} label={:?} shape_windows={} auth={:?} rings_inner={:?}/{:?}/{:?} rings_outer={:?}",
         cfg.endpoint, cfg.label, cfg.shape.windows.len(),
         std::mem::discriminant(&cfg.auth),
-        cfg.ring_colors.normal, cfg.ring_colors.warning, cfg.ring_colors.throttled,
+        cfg.ring_colors.inner.normal, cfg.ring_colors.inner.warning, cfg.ring_colors.inner.throttled,
+        cfg.ring_colors.outer,
     );
 
     let http_client = fetch::build_client(&cfg.user_agent)

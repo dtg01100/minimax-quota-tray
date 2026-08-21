@@ -1134,6 +1134,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
+name = "llm-quota-tray"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "futures-util",
+ "log",
+ "reqwest",
+ "secret-service",
+ "serde",
+ "serde_json",
+ "tiny-skia",
+ "tokio",
+ "zbus 5.19.0",
+]
+
+[[package]]
 name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1167,23 +1184,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "minimax-quota-tray"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "env_logger",
- "futures-util",
- "log",
- "reqwest",
- "secret-service",
- "serde",
- "serde_json",
- "tiny-skia",
- "tokio",
- "zbus 5.19.0",
 ]
 
 [[package]]

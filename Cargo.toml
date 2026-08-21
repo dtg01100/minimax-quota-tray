@@ -1,8 +1,8 @@
 [package]
-name = "minimax-quota-tray"
+name = "llm-quota-tray"
 version = "0.2.0"
 edition = "2021"
-description = "GNOME tray indicator for MiniMax quota — Rust port of the gjs original"
+description = "Provider-agnostic tray indicator for LLM API quota — supports any quota API via a config-only port"
 license = "MIT"
 
 [dependencies]

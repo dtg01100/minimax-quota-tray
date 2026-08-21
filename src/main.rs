@@ -472,7 +472,7 @@ async fn do_refresh(
                         .to_string_lossy().into_owned()
                 }
                 icon::Bucket::Throttled => {
-                    icon::static_svg_path("throttled").to_string_lossy().into_owned()
+                    icon::static_svg_path("throttled", &cfg.ring_colors).to_string_lossy().into_owned()
                 }
             };
             // SNI Title is empty (gjs parity — chip carries the
@@ -618,7 +618,7 @@ async fn render_initial(tray: &Arc<Tray>, cfg: &Config) {
     let tip = cfg.label.clone();
     let _ = tray.update(
         "",
-        &icon::static_svg_path("normal").to_string_lossy(),
+        &icon::static_svg_path("normal", &cfg.ring_colors).to_string_lossy(),
         "Active",
         None,
         &tip,
@@ -637,7 +637,7 @@ async fn render_error(tray: &Arc<Tray>, cfg: &Config, msg: &str) {
     let tip = format!("{} — stale data", cfg.label);
     let _ = tray.update(
         "",
-        &icon::static_svg_path("error").to_string_lossy(),
+        &icon::static_svg_path("error", &cfg.ring_colors).to_string_lossy(),
         "Active",
         None,
         &tip,
@@ -683,7 +683,7 @@ async fn render_error_with_stale(
     // The primary window is stale_windows[0] when available.
     let (icon_name, pixmap) = match stale_windows.first() {
         Some(w) if w.remaining_pct <= 0 => {
-            (icon::static_svg_path("throttled").to_string_lossy().into_owned(), None)
+            (icon::static_svg_path("throttled", &cfg.ring_colors).to_string_lossy().into_owned(), None)
         }
         Some(w) => {
             // Stale but not throttled — show the ring at the last
@@ -698,7 +698,7 @@ async fn render_error_with_stale(
             (path, pix)
         }
         None => {
-            (icon::static_svg_path("error").to_string_lossy().into_owned(), None)
+            (icon::static_svg_path("error", &cfg.ring_colors).to_string_lossy().into_owned(), None)
         }
     };
 
@@ -738,7 +738,7 @@ async fn render_out_of_menu(tray: &Arc<Tray>, cfg: &Config, offline: bool) {
         let tip = format!("{} — offline", cfg.label);
         let _ = tray.update(
             "",
-            &icon::static_svg_path("offline").to_string_lossy(),
+            &icon::static_svg_path("offline", &cfg.ring_colors).to_string_lossy(),
             "Active",
             None,
             &tip,

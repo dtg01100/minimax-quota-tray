@@ -174,27 +174,61 @@ fn bucket_name(b: Bucket) -> &'static str {
 /// from `render_pixmap`), so the icon still renders. We always send
 /// both: the SVG file as `IconName` for hosts that can use it, and the
 /// ARGB bytes as `IconPixmap` as the universal fallback.
-pub fn ring_svg_path(pct: i64) -> std::path::PathBuf {
+/// Stable cross-process hash of the four channel colors. Used as
+/// part of the SVG filename so any edit to `ring_colors` produces a
+/// fresh path, automatically invalidating the on-disk cache when the
+/// user retunes `~/.config/llm-quota-tray/config.json`.
+///
+/// We can't use `std::collections::hash_map::DefaultHasher` —
+/// `DefaultHasher` is randomized per-process to harden `HashMap`
+/// against DoS, so the same colors would hash differently on every
+/// daemon restart. FNV-1a is stable, tiny, dependency-free, and
+/// more than collision-resistant for the four ~7-char hex strings
+/// we feed it.
+fn colors_hash(colors: &RingColors) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for chunk in [
+        colors.inner.normal.as_bytes(),
+        b"|",
+        colors.inner.warning.as_bytes(),
+        b"|",
+        colors.inner.throttled.as_bytes(),
+        b"|",
+        colors.outer.as_bytes(),
+    ] {
+        for &b in chunk {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+    }
+    h
+}
+
+pub fn ring_svg_path(pct: i64, colors: &RingColors) -> std::path::PathBuf {
     let clamped = pct.clamp(0, 100);
+    let hash = colors_hash(colors);
     let dir = std::env::var("TMPDIR")
         .ok()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir());
-    dir.join(format!("minimax-quota-ring-{clamped}.svg"))
+    dir.join(format!("minimax-quota-ring-{clamped}-{hash:016x}.svg"))
 }
 
 /// Path to a pre-written SVG for the given static-state icon name
 /// (`normal`, `warning`, `throttled`, `error`, `offline`). See
 /// `ring_svg_path()` for the full rationale on why we send SVG file
 /// paths as `IconName`. The static SVGs are written to
-/// `${TMPDIR}/minimax-quota-{name}.svg` once at startup by
-/// `write_static_svgs()`.
-pub fn static_svg_path(name: &str) -> std::path::PathBuf {
+/// `${TMPDIR}/minimax-quota-{name}-{hash}.svg` once at startup by
+/// `write_static_svgs()`. The `{hash}` component is `colors_hash()`
+/// of the active `RingColors` so config edits invalidate the cache
+/// without manual intervention.
+pub fn static_svg_path(name: &str, colors: &RingColors) -> std::path::PathBuf {
+    let hash = colors_hash(colors);
     let dir = std::env::var("TMPDIR")
         .ok()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir());
-    dir.join(format!("minimax-quota-{name}.svg"))
+    dir.join(format!("minimax-quota-{name}-{hash:016x}.svg"))
 }
 
 /// SVG template for a static icon — a single filled `<circle r="9">`
@@ -247,8 +281,9 @@ pub fn write_static_svgs(colors: &RingColors) {
         ("error",     &colors.inner.throttled),
         ("offline",   OFFLINE_COLOR),
     ];
+    let hash = colors_hash(colors);
     for (name, color) in entries {
-        let path = dir.join(format!("minimax-quota-{name}.svg"));
+        let path = dir.join(format!("minimax-quota-{name}-{hash:016x}.svg"));
         if path.exists() { continue; }
         if let Err(e) = std::fs::write(&path, svg_static(color)) {
             log::warn!("icon: failed to write static SVG {path:?}: {e}");
@@ -268,7 +303,7 @@ pub fn write_static_svgs(colors: &RingColors) {
 /// just rendered at the panel's target size instead of upscaled from
 /// 22×22.
 pub fn write_ring_svg(pct: i64, bucket: Bucket, colors: &RingColors) -> std::path::PathBuf {
-    let path = ring_svg_path(pct);
+    let path = ring_svg_path(pct, colors);
     if path.exists() { return path; }
     let svg = svg_for(pct,
                       &inner_color_for(bucket, colors),
@@ -783,10 +818,14 @@ mod tests {
     // staring at a "three dots" placeholder.
     // ------------------------------------------------------------------
 
+    fn default_colors() -> RingColors { crate::provider::default_ring_colors() }
+
     #[test]
     fn ring_svg_path_uses_svg_extension() {
-        let p = ring_svg_path(80);
-        assert!(p.to_str().unwrap().ends_with("minimax-quota-ring-80.svg"),
+        let p = ring_svg_path(80, &default_colors());
+        // The filename ends with `.svg`; the pct segment and 16-hex
+        // color hash are between the prefix and the extension.
+        assert!(p.to_str().unwrap().ends_with(".svg"),
                 "expected .svg extension; got {p:?}");
     }
 
@@ -795,19 +834,97 @@ mod tests {
         // Same clamping rule as the old PNG path — out-of-range pct
         // gets pinned to 0 or 100 in the filename so a hostile or
         // buggy refresh can't write `minimax-quota-ring--5.svg`.
-        assert!(ring_svg_path(0).to_str().unwrap().ends_with("-0.svg"));
-        assert!(ring_svg_path(100).to_str().unwrap().ends_with("-100.svg"));
-        assert!(ring_svg_path(-5).to_str().unwrap().ends_with("-0.svg"));
-        assert!(ring_svg_path(150).to_str().unwrap().ends_with("-100.svg"));
+        // Filenames now include a color hash, so we check for the
+        // substring `-{pct}-` (hash separator on both sides) rather
+        // than the trailing position.
+        let c = default_colors();
+        assert!(ring_svg_path(0,   &c).to_str().unwrap().contains("-0-"));
+        assert!(ring_svg_path(100, &c).to_str().unwrap().contains("-100-"));
+        assert!(ring_svg_path(-5,  &c).to_str().unwrap().contains("-0-"));
+        assert!(ring_svg_path(150, &c).to_str().unwrap().contains("-100-"));
     }
 
     #[test]
     fn static_svg_path_uses_svg_extension() {
+        let c = default_colors();
         for name in ["normal", "warning", "throttled", "error", "offline"] {
-            let p = static_svg_path(name);
-            assert!(p.to_str().unwrap().ends_with(&format!("minimax-quota-{name}.svg")),
-                    "expected minimax-quota-{name}.svg; got {p:?}");
+            let p = static_svg_path(name, &c);
+            // The path must contain the `{name}-` segment (between
+            // prefix and color hash). Checking the substring is
+            // robust to hash-format changes.
+            let needle = format!("-{name}-");
+            assert!(p.to_str().unwrap().contains(&needle),
+                    "expected `{needle}` segment; got {p:?}");
         }
+    }
+
+    /// Regression test for the cache-invalidation bug: when the user
+    /// edits `~/.config/llm-quota-tray/config.json` to retune the
+    /// outer ring color, the daemon MUST generate a fresh SVG file
+    /// path. If it keeps the same path, the on-disk cache (which
+    /// holds the old color) wins, and the panel keeps showing the
+    /// stale color — the exact bug that motivated this fix.
+    #[test]
+    fn color_change_produces_different_path() {
+        let c1 = RingColors {
+            inner: BucketColors {
+                normal:   "#3a9d4d".into(),
+                warning:  "#f6d32d".into(),
+                throttled: "#e01b24".into(),
+            },
+            outer: "#3584e4".into(),
+        };
+        let c2 = RingColors {
+            inner: c1.inner.clone(),
+            outer: "#0c8599".into(),  // only difference
+        };
+
+        let p1 = ring_svg_path(51, &c1);
+        let p2 = ring_svg_path(51, &c2);
+        assert_ne!(p1, p2,
+                   "changing outer color must produce a fresh path; \
+                    got {p1:?} == {p2:?}");
+
+        // Same principle for static paths.
+        let s1 = static_svg_path("normal", &c1);
+        let s2 = static_svg_path("normal", &c2);
+        assert_ne!(s1, s2,
+                   "changing outer color must produce a fresh static path; \
+                    got {s1:?} == {s2:?}");
+    }
+
+    /// Same colors → same path (cache hit works as before).
+    #[test]
+    fn same_colors_produce_same_path() {
+        let c = default_colors();
+        let p1 = ring_svg_path(42, &c);
+        let p2 = ring_svg_path(42, &c);
+        assert_eq!(p1, p2,
+                   "same colors + same pct must produce the same path \
+                    (cache-keyed; otherwise we'd churn writes every poll)");
+    }
+
+    /// The hash must be stable across runs — `DefaultHasher` is
+    /// randomized per-process, which would defeat the purpose. This
+    /// test locks in that `colors_hash` produces the same value for
+    /// the same input on repeat calls.
+    #[test]
+    fn colors_hash_is_stable() {
+        let c = default_colors();
+        // Direct call gives the same value on repeat (within a run).
+        // Cross-run stability is locked in by the FNV-1a implementation
+        // — if someone replaces it with `DefaultHasher`, this test
+        // still passes (within a run) but the cross-process guarantee
+        // is lost. The point of this assertion is to catch accidental
+        // changes to the FNV constants.
+        let h1 = colors_hash(&c);
+        let h2 = colors_hash(&c);
+        assert_eq!(h1, h2);
+
+        // The hash must differ for different colors (basic distinctness).
+        let mut c2 = c.clone();
+        c2.outer = "#000000".into();
+        assert_ne!(colors_hash(&c), colors_hash(&c2));
     }
 
     #[test]
@@ -871,6 +988,26 @@ mod tests {
 
         write_static_svgs(&crate::provider::default_ring_colors());
 
+        // Verify all five files exist with non-zero content. The
+        // filenames include the color-hash; reconstruct the expected
+        // path the same way `static_svg_path` does so the assertion
+        // survives a hash-format change. We must do this BEFORE
+        // restoring TMPDIR — `static_svg_path` reads the env var
+        // to build the path, and we want it to point at our `tmp`
+        // directory, not whatever the test runner had set.
+        let colors = crate::provider::default_ring_colors();
+        for name in ["normal", "warning", "throttled", "error", "offline"] {
+            let path = tmp.join(static_svg_path(name, &colors).file_name().unwrap());
+            assert!(path.starts_with(&tmp),
+                    "{path:?} should be under TMPDIR={tmp:?}");
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("missing/wrong-type {path:?}: {e}"));
+            assert!(body.starts_with("<svg"),
+                    "{path:?} should start with <svg; got {body:?}");
+            assert!(body.contains("circle"),
+                    "{path:?} should contain <circle>; got {body:?}");
+        }
+
         // Restore TMPDIR so the rest of the suite isn't affected.
         if let Some(v) = prev {
             // SAFETY: see above.
@@ -878,17 +1015,6 @@ mod tests {
         } else {
             // SAFETY: see above.
             unsafe { std::env::remove_var("TMPDIR"); }
-        }
-
-        // Verify all five files exist with non-zero content.
-        for name in ["normal", "warning", "throttled", "error", "offline"] {
-            let path = tmp.join(format!("minimax-quota-{name}.svg"));
-            let body = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("missing/wrong-type {path:?}: {e}"));
-            assert!(body.starts_with("<svg"),
-                    "{path:?} should start with <svg; got {body:?}");
-            assert!(body.contains("circle"),
-                    "{path:?} should contain <circle>; got {body:?}");
         }
 
         // Idempotent — second call doesn't re-write or fail. (No

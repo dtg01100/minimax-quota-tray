@@ -11,14 +11,16 @@ license = "MIT"
 # GTK / libappindicator dependency.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
-# Native SVG → ARGB pixel buffer, sent via StatusNotifierItem IconPixmap.
-# Minimal features: no text, no system fonts, no embedded raster images
-# (we only render simple geometric SVGs).
-resvg = { version = "0.48", default-features = false }
-usvg = { version = "0.48", default-features = false }
+# Native 2D rasterizer for the tray icon. We render three circles (track,
+# progress arc, center dot) directly with tiny-skia's path API — no SVG
+# parser, no usvg, no resvg's CLI-arg parser (pico-args). The png-format
+# feature is disabled: we emit raw ARGB32 bytes to SNI's IconPixmap, never
+# PNG, so dropping the feature removes `png`, `flate2`, `miniz_oxide`,
+# `fdeflate`, `crc32fast`, `simd-adler32`, `adler2` from the build.
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 
 # Async / HTTP / JSON
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
 # StreamExt::next() for consuming zbus::proxy::SignalStream (the
 # Stream trait isn't in scope by default; futures-util provides it).
@@ -30,13 +32,8 @@ serde_json = "1"
 secret-service = { version = "3", features = ["rt-tokio-crypto-rust"] }
 
 anyhow = "1"
-thiserror = "1"
 log = "0.4"
 env_logger = "0.11"
-
-[dev-dependencies]
-approx = "0.5"
-serde_json = "1"
 
 [profile.release]
 opt-level = "z"     # minimize binary size

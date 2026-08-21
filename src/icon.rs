@@ -1,23 +1,30 @@
-//! Pure-Rust SVG → ARGB32 pixel buffer for the tray icon.
+//! Pure-Rust 2D rasterizer for the tray icon.
 //!
-//! Uses the `resvg` crate to parse + rasterize SVG into a 22×22 ARGB
-//! buffer that we send to StatusNotifierItem via the IconPixmap property.
-//! No more ImageMagick / disk caching / external processes — entirely
-//! in-memory, entirely in Rust.
+//! Renders directly to a 22×22 ARGB32 pixel buffer via `tiny-skia`
+//! (a Skia subset ported to Rust). Three primitives are drawn:
 //!
-//! The icon shape mirrors the gjs original: a ring (the remaining %
-//! shown as a stroked arc around a center dot) layered on top of a
-//! faded full-circle "track" so the unfilled portion reads as the same
-//! color at 25% opacity, not as a contrasting grey. Round caps on the
-//! progress arc terminate cleanly. The dasharray is corrected by half a
-//! stroke-width so the visible rounded cap aligns where the dasharray
-//! says (otherwise round caps overshoot and the arc visibly extends past
-//! the 12-o'clock start point at pct=100).
+//!   1. A faded full-circle track (`stroke`, opacity 0.25) — what makes
+//!      the unfilled portion read as "this much left" rather than as a
+//!      separate grey ring that fights the panel theme.
+//!   2. A progress arc (`stroke`, `stroke-linecap=round`,
+//!      `stroke-dasharray` = `(arc − halfStroke) (circumference −
+//!      arc + halfStroke)`) — the rounded terminus aligns with the
+//!      12-o'clock start at pct=100, matches gjs `arc − halfStroke`.
+//!   3. A center dot (`fill`) — without it the icon reads as a thin
+//!      curved line.
+//!
+//! No SVG parser, no external process, no resvg/usvg. Dropping those
+//! removed `usvg`, `svgtypes`, `winnow`, `pico-args`, `rgb`, `bytemuck`
+//! from the build (`resvg` itself brings them all in). The output is
+//! sent to StatusNotifierItem as `IconPixmap` (universal fallback) and
+//! the same shape is also serialized to `${TMPDIR}/*.svg` for hosts
+//! that can render SVG natively (see `write_static_svgs` /
+//! `write_ring_svg`).
 //!
 //! Colors are pinned to the gjs `RING_COLOR` table so the rendered icon
 //! matches what the gjs version produced: same green / yellow / red.
 
-use usvg::{Options, Tree};
+use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, StrokeDash, Transform};
 
 /// Colors per bucket — must match the gjs `RING_COLOR` table in
 /// `minimax-quota-tray.js`. Same hex, same role. The throttled color is
@@ -244,8 +251,12 @@ pub fn write_ring_svg(pct: i64, bucket: Bucket) -> std::path::PathBuf {
 }
 
 /// SVG template for the ring icon — three layers, identical to the gjs
-/// `renderRingSvg()` output so the resvg-rendered icon matches what the
-/// gjs version produced via `magick -density 600`:
+/// `renderRingSvg()` output so the tiny-skia-rendered pixmap matches
+/// what the gjs version produced via `magick -density 600`. Hosts that
+/// render SVG natively (KDE/QtSvg, GNOME with a registered
+/// `libpixbufloader-svg.so`) read this file directly via SNI's
+/// `IconName`; hosts without SVG support fall through to the in-memory
+/// ARGB bytes from `render_pixmap()`:
 ///
 ///   1. Faded full-circle track (`stroke` = color, `stroke-opacity`
 ///      = 0.25). Same color as the progress arc, so the unfilled
@@ -282,44 +293,169 @@ fn svg_for(pct: i64, color: &str) -> String {
     )
 }
 
-/// Render the SVG template for `(pct, bucket)` and rasterize it to an
+/// Render the ring icon for `(pct, bucket)` and rasterize it to an
 /// ARGB32 byte buffer matching the StatusNotifierItem IconPixmap
-/// property: `(width, height, bytes)`. Bytes are ARGB32 in memory order
-/// (alpha first, then R, G, B per pixel — the byte ordering the SNI
-/// spec mandates).
+/// property: `(width, height, bytes)`. Bytes are laid out in the
+/// host's native uint32 byte order so Cogl/GTK can interpret them
+/// directly — see the byte-order note in `pixmap_to_bgra` below.
 ///
-/// Returns `None` if SVG parsing or rasterization fails; callers fall
-/// back to a theme icon name in that case.
+/// The pixmap is composed of three tiny-skia primitives drawn in order
+/// (back to front):
+///
+///   1. Faded full-circle track (stroke, opacity 0.25)
+///   2. Progress arc (stroke, round caps, dasharray, rotated −90°)
+///   3. Inner dot (fill, opacity 1.0)
+///
+/// Returns `None` only if `Pixmap::new` fails (effectively impossible
+/// for a 22×22 pixmap, but the API is fallible). Callers fall back to
+/// a theme icon name in that case.
 pub fn render_pixmap(pct: i64, bucket: Bucket) -> Option<(u32, u32, Vec<u8>)> {
-    let svg_str = svg_for(pct, bucket_hex(bucket));
-    let opts = Options::default();
-    let tree = Tree::from_str(&svg_str, &opts).ok()?;
+    let (r, g, b) = parse_hex_rgb(bucket_hex(bucket))?;
+    let mut pixmap = Pixmap::new(ICON_SIZE, ICON_SIZE)?;
 
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(ICON_SIZE, ICON_SIZE)?;
+    // 1. Track: stroke at 25% opacity. The alpha channel of the Paint
+    //    multiplies the stroke color — track_opacity=0.25 yields a
+    //    25%-opacity ring in the same hue as the progress arc.
+    let mut track_paint = Paint::default();
+    track_paint.set_color(Color::from_rgba8(r, g, b, track_alpha()));
+    track_paint.anti_alias = true;
 
-    // resvg 0.48: render(tree, transform, &mut pixmap) — fits to pixmap size.
-    resvg::render(&tree, resvg::tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    let track_path = {
+        let mut pb = PathBuilder::new();
+        pb.push_circle(11.0, 11.0, RING_RADIUS);
+        pb.finish()?
+    };
 
-    // Convert RGBA → host-endian uint32 layout (BGRA bytes on x86).
-    //
-    // The SNI spec says "ARGB32 in network byte order" — but the actual
-    // reference implementations (KDE plasma's kstatusnotifieritem, the
-    // gjs appindicator extension's Cogl pipeline) all pass the bytes in
-    // *host-endian* uint32 order, which is `[B, G, R, A]` on little-endian
-    // (x86) and `[A, R, G, B]` on big-endian. The receiving end
-    // (Cogl's ARGB_8888 → Cairo → GdkPixbuf) interprets the bytes as a
-    // native uint32, so we must send the host layout — otherwise alpha
-    // gets swapped with blue and the icon becomes mostly transparent,
-    // which Cogl/the watcher report as a missing icon (the "three dots"
-    // placeholder).
-    let mut out = Vec::with_capacity((ICON_SIZE * ICON_SIZE * 4) as usize);
-    for pixel in pixmap.pixels() {
-        out.push(pixel.blue());
-        out.push(pixel.green());
-        out.push(pixel.red());
-        out.push(pixel.alpha());
+    let mut track_stroke = Stroke::default();
+    track_stroke.width = RING_STROKE;
+    track_stroke.line_cap = LineCap::Butt;
+
+    pixmap.stroke_path(
+        &track_path,
+        &track_paint,
+        &track_stroke,
+        Transform::identity(),
+        None,
+    );
+
+    // 2. Progress arc: same circle, but with the dashed pattern matching
+    //    gjs `arc - halfStroke`. The dash array must sum to a positive
+    //    finite value (tiny-skia rejects zero-length patterns); at pct=0
+    //    fg_arc is 0 but fg_rest is the full circumference so this
+    //    never triggers.
+    let circ = 2.0 * std::f32::consts::PI * RING_RADIUS;
+    let filled = (pct.clamp(0, 100) as f32 / 100.0) * circ;
+    let half_stroke = RING_STROKE / 2.0;
+    let fg_arc = (filled - half_stroke).max(0.0);
+    let fg_rest = (circ - fg_arc).max(0.0);
+
+    let mut arc_paint = Paint::default();
+    arc_paint.set_color(Color::from_rgba8(r, g, b, 255));
+    arc_paint.anti_alias = true;
+
+    let arc_path = {
+        let mut pb = PathBuilder::new();
+        pb.push_circle(11.0, 11.0, RING_RADIUS);
+        pb.finish()?
+    };
+
+    let mut arc_stroke = Stroke::default();
+    arc_stroke.width = RING_STROKE;
+    arc_stroke.line_cap = LineCap::Round;
+    // StrokeDash::new returns None when the array is empty or has an
+    // odd length — at this point both fg_arc and fg_rest are ≥0 and
+    // sum to a positive value, so .expect() is safe and never fires.
+    arc_stroke.dash = StrokeDash::new(vec![fg_arc, fg_rest], 0.0);
+
+    // SVG's `transform="rotate(-90 11 11)"` rotates the path around
+    // the icon center so the dasharray starts at 12 o'clock. tiny-skia's
+    // Transform::from_rotate_at gives us the same "rotate around a
+    // point" semantics.
+    let arc_xform = Transform::from_rotate_at(-90.0, 11.0, 11.0);
+
+    pixmap.stroke_path(
+        &arc_path,
+        &arc_paint,
+        &arc_stroke,
+        arc_xform,
+        None,
+    );
+
+    // 3. Inner dot: filled circle. Tiny-skia ignores stroke vs fill
+    //    via fill_path; we don't need a stroke here.
+    let mut dot_paint = Paint::default();
+    dot_paint.set_color(Color::from_rgba8(r, g, b, 255));
+    dot_paint.anti_alias = true;
+
+    let dot_path = {
+        let mut pb = PathBuilder::new();
+        pb.push_circle(11.0, 11.0, INNER_DOT_RADIUS);
+        pb.finish()?
+    };
+
+    pixmap.fill_path(
+        &dot_path,
+        &dot_paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+
+    Some((ICON_SIZE, ICON_SIZE, pixmap_to_bgra(&pixmap)))
+}
+
+/// Convert a `#rrggbb` hex string into `(r, g, b)` u8 components.
+/// Returns `None` if the string isn't exactly 7 bytes starting with `#`
+/// followed by 6 hex digits; in practice we only feed it `bucket_hex()`
+/// constants so the None branch is unreachable.
+fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 7 || bytes[0] != b'#' { return None; }
+    let r = u8::from_str_radix(std::str::from_utf8(&bytes[1..3]).ok()?, 16).ok()?;
+    let g = u8::from_str_radix(std::str::from_utf8(&bytes[3..5]).ok()?, 16).ok()?;
+    let b = u8::from_str_radix(std::str::from_utf8(&bytes[5..7]).ok()?, 16).ok()?;
+    Some((r, g, b))
+}
+
+/// 0.25 opacity → 8-bit alpha. Matches the gjs `stroke-opacity="0.25"`
+/// on the track ring. Centralized so the conversion is in one place
+/// (64/255 ≈ 0.251, close enough to the rendered value to be visually
+/// indistinguishable from the exact 0.25).
+fn track_alpha() -> u8 {
+    (TRACK_OPACITY * 255.0).round() as u8
+}
+
+/// Convert tiny-skia's premultiplied RGBA bytes to host-endian uint32
+/// layout ([B, G, R, A] on little-endian x86, [A, R, G, B] on big-endian).
+///
+/// The SNI spec says IconPixmap is "ARGB32 in network byte order" — but
+/// the reference implementations (KDE plasma's kstatusnotifieritem, the
+/// gjs appindicator extension's Cogl pipeline) all pass the bytes in
+/// *host-endian* uint32 order. The receiving end (Cogl's ARGB_8888 →
+/// Cairo → GdkPixbuf) interprets the bytes as a native uint32, so we
+/// must send the host layout — otherwise alpha gets swapped with blue
+/// and the icon becomes mostly transparent, which Cogl/the watcher
+/// report as a missing icon (the "three dots" placeholder).
+///
+/// tiny-skia's internal buffer is premultiplied RGBA. We iterate the
+/// raw bytes (no per-pixel demultiplication) to preserve bit-exact
+/// behavior with the previous resvg-based pipeline — fully-opaque
+/// pixels match their source color exactly, and semi-transparent track
+/// pixels keep their premultiplied scaling (which is what the receiving
+/// Cogl/ARGB_8888 pipeline expects when interpreting the buffer as
+/// premultiplied, as it does).
+fn pixmap_to_bgra(pixmap: &Pixmap) -> Vec<u8> {
+    let data = pixmap.data();
+    let mut out = Vec::with_capacity(data.len());
+    for px in data.chunks_exact(4) {
+        // px is [R, G, B, A] premultiplied. Swap to host-endian uint32
+        // order: [B, G, R, A] on little-endian (x86, aarch64).
+        out.push(px[2]); // B
+        out.push(px[1]); // G
+        out.push(px[0]); // R
+        out.push(px[3]); // A
     }
-    Some((ICON_SIZE, ICON_SIZE, out))
+    out
 }
 
 /// Cache key — bucket + remaining pct. We round pct to a step so we

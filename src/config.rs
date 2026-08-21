@@ -7,16 +7,33 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::burn::BurnConfig;
-use crate::provider::DEFAULT_PLANS;
+use crate::provider::{DEFAULT_PLANS, DEFAULT_PROVIDER, PROVIDERS};
 
 const CONFIG_DIR_NAME: &str = ".config/minimax-quota";
 const CONFIG_FILENAME: &str = "config.json";
 
+/// One plan entry in `config.json`'s `plans` map. `shape` references
+/// a `PlanShape` in the active `Provider::plan_shapes` table (e.g.
+/// `"remains"` for MiniMax). New plans can be added in `config.json`
+/// without touching code as long as their endpoint returns the same
+/// JSON shape as the referenced one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanConfig {
     pub endpoint: String,
     pub dashboard_url: String,
     pub label: String,
+    /// Reference into the active provider's `plan_shapes` table.
+    #[serde(default = "default_shape_id")]
+    pub shape: String,
+}
+
+fn default_shape_id() -> String {
+    // Default to the first registered shape in the default provider.
+    // For MiniMax this is "remains". Forks that ship with multiple
+    // shapes should set this explicitly.
+    DEFAULT_PROVIDER.plan_shapes.first()
+        .map(|(id, _)| id.to_string())
+        .unwrap_or_else(|| "default".to_string())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -29,6 +46,12 @@ pub struct Thresholds {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Active provider ID — references an entry in
+    /// `crate::provider::PROVIDERS`. Defaults to MiniMax when absent.
+    #[serde(default = "default_provider_id")]
+    pub provider: String,
+    /// Active plan ID — must match a key in `plans` (or one of the
+    /// default plans if `plans` is empty).
     pub plan: String,
     pub refresh_seconds: u64,
     /// Floor for the polling cadence (gjs `refresh_min_seconds`,
@@ -48,6 +71,27 @@ pub struct Config {
 
     #[serde(default)]
     pub burn_warning: BurnConfig,
+}
+
+fn default_provider_id() -> String {
+    DEFAULT_PROVIDER.id.to_string()
+}
+
+/// Resolve a `provider` ID to its registered `Provider` value. If the
+/// ID isn't in the registry, logs a warning and falls back to
+/// `DEFAULT_PROVIDER` (the first registered provider) so the tray
+/// can still boot — better than crashing on a typo.
+pub fn resolve_provider(id: &str) -> &'static crate::provider::Provider {
+    if let Some(p) = crate::provider::provider_by_id(id) {
+        p
+    } else {
+        log::warn!(
+            "config: unknown provider '{id}' (registered: {:?}); falling back to '{}'",
+            PROVIDERS.iter().map(|p| p.id).collect::<Vec<_>>(),
+            DEFAULT_PROVIDER.id,
+        );
+        DEFAULT_PROVIDER
+    }
 }
 
 impl Default for Config {
@@ -71,6 +115,7 @@ impl Default for Config {
                     endpoint: p.endpoint.to_string(),
                     dashboard_url: p.dashboard_url.to_string(),
                     label: p.label.to_string(),
+                    shape: p.shape_id.to_string(),
                 },
             );
         }
@@ -81,6 +126,7 @@ impl Default for Config {
             .map(|p| p.id.to_string())
             .unwrap_or_else(|| "coding_plan".to_string());
         Self {
+            provider: DEFAULT_PROVIDER.id.to_string(),
             plan: default_plan,
             refresh_seconds: 120,
             refresh_min_seconds: default_refresh_min_seconds(),

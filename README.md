@@ -329,33 +329,58 @@ from the constants there and needs no changes for typical ports.
 
 ### What's in `src/provider.rs`
 
-The file is organized top-down as four sections:
+The file is organized top-down as a registry of `Provider` values,
+each of which bundles everything that's API-specific:
 
-| Section | What it controls |
-| --- | --- |
-| `auth_header(api_key)` | How the API key is sent (`Authorization: Bearer …`, `x-goog-api-key`, `x-api-key`, etc.) |
-| `USER_AGENT_PREFIX` | User-Agent string prefix (version is appended automatically) |
-| `MINIMAX: PlanShape` | JSON shape: entry path, window fields, unit conversions, error envelope |
-| `DEFAULT_PLANS` | Plan table that ships in `Config::default()` and `config.example.json` |
+```rust
+pub struct Provider {
+    pub id: &'static str,                    // "minimax", "openai", etc.
+    pub auth_header: AuthHeaderFn,           // bearer / x-api-key / etc.
+    pub user_agent_prefix: &'static str,
+    pub ring_colors: RingColors,             // normal/warning/throttled hex
+    pub plan_shapes: &'static [(&str, PlanShape)],  // name → PlanShape map
+    pub default_plans: &'static [DefaultPlan],      // ships in defaults
+}
+```
 
-The `PlanShape` value is a data struct (not code) — it lists the
-JSON pointers, field-name prefixes, and unit multipliers the parser
-uses to extract each window. A porter replacing this constant with
-their own provider shape gets full parser support without editing
-`src/parse.rs` or `src/fetch.rs`.
+A `PlanShape` value is data (not code) — it lists the JSON pointers,
+field-name prefixes, and unit multipliers the parser uses to extract
+each window. A `PlanShape`'s `windows` field is a slice with no
+fixed length: the tray renders however many windows the shape
+produces. The MiniMax provider ships two windows (`5h` and
+`weekly`); a provider returning three (e.g. minute / hour / day)
+just adds another `WindowShape` entry.
+
+A `Provider`'s `plan_shapes` is a name-keyed table so multiple
+plans can share one shape (MiniMax does this: both `coding_plan`
+and `token_plan` use the `remains` shape since they return the same
+JSON structure). To support multiple JSON shapes per provider, add
+more entries to `plan_shapes` and reference them by `shape_id` in
+each plan.
 
 ### What's already configurable (no code change)
 
-Everything else is config-driven via `config.json`:
+Most provider surface is config-driven via `config.json`:
 
+- `provider` (top-level, optional) — selects which `Provider` from
+  `PROVIDERS` is active. Defaults to `"minimax"` when absent.
+  Unknown IDs fall back to the default with a warning.
+- `plan` (top-level) — which plan under the active provider is
+  active. Must match a key in `plans` (or one of the provider's
+  default plans if `plans` is empty).
 - `plans.<id>.endpoint` — full URL to GET
 - `plans.<id>.dashboard_url` — opened by the **Open dashboard** menu item
 - `plans.<id>.label` — shown in the chip and menu header
+- `plans.<id>.shape` — references the active provider's
+  `plan_shapes` table. Defaults to the first registered shape when
+  absent (so existing configs without `shape` keep working).
 - `thresholds`, `refresh_seconds`, `refresh_min_seconds`,
   `refresh_max_backoff_seconds`
 
-You can rename or add plan IDs freely; the `plan` field picks the
-active one.
+You can add new plan entries to `plans` (each pointing at an
+existing `shape` in the active provider) without touching code.
+Adding a new JSON shape requires a code change — see the worked
+example below.
 
 ### What the UI consumes
 
@@ -376,15 +401,19 @@ pub struct Window {
 Rules for the provider→Window mapping (the `WindowShape` constants
 in `src/provider.rs` encode these):
 
-- **Return 1–2 windows.** The UI is laid out for a short-window +
-  long-window pair. `main.rs` hardcodes two windows (`five_h` and
-  `weekly`); the parser returns whatever the `PlanShape` defines
-  but `main.rs` reads only the first two. To support a different
-  number, edit `main.rs::do_refresh` (not a porting concern — it's
-  structural).
-- **`id` is the window's UI label.** The first window drives the
-  chip percentage; convention is to put the rolling short-interval
-  window first (the one most likely to need urgent attention).
+- **N windows.** There's no fixed limit — `PlanShape::windows` is
+  a slice, the parser returns `Vec<Window>`, and `main.rs` renders
+  one menu row per window. MiniMax ships with 2 (`5h`, `weekly`);
+  a 3-window provider (e.g. minute/hour/day) just adds another
+  `WindowShape` entry to the shape and the tray adapts. Window
+  length isn't hardcoded — `burn::compute_burn` derives it
+  dynamically from `start_at` and `reset_at`.
+- **`id` is the window's UI label and history key.** The first
+  window drives the chip percentage; convention is to put the
+  rolling short-interval window first (the one most likely to need
+  urgent attention). The id also keys the burn-rate history — pick
+  something stable and descriptive (changing it would lose
+  accumulated samples across restarts).
 - **`remaining_pct` is the source of truth.** If your provider
   returns `used`/`total`, the parser computes
   `100 - (100 * used / total)` here.
@@ -409,26 +438,43 @@ x-api-key: <key>
     "monthly": { "limit": 30000, "used": 4500, "reset_in_ms": 2592000000 } }
 ```
 
-1. **Edit `src/provider.rs`:**
+1. **Define a new `Provider` in `src/provider.rs`:**
 
    ```rust
-   // Change auth header from Bearer to x-api-key:
-   pub fn auth_header(api_key: &str) -> (&'static str, String) {
-       ("x-api-key", api_key.to_string())
-   }
+   // Add to the provider registry (re-exported at the bottom of
+   // provider.rs):
+   pub const PROVIDER_X: Provider = Provider {
+       id: "provider_x",
+       auth_header: x_api_key_auth,    // see AuthHeaderFn type
+       user_agent_prefix: "minimax-quota-tray",
+       ring_colors: RingColors {
+           normal:   "#3366ff",
+           warning:  "#ff9900",
+           throttled: "#9933ff",
+       },
+       plan_shapes: &[("usage", PROVIDER_X_USAGE)],
+       default_plans: &[DefaultPlan {
+           id: "primary",
+           endpoint: "https://api.provider.com/v1/usage",
+           dashboard_url: "https://provider.com/dashboard",
+           label: "Provider X",
+           shape_id: "usage",
+       }],
+   };
 
-   // Add a new PlanShape (or replace MINIMAX):
-   pub const PROVIDER_X: PlanShape = PlanShape {
-       // Provider X returns the entry as the root object.
+   pub const PROVIDER_X_USAGE: PlanShape = PlanShape {
+       // Provider X returns the entry as the root object. The
+       // parser wraps a single-object response into a one-element
+       // synthetic array internally.
        entries_path: "/",
        windows: &[
            WindowShape {
                id: "daily",
                field_prefix: "daily",
-               start_field: None,           // no start time returned
+               start_field: None,
                reset_field: Some("reset_in_ms"),
-               start_unit_ms: 1,            // unused (start_field missing → 0)
-               reset_unit_ms: 1,            // already ms
+               start_unit_ms: 1,           // unused (start_field missing → 0)
+               reset_unit_ms: 1,           // already ms
                reset_is_absolute_epoch: false,
            },
            WindowShape {
@@ -444,32 +490,39 @@ x-api-key: <key>
        error_envelope: None,  // Provider X uses HTTP status codes
    };
 
-   // Replace the default plans table:
-   pub const DEFAULT_PLANS: &[DefaultPlan] = &[
-       DefaultPlan {
-           id: "primary",
-           endpoint: "https://api.provider.com/v1/usage",
-           dashboard_url: "https://provider.com/dashboard",
-           label: "Provider X",
-       },
-   ];
+   // Register in PROVIDERS:
+   pub const PROVIDERS: &[&Provider] = &[&MINIMAX, &PROVIDER_X];
+
+   // Auth fn for the new provider:
+   fn x_api_key_auth(api_key: &str) -> (&'static str, String) {
+       ("x-api-key", api_key.to_string())
+   }
    ```
 
-2. **Edit `src/parse.rs` and `src/fetch.rs` to pass the new shape:**
+2. **Add plans in `config.json`** without code changes — each plan
+   references a registered shape by `shape`:
 
-   ```rust
-   // In src/fetch.rs — pass PROVIDER_X instead of MINIMAX:
-   parse_plan(&body, &crate::provider::PROVIDER_X, now_ms)
-       .context("parsing payload")
+   ```json
+   {
+     "provider": "provider_x",
+     "plan": "primary",
+     "plans": {
+       "primary": {
+         "endpoint": "https://api.provider.com/v1/usage",
+         "dashboard_url": "https://provider.com/dashboard",
+         "label": "Provider X",
+         "shape": "usage"
+       }
+     }
+   }
    ```
 
-   `src/parse.rs::parse_coding_plan` is a thin wrapper around
-   `parse_plan(&MINIMAX, …)` that asserts a 2-tuple. If your new
-   shape also returns 2 windows, you can keep using
-   `parse_coding_plan` (just rename and re-target); otherwise call
-   `parse_plan` directly and adapt `main.rs` to handle `Vec<Window>`.
+   `Config::default()` ships the provider's `default_plans` table;
+   `plans` in `config.json` can ADD more entries (each pointing at
+   an existing shape) without re-compiling.
 
-3. **Update `config.example.json`** to match the new defaults.
+3. **Update `config.example.json`** so fresh installs start with the
+   new provider's defaults.
 
 The UI, scheduler, keyring, and tray code don't change.
 

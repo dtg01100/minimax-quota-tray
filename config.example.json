@@ -1,4 +1,8 @@
 {
+  "_comment": "minimax-quota-tray config. To port to a different provider, see src/provider.rs and the README 'Porting to another provider' section. Top-level fields:",
+  "_comment2": "  provider: optional — selects which Provider from src/provider.rs::PROVIDERS is active. Defaults to 'minimax' when absent.",
+  "_comment3": "  plan: which plan under the active provider is the default. The 'plans' map below can ADD plans without code changes as long as their endpoint returns JSON matching an existing PlanShape (referenced by 'shape').",
+  "provider": "minimax",
   "plan": "coding_plan",
   "refresh_seconds": 120,
   "refresh_min_seconds": 15,
@@ -7,12 +11,14 @@
     "coding_plan": {
       "endpoint": "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
       "dashboard_url": "https://platform.minimax.io/console/plan",
-      "label": "Coding Plan"
+      "label": "Coding Plan",
+      "shape": "remains"
     },
     "token_plan": {
       "endpoint": "https://api.minimax.io/v1/token_plan/remains",
       "dashboard_url": "https://platform.minimax.io/console/plan",
-      "label": "Token Plan"
+      "label": "Token Plan",
+      "shape": "remains"
     }
   },
   "thresholds": {

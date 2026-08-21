@@ -1,4 +1,4 @@
-//! Parse the provider's JSON payload into the internal window shape
+//! Parse a provider's JSON payload into the internal `Window` shape
 //! used by the burn-rate and menu code.
 //!
 //! All provider-specific details (JSON field names, unit conversions,
@@ -6,15 +6,20 @@
 //! the data-driven reader. To port to a different API, edit
 //! `src/provider.rs`, not this file.
 //!
+//! The parser returns `Vec<Window>` with one entry per window the
+//! `PlanShape` defines. There's no fixed pair — `main.rs` consumes
+//! whatever windows the parser produces and renders one menu row per
+//! window; the first window drives the chip percentage.
+//!
 //! For the MiniMax live shape (verified 2026-08-18) see the doc on
-//! `provider::MINIMAX`. Token Plan uses the same shape, just a
-//! different endpoint path.
+//! `provider::MINIMAX_REMAINS`. The Coding Plan and Token Plan use
+//! the same shape, just different endpoints.
 
 use anyhow::Result;
 use serde_json::Value;
 
 use crate::burn::Window;
-use crate::provider::{PlanShape, WindowShape, MINIMAX};
+use crate::provider::{PlanShape, WindowShape};
 
 fn num(v: &Value, key: &str) -> i64 {
     v.get(key)
@@ -83,24 +88,22 @@ pub fn parse_plan(payload: &Value, shape: &PlanShape, now_ms: i64) -> Result<Vec
         .collect())
 }
 
-/// Convenience wrapper for the MiniMax shape — returns the
-/// `(five_h, weekly)` pair that `main.rs` and the existing tests
-/// destructure. New code should call `parse_plan(&MINIMAX, ...)`
-/// directly; this wrapper exists so the test suite and the fetch
-/// pipeline keep their original 2-tuple signature.
-pub fn parse_coding_plan(payload: &Value, now_ms: i64) -> Result<(Window, Window)> {
-    let windows = parse_plan(payload, &MINIMAX, now_ms)?;
-    if windows.len() != 2 {
-        return Err(anyhow::anyhow!(
-            "MiniMax parser expects 2 windows, got {}", windows.len()));
-    }
-    Ok((windows[0], windows[1]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::MINIMAX_REMAINS;
     use serde_json::json;
+
+    /// Convenience: parse the standard fixture and destructure the
+    /// resulting Vec into the canonical 5h/weekly pair (MiniMax
+    /// always produces exactly 2 windows for the `remains` shape).
+    fn parse_minimax(payload: &Value, now_ms: i64) -> (crate::burn::Window, crate::burn::Window) {
+        let windows = parse_plan(payload, &MINIMAX_REMAINS, now_ms)
+            .expect("parse_plan(MINIMAX_REMAINS) should succeed on the fixture");
+        assert_eq!(windows.len(), 2,
+                   "MINIMAX_REMAINS shape should produce exactly 2 windows");
+        (windows[0], windows[1])
+    }
 
     /// Fixture uses realistic values: `start_time` in epoch seconds,
     /// `remains_time` in ms (a 4.5-hour reset for the 5h window and a
@@ -138,7 +141,7 @@ mod tests {
 
     #[test]
     fn parses_full_coding_plan() {
-        let (five_h, weekly) = parse_coding_plan(&fixture(), TEST_NOW_MS).unwrap();
+        let (five_h, weekly) = parse_minimax(&fixture(), TEST_NOW_MS);
         assert_eq!(five_h.id, "5h");
         assert_eq!(five_h.total, 1000);
         assert_eq!(five_h.used, 200);
@@ -161,7 +164,7 @@ mod tests {
     /// gjs parity requires this math to be correct.
     #[test]
     fn reset_at_minus_now_is_time_remaining() {
-        let (five_h, weekly) = parse_coding_plan(&fixture(), TEST_NOW_MS).unwrap();
+        let (five_h, weekly) = parse_minimax(&fixture(), TEST_NOW_MS);
         // Time until reset equals `remains_time` (the raw duration
         // in ms, no conversion — the bug we just fixed).
         assert_eq!(five_h.reset_at - TEST_NOW_MS, 16_320_000); // 4.53h
@@ -188,7 +191,7 @@ mod tests {
                 "current_weekly_status": 1
             }]
         });
-        let (five_h, weekly) = parse_coding_plan(&v, TEST_NOW_MS).unwrap();
+        let (five_h, weekly) = parse_minimax(&v, TEST_NOW_MS);
         assert_eq!(five_h.remaining_pct, 100);
         assert_eq!(weekly.remaining_pct, 0);
     }
@@ -213,7 +216,7 @@ mod tests {
                 "current_weekly_status": 1
             }]
         });
-        let (five_h, weekly) = parse_coding_plan(&v, TEST_NOW_MS).unwrap();
+        let (five_h, weekly) = parse_minimax(&v, TEST_NOW_MS);
         assert_eq!(five_h.total, 0);
         assert_eq!(five_h.used, 0);
         assert_eq!(five_h.remaining_pct, 80);
@@ -224,13 +227,13 @@ mod tests {
     #[test]
     fn missing_model_remains_returns_error() {
         let v = json!({});
-        assert!(parse_coding_plan(&v, 0).is_err());
+        assert!(parse_plan(&v, &MINIMAX_REMAINS, 0).is_err());
     }
 
     #[test]
     fn empty_model_remains_returns_error() {
         let v = json!({"model_remains": []});
-        assert!(parse_coding_plan(&v, 0).is_err());
+        assert!(parse_plan(&v, &MINIMAX_REMAINS, 0).is_err());
     }
 
     #[test]
@@ -255,11 +258,89 @@ mod tests {
                 "current_weekly_status": 1
             }]
         });
-        let (five_h, weekly) = parse_coding_plan(&v, TEST_NOW_MS).unwrap();
+        let (five_h, weekly) = parse_minimax(&v, TEST_NOW_MS);
         assert_eq!(five_h.start_at, 1_632_000_000 * 1000);
         // `remains_time` is in ms (the float is truncated to integer ms),
         // so reset_at = now + 16320000 (the rounded ms value).
         assert_eq!(five_h.reset_at, TEST_NOW_MS + 16_320_000);
         assert_eq!(weekly.reset_at, TEST_NOW_MS + 561_600_000);
+    }
+
+    #[test]
+    fn single_window_shape_works() {
+        // Prove the parser is generic over N windows: define a
+        // shape with one window and verify the Vec has one entry.
+        // The entry path is `/` (the root object IS the entry —
+        // `first_entry` wraps it into a one-element synthetic array).
+        use crate::provider::{PlanShape, WindowShape};
+        let shape = PlanShape {
+            entries_path: "/",
+            windows: &[WindowShape {
+                id: "daily",
+                field_prefix: "daily",
+                start_field: None,
+                reset_field: None,
+                start_unit_ms: 1000,
+                reset_unit_ms: 1,
+                reset_is_absolute_epoch: false,
+            }],
+            error_envelope: None,
+        };
+        let v = json!({
+            "daily_total_count": 1000,
+            "daily_usage_count": 200,
+            "daily_remaining_percent": 80,
+            "start_time": 1700000000,
+            "remains_time": 7200000,
+        });
+        let windows = parse_plan(&v, &shape, 1_700_000_000_000).unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].id, "daily");
+        assert_eq!(windows[0].remaining_pct, 80);
+        assert_eq!(windows[0].reset_at, 1_700_000_000_000 + 7_200_000);
+    }
+
+    #[test]
+    fn three_window_shape_works() {
+        // And the N>2 case — three windows from one shape, all sharing
+        // the same entry object.
+        use crate::provider::{PlanShape, WindowShape};
+        let shape = PlanShape {
+            entries_path: "/",
+            windows: &[
+                WindowShape {
+                    id: "m5", field_prefix: "m5",
+                    start_field: None, reset_field: None,
+                    start_unit_ms: 1, reset_unit_ms: 1, reset_is_absolute_epoch: false,
+                },
+                WindowShape {
+                    id: "h1", field_prefix: "h1",
+                    start_field: None, reset_field: None,
+                    start_unit_ms: 1, reset_unit_ms: 1, reset_is_absolute_epoch: false,
+                },
+                WindowShape {
+                    id: "d1", field_prefix: "d1",
+                    start_field: None, reset_field: None,
+                    start_unit_ms: 1, reset_unit_ms: 1, reset_is_absolute_epoch: false,
+                },
+            ],
+            error_envelope: None,
+        };
+        let v = json!({
+            "m5_total_count": 0, "m5_usage_count": 0, "m5_remaining_percent": 80,
+            "start_time": 0, "remains_time": 100,
+            "h1_total_count": 0, "h1_usage_count": 0, "h1_remaining_percent": 50,
+            "start_time": 0, "remains_time": 200,
+            "d1_total_count": 0, "d1_usage_count": 0, "d1_remaining_percent": 25,
+            "start_time": 0, "remains_time": 300,
+        });
+        let windows = parse_plan(&v, &shape, 1000).unwrap();
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0].id, "m5");
+        assert_eq!(windows[0].remaining_pct, 80);
+        assert_eq!(windows[1].id, "h1");
+        assert_eq!(windows[1].remaining_pct, 50);
+        assert_eq!(windows[2].id, "d1");
+        assert_eq!(windows[2].remaining_pct, 25);
     }
 }

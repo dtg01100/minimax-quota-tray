@@ -26,15 +26,18 @@
 
 use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, StrokeDash, Transform};
 
-/// Colors per bucket — must match the gjs `RING_COLOR` table in
-/// `minimax-quota-tray.js`. Same hex, same role. The throttled color is
-/// the same red as the static `quota-throttled.svg` dot so the ring and
-/// the static fallback look identical.
-const RING_COLOR: &[(&str, &str)] = &[
-    ("normal", "#3a9d4d"),     // gjs RING_COLOR.normal
-    ("warning", "#f6d32d"),    // gjs RING_COLOR.warning
-    ("throttled", "#e01b24"),  // matches icons/quota-throttled.svg
-];
+use crate::provider::RingColors;
+
+/// Colors for the offline + error chip states. Independent of
+/// provider — these aren't bucket states, they're tray lifecycle
+/// states, so they're the same regardless of which provider the
+/// tray is running against.
+///
+/// `error` shares the throttled red (the legacy gjs chip used the
+/// same red dot for both — see icons/quota-error.svg).
+/// `offline` is a neutral gray so the panel doesn't show a red
+/// chip just because the network is down.
+const OFFLINE_COLOR: &str = "#9a9996";
 
 /// Icon dimensions — 22×22 is the standard symbolic icon size and matches
 /// the gjs version (its `viewBox` is 0 0 22 22).
@@ -103,19 +106,15 @@ pub fn bucket_for(
     Bucket::Normal
 }
 
-fn bucket_hex(b: Bucket) -> &'static str {
-    RING_COLOR
-        .iter()
-        .find(|(name, _)| matches_bucket_name(b, name))
-        .map(|(_, hex)| *hex)
-        .unwrap_or("#a8d1a3")
-}
-
-fn matches_bucket_name(b: Bucket, name: &str) -> bool {
+/// Look up the hex color for a bucket, using the provider's
+/// `RingColors` table. The MiniMax provider's defaults match the gjs
+/// `RING_COLOR` table (green/yellow/red); forked providers can
+/// override via `Provider::ring_colors`.
+fn bucket_hex(b: Bucket, colors: &RingColors) -> &'static str {
     match b {
-        Bucket::Normal => name == "normal",
-        Bucket::Warning => name == "warning",
-        Bucket::Throttled => name == "throttled",
+        Bucket::Normal => colors.normal,
+        Bucket::Warning => colors.warning,
+        Bucket::Throttled => colors.throttled,
     }
 }
 
@@ -201,26 +200,30 @@ fn svg_static(color: &str) -> String {
 /// Each static icon is a single `<circle r="9" fill="{color}">` — a
 /// solid dot. The set covers the five states the chip can be in:
 ///
-///   - `normal`:    green  (`#3a9d4d`)
-///   - `warning`:   yellow (`#f6d32d`)
-///   - `throttled`: red    (`#e01b24`) — also matches `quota-error`
-///   - `error`:     red    (`#e01b24`)
-///   - `offline`:   grey   (`#9a9996`)
-///
-/// Colors are pinned to the `RING_COLOR` table for normal/warning/
-/// throttled; the others are unique to the static-state UI.
-pub fn write_static_svgs() {
+///   - `normal`:    from `colors.normal`  (provider-defined)
+///   - `warning`:   from `colors.warning` (provider-defined)
+///   - `throttled`: from `colors.throttled` (provider-defined; also
+///                  matches `quota-error` for visual consistency with
+///                  the legacy gjs chip)
+///   - `error`:     same as throttled — the tray uses one red for both
+///                  "exhausted" and "fetch failed"
+///   - `offline`:   gray (`OFFLINE_COLOR`)
+pub fn write_static_svgs(colors: &RingColors) {
     let dir = std::env::var("TMPDIR")
         .ok()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir());
-    for (name, color) in [
-        ("normal", "#3a9d4d"),
-        ("warning", "#f6d32d"),
-        ("throttled", "#e01b24"),
-        ("error", "#e01b24"),
-        ("offline", "#9a9996"),
-    ] {
+    // The throttled color also serves as the error dot color; we
+    // intentionally collapse these into a single visual state so
+    // the user gets the same "I need attention" cue either way.
+    let entries: &[(&str, &str)] = &[
+        ("normal", colors.normal),
+        ("warning", colors.warning),
+        ("throttled", colors.throttled),
+        ("error", colors.throttled),
+        ("offline", OFFLINE_COLOR),
+    ];
+    for (name, color) in entries {
         let path = dir.join(format!("minimax-quota-{name}.svg"));
         if path.exists() { continue; }
         if let Err(e) = std::fs::write(&path, svg_static(color)) {
@@ -240,10 +243,10 @@ pub fn write_static_svgs() {
 /// the file get bit-for-bit the same shapes the ARGB bytes contain,
 /// just rendered at the panel's target size instead of upscaled from
 /// 22×22.
-pub fn write_ring_svg(pct: i64, bucket: Bucket) -> std::path::PathBuf {
+pub fn write_ring_svg(pct: i64, bucket: Bucket, colors: &RingColors) -> std::path::PathBuf {
     let path = ring_svg_path(pct);
     if path.exists() { return path; }
-    let svg = svg_for(pct, bucket_hex(bucket));
+    let svg = svg_for(pct, bucket_hex(bucket, colors));
     if let Err(e) = std::fs::write(&path, svg) {
         log::warn!("icon: failed to write ring SVG to {path:?}: {e}");
     }
@@ -306,11 +309,15 @@ fn svg_for(pct: i64, color: &str) -> String {
 ///   2. Progress arc (stroke, round caps, dasharray, rotated −90°)
 ///   3. Inner dot (fill, opacity 1.0)
 ///
+/// `colors` controls the ring + dot hue. MiniMax's defaults match the
+/// gjs `RING_COLOR` table (green/yellow/red); forked providers can
+/// override.
+///
 /// Returns `None` only if `Pixmap::new` fails (effectively impossible
 /// for a 22×22 pixmap, but the API is fallible). Callers fall back to
 /// a theme icon name in that case.
-pub fn render_pixmap(pct: i64, bucket: Bucket) -> Option<(u32, u32, Vec<u8>)> {
-    let (r, g, b) = parse_hex_rgb(bucket_hex(bucket))?;
+pub fn render_pixmap(pct: i64, bucket: Bucket, colors: &RingColors) -> Option<(u32, u32, Vec<u8>)> {
+    let (r, g, b) = parse_hex_rgb(bucket_hex(bucket, colors))?;
     let mut pixmap = Pixmap::new(ICON_SIZE, ICON_SIZE)?;
 
     // 1. Track: stroke at 25% opacity. The alpha channel of the Paint
@@ -584,10 +591,28 @@ mod tests {
     fn ring_colors_match_gjs() {
         // Pinned to gjs RING_COLOR table. If you change these, change
         // the gjs version too — the two implementations need to look
-        // identical when the user toggles between them.
-        assert_eq!(bucket_hex(Bucket::Normal), "#3a9d4d");
-        assert_eq!(bucket_hex(Bucket::Warning), "#f6d32d");
-        assert_eq!(bucket_hex(Bucket::Throttled), "#e01b24");
+        // identical when the user toggles between them. The MiniMax
+        // provider's `RingColors` constant is the single source of
+        // truth; this test guards against accidental edits.
+        let colors = crate::provider::MINIMAX_RING_COLORS;
+        assert_eq!(bucket_hex(Bucket::Normal, &colors), "#3a9d4d");
+        assert_eq!(bucket_hex(Bucket::Warning, &colors), "#f6d32d");
+        assert_eq!(bucket_hex(Bucket::Throttled, &colors), "#e01b24");
+    }
+
+    #[test]
+    fn ring_colors_per_provider_override() {
+        // A forked provider with a different palette (blue / orange /
+        // purple) should propagate through the icon code without
+        // touching constants.
+        let alt = RingColors {
+            normal: "#3366ff",
+            warning: "#ff9900",
+            throttled: "#9933ff",
+        };
+        assert_eq!(bucket_hex(Bucket::Normal, &alt), "#3366ff");
+        assert_eq!(bucket_hex(Bucket::Warning, &alt), "#ff9900");
+        assert_eq!(bucket_hex(Bucket::Throttled, &alt), "#9933ff");
     }
 
     #[test]
@@ -615,7 +640,7 @@ mod tests {
 
     #[test]
     fn render_pixmap_returns_22x22_argb() {
-        let result = render_pixmap(80, Bucket::Normal);
+        let result = render_pixmap(80, Bucket::Normal, &crate::provider::MINIMAX_RING_COLORS);
         let (w, h, bytes) = result.expect("render_pixmap should succeed");
         assert_eq!(w, 22);
         assert_eq!(h, 22);
@@ -629,7 +654,8 @@ mod tests {
         // On host-endian (x86 = BGRA bytes per pixel), the alpha channel
         // is the LAST byte of each 4-byte group. Cogl/GTK interprets these
         // bytes as a host uint32.
-        let (_w, _h, bytes) = render_pixmap(50, Bucket::Normal).unwrap();
+        let (_w, _h, bytes) = render_pixmap(50, Bucket::Normal,
+                                            &crate::provider::MINIMAX_RING_COLORS).unwrap();
         let any_visible = bytes.chunks_exact(4)
             .any(|px| px[3] > 0);
         assert!(any_visible, "rendered pixmap should have visible pixels (alpha > 0)");
@@ -645,7 +671,8 @@ mod tests {
         // Ring color is #3a9d4d (RGB = 58, 157, 77) — matches the gjs
         // RING_COLOR.normal. Expected bytes for an opaque ring pixel:
         // B=0x4d, G=0x9d, R=0x3a, A=0xff.
-        let (_w, _h, bytes) = render_pixmap(100, Bucket::Normal).unwrap();
+        let (_w, _h, bytes) = render_pixmap(100, Bucket::Normal,
+                                            &crate::provider::MINIMAX_RING_COLORS).unwrap();
         let any_ring_pixel = bytes.chunks_exact(4)
             .any(|px| {
                 px[0] == 0x4d && px[1] == 0x9d && px[2] == 0x3a && px[3] == 0xff
@@ -769,7 +796,7 @@ mod tests {
         // the lock ensures no two tests that read `TMPDIR` overlap.
         unsafe { std::env::set_var("TMPDIR", &tmp); }
 
-        write_static_svgs();
+        write_static_svgs(&crate::provider::MINIMAX_RING_COLORS);
 
         // Restore TMPDIR so the rest of the suite isn't affected.
         if let Some(v) = prev {
@@ -794,7 +821,7 @@ mod tests {
         // Idempotent — second call doesn't re-write or fail. (No
         // observable change since the files are byte-identical, but
         // the cache-hit path takes the early return.)
-        write_static_svgs();
+        write_static_svgs(&crate::provider::MINIMAX_RING_COLORS);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -821,7 +848,8 @@ mod dump_tests {
                               // through to the static quota-throttled SVG). This dumps
                               // the pixmap anyway for comparison reference.
                               (0,   Bucket::Throttled)] {
-            let (_w, _h, bytes) = render_pixmap(pct, bucket).unwrap();
+            let (_w, _h, bytes) = render_pixmap(pct, bucket,
+                &crate::provider::MINIMAX_RING_COLORS).unwrap();
             std::fs::write(
                 format!("/tmp/icon_{}_{:?}.argb", pct, bucket), &bytes).unwrap();
         }

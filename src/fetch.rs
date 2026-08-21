@@ -7,21 +7,26 @@
 //!
 //! The HTTP call is blocking (reqwest blocking) and intended to be
 //! wrapped in `tokio::task::spawn_blocking` from the polling loop.
+//!
+//! `fetch_windows_blocking` returns `Vec<Window>` — one entry per
+//! window the plan's `PlanShape` defines. There's no fixed pair;
+//! `main.rs` consumes whatever the parser produces.
 
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use serde_json::Value;
 
 use crate::burn::Window;
-use crate::parse::parse_coding_plan;
-use crate::provider::{self, MINIMAX};
+use crate::parse::parse_plan;
+use crate::provider::{PlanShape, Provider};
 
 // Re-export so callers can refer to `fetch::Client` without importing reqwest.
 pub use reqwest::blocking::Client as HttpClient;
 
 /// Build a shared blocking reqwest client. TLS via rustls.
-pub fn build_client() -> Result<Client> {
-    let user_agent = format!("{}/{}", provider::USER_AGENT_PREFIX, env!("CARGO_PKG_VERSION"));
+pub fn build_client(provider: &Provider) -> Result<Client> {
+    let user_agent = format!("{}/{}",
+        provider.user_agent_prefix, env!("CARGO_PKG_VERSION"));
     Client::builder()
         .user_agent(user_agent)
         .timeout(std::time::Duration::from_secs(15))
@@ -37,8 +42,10 @@ pub fn fetch_windows_blocking(
     client: &Client,
     endpoint: &str,
     api_key: &str,
-) -> Result<(Window, Window)> {
-    let (auth_name, auth_value) = provider::auth_header(api_key);
+    provider: &Provider,
+    shape: &PlanShape,
+) -> Result<Vec<Window>> {
+    let (auth_name, auth_value) = (provider.auth_header)(api_key);
     let resp = client
         .get(endpoint)
         .header(auth_name, auth_value)
@@ -59,18 +66,18 @@ pub fn fetch_windows_blocking(
 
     let body: Value = resp.json().context("decoding JSON body")?;
 
-    if let Some(msg) = envelope_error(&body, MINIMAX.error_envelope.as_ref()) {
+    if let Some(msg) = envelope_error(&body, shape.error_envelope.as_ref()) {
         return Err(anyhow::anyhow!("{msg}"));
     }
 
-    // Pass current epoch ms to parse_coding_plan so it can compute
-    // `reset_at = now_ms + remains_time_ms` (the API's `remains_time`
-    // is a duration in ms, not an epoch timestamp).
+    // Pass current epoch ms to parse_plan so it can compute
+    // `reset_at = now_ms + remains_time_ms` (when the API's
+    // `remains_time` is a duration in ms, not an epoch timestamp).
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    parse_coding_plan(&body, now_ms).context("parsing payload")
+    parse_plan(&body, shape, now_ms).context("parsing payload")
 }
 
 /// Strip anything that looks like a credential from an error snippet
@@ -247,19 +254,27 @@ mod tests {
 
     #[test]
     fn build_client_succeeds() {
-        assert!(build_client().is_ok());
+        assert!(build_client(&crate::provider::MINIMAX).is_ok());
     }
 
     #[test]
     fn parse_error_propagates() {
         let v: Value = serde_json::from_str("{}").unwrap();
-        assert!(parse_coding_plan(&v, 0).is_err());
+        let shape = crate::provider::MINIMAX.shape("remains").unwrap();
+        assert!(parse_plan(&v, shape, 0).is_err());
     }
 
     #[test]
     fn empty_model_remains_returns_parse_error_not_panic() {
         let v = json!({"model_remains": []});
-        assert!(parse_coding_plan(&v, 0).is_err());
+        let shape = crate::provider::MINIMAX.shape("remains").unwrap();
+        assert!(parse_plan(&v, shape, 0).is_err());
+    }
+
+    fn minimax_envelope() -> &'static crate::provider::ErrorEnvelope {
+        crate::provider::MINIMAX.shape("remains")
+            .and_then(|s| s.error_envelope.as_ref())
+            .expect("MINIMAX_REMAINS should have an error envelope")
     }
 
     #[test]
@@ -268,21 +283,21 @@ mod tests {
         let v = json!({
             "base_resp": {"status_code": 1004, "status_msg": "login fail: bad key"}
         });
-        let err = super::envelope_error(&v, crate::provider::MINIMAX.error_envelope.as_ref());
+        let err = super::envelope_error(&v, Some(minimax_envelope()));
         assert_eq!(err.as_deref(), Some("API error 1004: login fail: bad key"));
     }
 
     #[test]
     fn base_resp_zero_code_is_not_an_error() {
         let v = json!({"base_resp": {"status_code": 0, "status_msg": "ok"}});
-        let err = super::envelope_error(&v, crate::provider::MINIMAX.error_envelope.as_ref());
+        let err = super::envelope_error(&v, Some(minimax_envelope()));
         assert_eq!(err, None);
     }
 
     #[test]
     fn missing_base_resp_is_not_an_error() {
         let v = json!({"model_remains": []});
-        let err = super::envelope_error(&v, crate::provider::MINIMAX.error_envelope.as_ref());
+        let err = super::envelope_error(&v, Some(minimax_envelope()));
         assert_eq!(err, None);
     }
 

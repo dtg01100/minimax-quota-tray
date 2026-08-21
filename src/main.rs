@@ -163,7 +163,20 @@ async fn do_refresh(
             // by install.sh under hicolor/scalable/apps). Renders for
             // Normal/Warning go through IconPixmap (the green/yellow
             // ring with center dot).
-            let icon_name = bucket_name(bucket);
+            // For Normal/Warning, write the ring PNG to disk and use its
+            // path as IconName — matches gjs `set_icon_full(path, ...)` so
+            // the AppIndicator extension reads the rendered PNG and shows
+            // the ring (with center dot + faded track) instead of the
+            // theme-icon fallback (a solid filled circle). See the long
+            // comment on `icon::ring_icon_path` for why this is needed.
+            // For Throttled (no ring), use the static `quota-throttled`
+            // theme icon.
+            let icon_name: String = match bucket {
+                icon::Bucket::Normal | icon::Bucket::Warning => {
+                    icon::write_ring_png(pct, bucket).to_string_lossy().into_owned()
+                }
+                icon::Bucket::Throttled => bucket_name(bucket).to_string(),
+            };
             let title = title_for(&five_h, burn_5h.as_ref());
             let pixmap = match bucket {
                 icon::Bucket::Throttled => None,
@@ -175,7 +188,7 @@ async fn do_refresh(
                 pct, cfg.thresholds.yellow, cfg.thresholds.red, 0,
             );
             drop(s);
-            let _ = tray.update(&title, icon_name, "Active", pixmap).await;
+            let _ = tray.update(&title, &icon_name, "Active", pixmap).await;
             interval * 1000
         }
         Err(e) => {

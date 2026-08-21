@@ -118,6 +118,72 @@ fn bucket_name(b: Bucket) -> &'static str {
     }
 }
 
+/// Compute the path to a cached PNG for the given percentage.
+///
+/// Matches gjs `ringIconPath()`: `${TMPDIR}/minimax-quota-ring-${pct}.png`.
+/// One file per integer percentage (0..100), shared across buckets via the
+/// bucket color baked into the BGRA bytes. The path is what we send as
+/// `IconName` so the SNI host reads the PNG from disk — without this,
+/// the AppIndicator extension prefers the theme name `quota-normal`
+/// (a solid filled circle) over `IconPixmap`, so the panel shows the
+/// static dot instead of our rendered ring. This is exactly what gjs
+/// does to make the ring visible: it sets the icon name to the path of
+/// the rendered PNG file, then the AppIndicator extension loads that
+/// PNG via the standard theme-resolution path.
+pub fn ring_icon_path(pct: i64) -> std::path::PathBuf {
+    let clamped = pct.clamp(0, 100);
+    let dir = std::env::var("TMPDIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir());
+    dir.join(format!("minimax-quota-ring-{clamped}.png"))
+}
+
+/// Render the ring for `pct` + `bucket` to a PNG file on disk, returning
+/// the path. Skips the write when the file is already up to date (cache
+/// hit on subsequent polls — saves a resvg invocation per refresh for
+/// the steady-state "no change" case). The PNG is RGBA8 so the panel
+/// picks up transparent background correctly.
+pub fn write_ring_png(pct: i64, bucket: Bucket) -> std::path::PathBuf {
+    let path = ring_icon_path(pct);
+    if path.exists() { return path; }
+    if let Some((w, h, bytes)) = render_pixmap(pct, bucket) {
+        if let Err(e) = write_png_rgba(&path, w, h, &bytes) {
+            log::warn!("icon: failed to write ring PNG to {path:?}: {e}");
+        }
+    }
+    path
+}
+
+/// Encode `bytes` (BGRA host-endian, as `render_pixmap` returns) as a
+/// RGBA8 PNG at `path`. Uses the `png` crate — a hand-rolled encoder
+/// failed to produce a valid deflate stream the AppIndicator extension
+/// would load (and would silently show no icon when the file path
+/// couldn't be decoded).
+fn write_png_rgba(
+    path: &std::path::Path,
+    w: u32,
+    h: u32,
+    bgra: &[u8],
+) -> anyhow::Result<()> {
+    // Convert BGRA → RGBA (just swap channel order; alpha stays).
+    let mut raw = Vec::with_capacity(bgra.len());
+    for px in bgra.chunks_exact(4) {
+        raw.push(px[2]); // R
+        raw.push(px[1]); // G
+        raw.push(px[0]); // B
+        raw.push(px[3]); // A
+    }
+    let file = std::fs::File::create(path)?;
+    let w_ref = &mut std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(w_ref, w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(&raw)?;
+    Ok(())
+}
+
 /// SVG template for the ring icon — three layers, identical to the gjs
 /// `renderRingSvg()` output so the resvg-rendered icon matches what the
 /// gjs version produced via `magick -density 600`:

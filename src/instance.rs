@@ -5,13 +5,12 @@
 //! same endpoint with different colors). Each instance is
 //! identified by a name (the "instance name") which namespaces:
 //!
-//!   - config dir  → `~/.config/quota-tray-<name>/config.json`
-//!   - lock file   → `${XDG_RUNTIME_DIR}/quota-tray-<name>.pid`
-//!   - keyring app → `quota-tray-<name>`
+//!   - config dir  → `~/.config/llm-quota-tray-<name>/config.json`
+//!   - lock file   → `${XDG_RUNTIME_DIR}/llm-quota-tray-<name>.pid`
+//!   - keyring app → `llm-quota-tray-<name>`
 //!
-//! The basename `quota-tray` is deliberately neutral — no provider
-//! name baked in. The default instance (no `--instance=` flag) uses
-//! just `quota-tray`; named instances append `-<name>`.
+//! The default instance (no `--instance=` flag) uses `llm-quota-tray`;
+//! named instances append `-<name>`.
 //!
 //! ## Sources for the instance name
 //!
@@ -81,9 +80,9 @@ pub fn is_default() -> bool {
 /// Used to build `~/.config/<basename>/config.json`.
 pub fn config_dir_basename() -> String {
     if is_default() {
-        "quota-tray".to_string()
+        "llm-quota-tray".to_string()
     } else {
-        format!("quota-tray-{}", name())
+        format!("llm-quota-tray-{}", name())
     }
 }
 
@@ -145,7 +144,7 @@ mod tests {
 
     #[test]
     fn config_dir_basename_default() {
-        // Empty name → "quota-tray" (legacy single-instance).
+        // Empty name → "llm-quota-tray" (default single-instance).
         // We can't safely mutate INSTANCE_NAME across tests, but
         // since the helper derives from `name()` which defaults to
         // "" when uninitialized, this matches the production
@@ -154,12 +153,12 @@ mod tests {
         // the helper is a pure function over `name()` so it's
         // covered by the path test below.
         let s = if is_default() {
-            "quota-tray".to_string()
+            "llm-quota-tray".to_string()
         } else {
-            format!("quota-tray-{}", name())
+            format!("llm-quota-tray-{}", name())
         };
         // The test is more meaningful once we've initialized —
         // covered by the multi-instance doc tests in main.rs.
-        assert!(s == "quota-tray" || s.starts_with("quota-tray-"));
+        assert!(s == "llm-quota-tray" || s.starts_with("llm-quota-tray-"));
     }
 }

@@ -48,11 +48,11 @@ fn label() -> String {
 /// Look up the API key. Priority order matches the gjs `loadApiKey()`:
 ///
 ///   1. Secret Service (GNOME Keyring / KWallet via libsecret).
-///   2. Legacy plaintext file at `$HOME/.config/.config/quota-tray/key`
+///   2. Legacy plaintext file at `$HOME/.config/.config/llm-quota-tray/key`
 ///      (auto-migrated to the keyring on first run by the gjs code;
 ///      here we just read it as a fallback if the keyring daemon is
 ///      unreachable).
-///   3. `MINIMAX_API_KEY` env var. Useful for systemd unit overrides
+///   3. `LLM_API_KEY` env var. Useful for systemd unit overrides
 ///      where the user prefers not to store a key in the keyring.
 ///
 /// Returns `None` if all three are missing/empty. Callers should treat
@@ -84,7 +84,7 @@ pub fn get() -> Option<String> {
     }
     // 3. Env var. Trim + reject — matches the gjs handling that
     // treats an all-whitespace env value as absent.
-    if let Ok(raw) = std::env::var("MINIMAX_API_KEY") {
+    if let Ok(raw) = std::env::var("LLM_API_KEY") {
         if let Some(k) = secret_to_key(raw.as_bytes()) {
             return Some(k);
         }
@@ -185,26 +185,26 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Tests in this module mutate the global `MINIMAX_API_KEY` env
+    /// Tests in this module mutate the global `LLM_API_KEY` env
     /// var. Serialize them so cargo's parallel runner doesn't have
     /// two tests stomp on each other's env state.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Set `MINIMAX_API_KEY` for the duration of `body`, restoring
+    /// Set `LLM_API_KEY` for the duration of `body`, restoring
     /// the previous value (if any) when `body` returns. The body
     /// must NOT panic — we don't catch_unwind here because that
     /// would force callers to be UnwindSafe.
     fn with_env<F: FnOnce()>(env_value: Option<&str>, body: F) {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("MINIMAX_API_KEY").ok();
+        let prev = std::env::var("LLM_API_KEY").ok();
         match env_value {
-            Some(v) => std::env::set_var("MINIMAX_API_KEY", v),
-            None => std::env::remove_var("MINIMAX_API_KEY"),
+            Some(v) => std::env::set_var("LLM_API_KEY", v),
+            None => std::env::remove_var("LLM_API_KEY"),
         }
         let result = body();
         match prev {
-            Some(v) => std::env::set_var("MINIMAX_API_KEY", v),
-            None => std::env::remove_var("MINIMAX_API_KEY"),
+            Some(v) => std::env::set_var("LLM_API_KEY", v),
+            None => std::env::remove_var("LLM_API_KEY"),
         }
         result
     }
@@ -250,7 +250,7 @@ mod tests {
         // (which is the case in CI / containers — see the
         // `service()` cache).
         //
-        // To force the env-var path we set MINIMAX_API_KEY and
+        // To force the env-var path we set LLM_API_KEY and
         // rely on the keyring/legacy-file lookups failing in the
         // test container.
         with_env(Some("sk-env-test-key"), || {
@@ -281,7 +281,7 @@ mod tests {
         let path = legacy_key_path();
         assert!(path.starts_with(std::env::var("HOME").unwrap_or_default())
                 || path.starts_with("/tmp"));
-        assert!(path.ends_with(".config/.config/quota-tray/key"));
+        assert!(path.ends_with(".config/.config/llm-quota-tray/key"));
     }
 
     #[test]
@@ -292,7 +292,7 @@ mod tests {
         // SecretService::connect() succeed (returning a service handle) but
         // the daemon isn't actually running, so operations on it fail. Run
         // with `cargo test -- --ignored` to exercise the file path explicitly.
-        let tmp = std::env::temp_dir().join("minimax-keyring-test");
+        let tmp = std::env::temp_dir().join("llm-quota-keyring-test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("HOME", &tmp);
 

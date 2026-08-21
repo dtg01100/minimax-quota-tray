@@ -31,7 +31,7 @@ pub fn send(tag: &str, title: &str, body: &str, urgency: Urgency) {
     };
     let result = Command::new("notify-send")
         .args([
-            "-a", "minimax-quota-tray",
+            "-a", "llm-quota-tray",
             "-h", &format!("string:x-canonical-private-synchronous:{tag}"),
             "-u", urgency_str,
             title, body,

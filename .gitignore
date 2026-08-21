@@ -9,3 +9,6 @@ target/
 
 # Local-only files (don't ship)
 *.local
+
+# Toolchain pinning — local dev env, not for the repo
+mise.toml

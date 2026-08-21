@@ -3,7 +3,7 @@
 /// Format a duration in ms as e.g. "5m", "1h 5m", "2d 3h". Used for reset
 /// countdowns (window labels) and "last update Xm ago" stale annotations.
 ///
-/// gjs parity: matches `fmtReset()` / `fmtAge()` in `minimax-quota-tray.js`.
+/// gjs parity: matches `fmtReset()` / `fmtAge()` in `llm-quota-tray.js`.
 /// Note the gjs `fmtReset()` uses ceil-minutes ("4h" for 3h59m left), but
 /// `fmtAge()` uses floor — they're separate helpers. Here we pick the
 /// appropriate rounding via the `floor` flag at the call site.

@@ -1,8 +1,11 @@
-# MiniMax Quota Tray
+# LLM Quota Tray
 
-A standalone freedesktop tray indicator for MiniMax API quota. Supports
-both the **Coding Plan** and the **Token Plan** via your own API key.
-Talks directly to the MiniMax API — no agent or plugin system required.
+A provider-agnostic freedesktop tray indicator for LLM API quota. One
+binary, many APIs — every provider-specific bit (endpoint, JSON shape,
+auth style, ring colors) lives in `~/.config/llm-quota-tray/config.json`.
+The shipped example config points at the MiniMax API (Coding Plan +
+Token Plan), but the tray is fully generic; a fork or a second
+instance can target any other LLM API.
 
 ![Menu preview](menu.txt)
 
@@ -17,9 +20,9 @@ the host's panel does all the rendering from the dbusmenu tree.
 
 > The gjs implementation has been retired. The Rust port is the
 > only supported implementation on `main`. (~5000 LOC across 14
-> modules, 126 unit tests, ~5.5 MB release binary, ~10 MB RSS.) No GUI
+> modules, 150+ unit tests, ~5.5 MB release binary, ~10 MB RSS.) No GUI
 > library at all — talks to D-Bus directly and renders the icon as ARGB
-> bytes via `resvg` (or a raw BGRA circle routine for the static
+> bytes via `tiny-skia` (or a raw BGRA circle routine for the static
 > states). No `~/.so` link deps beyond libc + libsecret + libdbus;
 > works on any Linux distro without needing gtk3/libappindicator/etc.
 > installed.
@@ -37,11 +40,11 @@ the host's panel does all the rendering from the dbusmenu tree.
     · on pace to have ~62% left at reset (15%/h)
     weekly: 100% left · resets in 6d 8h
     ███████████████████████
-    ───
+  ───
     Refresh now
     Open dashboard
     Set API Key…
-    ───
+  ───
     Quit
   ```
 - **Burn-rate row** — once the tray has ~10 minutes of polling history
@@ -64,7 +67,7 @@ the host's panel does all the rendering from the dbusmenu tree.
     barely ticks, so the slope over the 1h lookback is meaningless. A
     pct-only window only gets a row when its rate is non-zero (i.e. the
     percent has actually crossed a 1% boundary recently). Token-counting
-    providers keep the row for all windows — their rate is computed from
+    providers keep the row for all windows since their rate is computed from
     real count deltas, which stays meaningful at any window length.
   - warning (projected exhaustion before reset):
     `⚠ 1.2k tok/h → exhausts ~1h 5m before reset` (or `⚠ 60%/h → exhausts ~22m before reset`)
@@ -88,9 +91,9 @@ the host's panel does all the rendering from the dbusmenu tree.
     natively (they speak SNI directly)
 - `libsecret` for the keyring (any libsecret provider — GNOME Keyring,
   KWallet, KeePassXC's secret-service bridge)
-- A MiniMax API key (stored in the keyring under the `quota-tray`
-  application, in `~/.config/.config/quota-tray/key`, or in the
-  `MINIMAX_API_KEY` env var)
+- An LLM-provider API key (stored in the keyring under the `llm-quota-tray`
+  application, in `~/.config/.config/llm-quota-tray/key`, or in the
+  `LLM_API_KEY` env var)
 
 ### Build (for `install.sh`, which compiles from source)
 
@@ -99,8 +102,8 @@ the host's panel does all the rendering from the dbusmenu tree.
 ## Install
 
 ```bash
-git clone https://github.com/dtg01100/minimax-quota-tray.git
-cd minimax-quota-tray
+git clone https://github.com/dtg01100/llm-quota-tray.git
+cd llm-quota-tray
 ./install.sh
 ```
 
@@ -108,7 +111,7 @@ The installer compiles the Rust binary if needed
 (`cargo build --release` — first build is ~1-2 min, subsequent rebuilds
 are seconds since `target/` is cached), copies it to `~/.local/bin/`,
 installs the systemd unit to `~/.config/systemd/user/`, and writes a
-default config to `~/.config/quota-tray/config.json` (skipped if it
+default config to `~/.config/llm-quota-tray/config.json` (skipped if it
 already exists). After it finishes, click the chip in your panel →
 **Set API Key…** to store your key in your libsecret provider
 (GNOME Keyring, KWallet, etc.).
@@ -116,7 +119,7 @@ already exists). After it finishes, click the chip in your panel →
 If you're not in a graphical session, run the installer from a desktop
 session or start the service manually after logging in:
 ```bash
-systemctl --user enable --now minimax-quota.service
+systemctl --user enable --now llm-quota-tray.service
 ```
 
 ## Uninstall
@@ -139,7 +142,7 @@ permanently self-rescheduling polling chains:
 ./tests/run.sh
 ```
 
-It imports the real app module with `MINIMAX_QUOTA_TEST=1` (which skips
+It imports the real app module with `LLM_QUOTA_TEST=1` (which skips
 `main()`), swaps the network / tray / menu / notification hooks for fakes,
 and asserts the single-flight invariant: at most one poll timeout is ever
 armed, and an explicit refresh arriving mid-fetch is queued exactly once.
@@ -166,7 +169,7 @@ if the cancel-before-arm logic is ever removed.
 
 ## Configuration
 
-`~/.config/quota-tray/config.json` (one instance = one config = one
+`~/.config/llm-quota-tray/config.json` (one instance = one config = one
 tray icon; see [Multiple instances](#multiple-instances) below for
 running more than one):
 
@@ -193,13 +196,16 @@ running more than one):
   },
 
   "ring_colors": {
-    "normal":   "#3a9d4d",
-    "warning":  "#f6d32d",
-    "throttled": "#e01b24"
+    "inner": {
+      "normal":   "#3a9d4d",
+      "warning":  "#f6d32d",
+      "throttled": "#e01b24"
+    },
+    "outer": "#3584e4"
   },
 
   "auth": { "type": "bearer" },
-  "user_agent": "minimax-quota-tray",
+  "user_agent": "llm-quota-tray",
 
   "refresh_seconds": 120,
   "refresh_min_seconds": 15,
@@ -224,10 +230,25 @@ running more than one):
   `src/provider.rs` for the full schema; the worked example in
   [Porting to another provider](#porting-to-another-provider)
   below shows how to define a new shape.
-- **`ring_colors`** — the chip's three bucket-state colors. The
-  center dot uses the same color as the ring, so the chip reads as
-  "ring with center" — orange scheme for one tray, blue for another,
-  green/yellow/red (default) for a third, etc.
+- **`ring_colors`** — the chip's two color channels, each
+  configurable independently:
+  - **`inner`** colors the center dot (and the solid static-state
+    icons) — three bucket states: `normal` / `warning` /
+    `throttled`. This is the **status** channel; it flips through
+    green/yellow/red as the tray's state changes.
+  - **`outer`** colors the outer ring (track + progress arc) — a
+    single hex color. This is the **remaining-quota** channel; the
+    *length* of the arc encodes the percentage fill, the hue just
+    has to be visually distinct from the inner dot. Default is a
+    neutral blue accent (`#3584e4`) so the ring reads as a
+    "progress meter" regardless of which bucket the inner dot is
+    in. Examples: orange scheme for one tray (`inner: {normal:
+    "#ff9900", warning: "#ff5500", throttled: "#ff0000"}`, any
+    `outer`), blue for another, green/yellow/red (default) for a
+    third.
+  - Legacy configs that put `normal`/`warning`/`throttled` directly
+    under `ring_colors` (pre-split) still parse — those fields
+    become `inner` and `outer` defaults to the neutral accent.
 - **`auth`** — how the API key is sent. One of:
   - `{ "type": "bearer" }` — `Authorization: Bearer <key>` (default)
   - `{ "type": "header", "name": "x-api-key" }` — `<header>: <key>`
@@ -272,41 +293,41 @@ don't collide. Run them with `--instance=<name>` (or
 `QUOTA_INSTANCE=<name>` env var).
 
 ```sh
-# Default tray — `~/.config/quota-tray/`, keyring app `quota-tray`,
-# lock at `$XDG_RUNTIME_DIR/quota-tray.pid`
-minimax-quota-tray
+# Default tray — `~/.config/llm-quota-tray/`, keyring app `llm-quota-tray`,
+# lock at `$XDG_RUNTIME_DIR/llm-quota-tray.pid`
+llm-quota-tray
 
-# Concurrent instance for a different provider — `~/.config/quota-tray-codex/`,
-# keyring app `quota-tray-codex`, lock at `$XDG_RUNTIME_DIR/quota-tray-codex.pid`.
+# Concurrent instance for a different provider — `~/.config/llm-quota-tray-codex/`,
+# keyring app `llm-quota-tray-codex`, lock at `$XDG_RUNTIME_DIR/llm-quota-tray-codex.pid`.
 # Each tray icon can have its own colors / endpoint / auth / etc.
-minimax-quota-tray --instance=codex
+llm-quota-tray --instance=codex
 ```
 
 For a persistent second tray (e.g. Codex running on every login),
-install a second systemd unit. `minimax-quota.service` is the
-template — copy it to `minimax-quota-codex.service` and add
+install a second systemd unit. `llm-quota-tray.service` is the
+template — copy it to `llm-quota-tray-codex.service` and add
 `--instance=codex` to the `ExecStart=` line:
 
 ```sh
-cp ~/.config/systemd/user/minimax-quota.service \
-   ~/.config/systemd/user/minimax-quota-codex.service
+cp ~/.config/systemd/user/llm-quota-tray.service \
+   ~/.config/systemd/user/llm-quota-tray-codex.service
 # Edit the copy: change Description= and add ` --instance=codex`
 # to the end of ExecStart=
 systemctl --user daemon-reload
-systemctl --user enable --now minimax-quota-codex.service
+systemctl --user enable --now llm-quota-tray-codex.service
 ```
 
 What gets namespaced per instance:
 
 | | Default | `--instance=codex` |
 |---|---|---|
-| Config dir | `~/.config/quota-tray/` | `~/.config/quota-tray-codex/` |
+| Config dir | `~/.config/llm-quota-tray/` | `~/.config/llm-quota-tray-codex/` |
 | Config file | `…/config.json` | `…/config.json` |
-| Lock file | `$XDG_RUNTIME_DIR/quota-tray.pid` | `$XDG_RUNTIME_DIR/quota-tray-codex.pid` |
-| Keyring `application` | `quota-tray` | `quota-tray-codex` |
-| Keyring `label` | `quota-tray API Key` | `quota-tray-codex API Key` |
-| Legacy fallback key file | `~/.config/.config/quota-tray/key` | `~/.config/.config/quota-tray-codex/key` |
-| Static SVGs | `minimax-quota-*.svg` (shared) | (shared — same names) |
+| Lock file | `$XDG_RUNTIME_DIR/llm-quota-tray.pid` | `$XDG_RUNTIME_DIR/llm-quota-tray-codex.pid` |
+| Keyring `application` | `llm-quota-tray` | `llm-quota-tray-codex` |
+| Keyring `label` | `llm-quota-tray API Key` | `llm-quota-tray-codex API Key` |
+| Legacy fallback key file | `~/.config/.config/llm-quota-tray/key` | `~/.config/.config/llm-quota-tray-codex/key` |
+| Static SVGs | `llm-quota-tray-*.svg` (shared) | (shared — same names) |
 
 The static SVGs in `${TMPDIR}/` are shared across instances because
 they're per-color, not per-instance, and the colors come from each
@@ -330,7 +351,7 @@ to render a native menu.
 
 ```
    ┌──────────────────────────┐
-   │   minimax-quota-tray      │   ~5.2 MB ELF, no GUI library;
+   │   llm-quota-tray         │   ~5.2 MB ELF, no GUI library;
    │                          │   links libc + libsecret + libdbus only
    └────────────┬─────────────┘
                 │
@@ -340,7 +361,7 @@ to render a native menu.
    └────────────┬─────────────┘
                 │
    Host's SNI panel ←  reqwest →  endpoint from config.json
-                ↓
+                 ↓
    secret-service crate  →  libsecret (any provider)
 ```
 
@@ -373,7 +394,7 @@ compatibility with libsecret versions that misbehave on
   empty loader directory), the file load fails and the host falls
   through to the in-memory ARGB bytes sent via SNI `IconPixmap` —
   so the icon should still render. If it doesn't, check that
-  `${TMPDIR}/minimax-quota-*.svg` exists, is readable, and the directory
+  `${TMPDIR}/llm-quota-tray-*.svg` exists, is readable, and the directory
   isn't read-only. The icon-pixmap fallback renders regardless of
   whether the SVG file load succeeded, so a missing SVG file will
   never produce a blank panel on its own — if you see the three
@@ -388,7 +409,7 @@ compatibility with libsecret versions that misbehave on
   (`--components=secrets`), kwalletd, or KeePassXC's secret-service
   bridge is running.
 
-- **`MINIMAX_API_KEY` env var works but keyring doesn't** — your
+- **`LLM_API_KEY` env var works but keyring doesn't** — your
   panel session doesn't have the libsecret `$DBUS_SESSION_BUS_ADDRESS`
   reachable, so the binary falls through to the env var. This is
   fine — just keep the env var set in your shell rc file or systemd
@@ -409,8 +430,8 @@ names a specific provider.
 ### What's in `config.json`
 
 Every field that varies between providers lives in
-`~/.config/quota-tray/config.json` (or
-`~/.config/quota-tray-<instance>/config.json` for a named
+`~/.config/llm-quota-tray/config.json` (or
+`~/.config/llm-quota-tray-<instance>/config.json` for a named
 instance):
 
 | Field | What it controls |
@@ -419,7 +440,7 @@ instance):
 | `dashboard_url` | Opened by the **Open dashboard** menu item |
 | `label` | Shown in the chip and menu header |
 | `shape` | JSON response structure: entry path, windows, error envelope |
-| `ring_colors` | Hex colors for normal / warning / throttled |
+| `ring_colors` | Two color channels: `inner: {normal, warning, throttled}` (status dot) + `outer` (percentage-fill ring) |
 | `auth` | How the API key is sent (Bearer / header / custom / query param) |
 | `user_agent` | User-Agent prefix (version auto-appended) |
 | `thresholds`, `refresh_*`, `burn_warning` | UI cadence + bucket thresholds |
@@ -450,7 +471,7 @@ fields in `config.json`'s `shape`):
 
 - **N windows.** There's no fixed limit — `shape.windows` is a
   `Vec<WindowShape>` of arbitrary length. The tray renders one
-  menu row per window. MiniMax ships with 2 (`5h`, `weekly`);
+  menu row per window. The LLM provider ships with 2 (`5h`, `weekly`);
   a 3-window provider (e.g. minute/hour/day) just adds another
   `WindowShape` entry to its config.
 - **Window length is derived dynamically** — `burn::compute_burn`
@@ -482,11 +503,11 @@ Suppose Provider X exposes:
 GET https://api.provider.com/v1/usage
 x-api-key: <key>
 → { "daily":   { "limit": 1000,  "used": 120,  "reset_in_ms": 7200000 },
-    "monthly": { "limit": 30000, "used": 4500, "reset_in_ms": 2592000000 } }
+    "monthly": { "limit": 30000, "used": 4500,  "reset_in_ms": 2592000000 } }
 ```
 
 The whole port is one config file at
-`~/.config/quota-tray-provider-x/config.json`:
+`~/.config/llm-quota-tray-provider-x/config.json`:
 
 ```json
 {
@@ -515,17 +536,20 @@ The whole port is one config file at
   },
 
   "ring_colors": {
-    "normal":   "#3366ff",
-    "warning":  "#9933ff",
-    "throttled": "#cc00ff"
+    "inner": {
+      "normal":   "#3366ff",
+      "warning":  "#9933ff",
+      "throttled": "#cc00ff"
+    },
+    "outer": "#ff66cc"
   },
 
   "auth": { "type": "header", "name": "x-api-key" },
-  "user_agent": "quota-tray-provider-x"
+  "user_agent": "llm-quota-tray-provider-x"
 }
 ```
 
-Launch it: `minimax-quota-tray --instance=provider-x`. The tray icon
+Launch it: `llm-quota-tray --instance=provider-x`. The tray icon
 shows the blue/purple/pink palette, hits `api.provider.com`, sends
 `x-api-key: <key>`, renders two menu rows (`daily: 88% left`,
 `monthly: 85% left`), and refreshes on the configured cadence. No
@@ -543,13 +567,13 @@ coexist with the original:
 
 | What                          | Where                                             |
 | ----------------------------- | ------------------------------------------------- |
-| Script filename               | `minimax-quota-tray` → e.g. `openai-quota-tray` |
-| systemd unit                  | `minimax-quota.service`                           |
+| Script filename               | `llm-quota-tray` → e.g. `openai-quota-tray` |
+| systemd unit                  | `llm-quota-tray.service`                           |
 | Service `Description=`         | text shown in `systemctl --user status`         |
 | Cargo crate name              | `Cargo.toml` `[package].name`                     |
 
 The config dir, lock file, and keyring `application` attribute are
-all derived from the instance name (default: `quota-tray`); forking
+all derived from the instance name (default: `llm-quota-tray`); forking
 the binary doesn't change those.
 
 

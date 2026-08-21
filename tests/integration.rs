@@ -1,4 +1,4 @@
-//! End-to-end integration tests for the MiniMax quota tray.
+//! End-to-end integration tests for the LLM Quota Tray.
 //!
 //! These tests require a session D-Bus and write to ~/.config. Marked
 //! `#[ignore]` by default so `cargo test` doesn't fail in stripped-down
@@ -14,8 +14,8 @@ use std::process::Command;
 #[test]
 #[ignore]
 fn binary_starts_under_session_dbus() {
-    let mut child = Command::new("./target/release/minimax-quota-tray")
-        .env("HOME", "/tmp/minimax-integration-home")
+    let mut child = Command::new("./target/release/llm-quota-tray")
+        .env("HOME", "/tmp/llm-quota-integration-home")
         .spawn()
         .expect("binary must exist");
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -25,7 +25,7 @@ fn binary_starts_under_session_dbus() {
     // The startup log includes the SNI warning (no watcher in headless
     // test) and the plan label — both are proof the daemon reached its
     // main loop without panicking.
-    assert!(stderr.contains("minimax-quota-tray")
+    assert!(stderr.contains("llm-quota-tray")
             || stderr.contains("refresh every"),
             "binary should reach steady state; got: {stderr}");
 }
@@ -36,8 +36,8 @@ fn binary_starts_under_session_dbus() {
 #[test]
 #[ignore]
 fn rss_under_target() {
-    let mut child = Command::new("./target/release/minimax-quota-tray")
-        .env("HOME", "/tmp/minimax-integration-home")
+    let mut child = Command::new("./target/release/llm-quota-tray")
+        .env("HOME", "/tmp/llm-quota-integration-home")
         .spawn()
         .expect("binary must exist");
     std::thread::sleep(std::time::Duration::from_secs(3));

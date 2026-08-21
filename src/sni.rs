@@ -9,7 +9,7 @@
 //!
 //! What we expose:
 //!   - `Category`     = "ApplicationStatus"
-//!   - `Id`           = "minimax-quota-tray"
+//!   - `Id`           = "llm-quota-tray"
 //!   - `Title`        = always `""` (gjs parity — the chip carries
 //!                       the bucket via icon color, never a visible
 //!                       text label; the menu carries the detail)
@@ -116,7 +116,7 @@ impl StatusNotifierItem {
 
     #[zbus(property)]
     async fn id(&self) -> String {
-        "minimax-quota-tray".to_string()
+        "llm-quota-tray".to_string()
     }
 
     #[zbus(property)]

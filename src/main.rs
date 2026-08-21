@@ -11,7 +11,7 @@
 //! ## Subsystems wired here
 //!
 //! - **Single-instance lock** (`lock::Lock`): O_EXCL PID file at
-//!   `$XDG_RUNTIME_DIR/minimax-quota-tray.pid`. Refuses to start if a
+//!   `$XDG_RUNTIME_DIR/llm-quota-tray.pid`. Refuses to start if a
 //!   live instance already holds it; takes over stale locks.
 //!
 //! - **Network monitor** (`network::spawn_watcher`): subscribes to NM

@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn build_client_succeeds() {
-        assert!(build_client("minimax-quota-tray").is_ok());
+        assert!(build_client("llm-quota-tray").is_ok());
     }
 
     #[test]

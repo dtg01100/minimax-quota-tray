@@ -134,38 +134,57 @@ provider.
 
 ## Tests
 
-The poll scheduler has a unit harness that simulates overlapping
-`refresh()` calls — the exact scenario that used to spawn multiple,
-permanently self-rescheduling polling chains:
+The Rust port carries **~155 unit tests across 16 modules**, plus two
+ignored integration tests that need a session D-Bus.
 
 ```bash
-./tests/run.sh
+cargo test                                 # unit tests (no D-Bus needed)
+cargo test -- --ignored                    # + integration tests (D-Bus smoke + RSS guard)
+cargo test config::tests::provider_templates_deserialize  # schema-drift guard for examples/providers/*.json
 ```
 
-It imports the real app module with `LLM_QUOTA_TEST=1` (which skips
-`main()`), swaps the network / tray / menu / notification hooks for fakes,
-and asserts the single-flight invariant: at most one poll timeout is ever
-armed, and an explicit refresh arriving mid-fetch is queued exactly once.
-The suite also covers offline handling, the no-key state, backoff after
-errors, threshold-notification dedup, and the burn-rate projection
-(history gating, rollover resets, the warn/don't-warn decision, the
-projected-% at reset label, and the chip bucket flip — driven under a
-stubbed clock so the slope math is deterministic). The burn-rate
-coverage exercises both windows independently: T18 verifies the weekly
-rate is computed from weekly samples (a quiet 5h doesn't pollute it),
-T19 verifies the 5h rollover does not clear the weekly history, and T21
-verifies the pct-only suppression rule — pct-only windows with no signal
-(skip the weekly row on Coding Plan, skip idle 5h on any pct-only API)
-while token-counting providers keep the row for all windows.
+What the suite covers:
 
-`tests/regression-scheduler.test.js` documents the bug this guards against:
-it runs a faithful replica of the pre-fix scheduler (extracted from commit
-`d4d07cd`, where every manual refresh spawned a second self-rescheduling
-poll chain) head-to-head against the fixed app — Part A reproduces the
-stacked chains and request burst, Part B proves the fixed code has exactly
-one chain and no burst. The suite is red against the pre-fix algorithm and
-green against the fix; the real-timer Part B test is the decisive detector
-if the cancel-before-arm logic is ever removed.
+- **Single-flight invariant** — the orchestrator's `tokio::select!`
+  arms at most one poll timeout; an explicit Refresh arriving mid-fetch
+  is queued exactly once (no stacked polling chains, no request bursts).
+- **Offline handling** — `NetEvent::Connectivity(false)` skips polling;
+  `Connectivity(true)` force-refreshes and clears backoff.
+- **No-key state** — menu shows `"No API key configured"` and re-arms
+  the normal cadence (no exponential backoff while waiting for the user).
+- **Backoff after errors** — `scheduler::next_interval` doubles up to
+  `max_backoff_seconds`, resets on success or menu Refresh.
+- **Threshold notification dedup** — `_last_bucket` is upward-only;
+  rank decrease does not fire a notification.
+- **Burn-rate projection** — `slope_per_hour` over `lookback_ms`,
+  `max`'d with the epoch-average floor when `use_epoch_average: true`.
+- **Window-specific history** — the weekly rate is computed from weekly
+  samples (a quiet 5h doesn't pollute it); the 5h rollover does not
+  clear the weekly history.
+- **Pct-only suppression** — pct-only windows with no signal suppress
+  the row (skip the weekly row on Coding Plan, skip idle 5h on any
+  pct-only API); token-counting providers keep the row for all windows.
+- **Lock takeover** — stale PID files (whose owner `/proc/<pid>` is
+  gone) are taken over cleanly; live holders are refused.
+- **Keyring trimming** — `secret-tool store` via a shell pipe can
+  persist trailing newlines; `secret_to_key` strips them so reqwest
+  doesn't reject the `Authorization` header.
+- **RSS regression guard** — `tests/integration.rs::rss_under_target`
+  fails if the binary exceeds 20 MB resident (catches accidental
+  re-introduction of GTK/libappindicator).
+
+The gjs-era test fixtures (`tests/run.sh`,
+`tests/regression-scheduler.test.js`) were retired with the gjs
+implementation. Their coverage maps to the Rust unit tests in
+`src/burn.rs::tests`, `src/main.rs::tests`, and `src/scheduler.rs::tests`;
+see [`docs/development.md`](docs/development.md) for the per-test
+locations.
+
+For the build profiles, debug tooling (logs, D-Bus introspection,
+backtraces), and how to add new tests / provider templates, see
+[`docs/development.md`](docs/development.md). For the architecture map
+and call graph, see [`docs/architecture.md`](docs/architecture.md). For
+the full config schema, see [`docs/config-schema.md`](docs/config-schema.md).
 
 ## Configuration
 
@@ -415,6 +434,9 @@ compatibility with libsecret versions that misbehave on
   fine — just keep the env var set in your shell rc file or systemd
   unit's `Environment=` line.
 
+For more troubleshooting + the full diagnostic checklist when the chip
+stays red after a port, see [`docs/port-guide.md`](docs/port-guide.md#diagnostic-checklist).
+
 ## Porting to another provider
 
 The tray infrastructure (AppIndicator, keyring, adaptive polling,
@@ -576,6 +598,15 @@ The config dir, lock file, and keyring `application` attribute are
 all derived from the instance name (default: `llm-quota-tray`); forking
 the binary doesn't change those.
 
+### When the simple port isn't enough
+
+The example above covers the *native-shape* case — your provider
+returns `{prefix}_remaining_percent` directly. Most Western providers
+(OpenAI, Anthropic, Google, Mistral, Groq, Cohere) don't, and need a
+sidecar. For the full port guide — Simple vs. Hard tracks, worked
+examples for the four hard cases (headers-only / consumption-only /
+multi-header auth / OAuth), and the diagnostic checklist — see
+[`docs/port-guide.md`](docs/port-guide.md).
 
 ## License
 

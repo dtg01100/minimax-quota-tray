@@ -21,8 +21,14 @@
 //! that can render SVG natively (see `write_static_svgs` /
 //! `write_ring_svg`).
 //!
-//! Colors are pinned to the gjs `RING_COLOR` table so the rendered icon
-//! matches what the gjs version produced: same green / yellow / red.
+//! Colors: the **outer ring** (track + progress arc) is drawn in the
+//! configured outer color (default: neutral blue accent, see
+//! `provider::DEFAULT_OUTER_COLOR`) so the percentage fill reads as a
+//! "progress meter" on its own channel. The **inner dot** is drawn in
+//! the bucket's status color (Normal / Warning / Throttled) so it
+//! flips through the green/yellow/red bucket palette independently of
+//! the percentage fill. See `RingColors` for the full inner/outer
+//! rationale.
 
 use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, StrokeDash, Transform};
 
@@ -106,17 +112,25 @@ pub fn bucket_for(
     Bucket::Normal
 }
 
-/// Look up the hex color for a bucket. Returns an owned `String`
-/// (the config drives these, so they're not `&'static`). Returns
-/// an empty string for unknown buckets — callers feed the result to
-/// `parse_hex_rgb` which rejects empty strings, so an unknown
-/// bucket renders as a transparent / default-color ring.
-fn bucket_hex(b: Bucket, colors: &RingColors) -> String {
+/// Look up the inner-dot hex color for a bucket. Returns an owned
+/// `String` (the config drives these, so they're not `&'static`).
+/// The inner color is the bucket's **status** color — the channel
+/// that flips through green/yellow/red as the tray moves between
+/// Normal / Warning / Throttled.
+fn inner_color_for(b: Bucket, colors: &RingColors) -> String {
     match b {
-        Bucket::Normal => colors.normal.clone(),
-        Bucket::Warning => colors.warning.clone(),
-        Bucket::Throttled => colors.throttled.clone(),
+        Bucket::Normal    => colors.inner.normal.clone(),
+        Bucket::Warning   => colors.inner.warning.clone(),
+        Bucket::Throttled => colors.inner.throttled.clone(),
     }
+}
+
+/// Outer-ring color — the **percentage-fill** channel. A single
+/// color (no per-bucket variation) so the percentage readout stays
+/// stable as the inner dot flips between buckets. Configurable via
+/// `ring_colors.outer`.
+fn outer_color(colors: &RingColors) -> &str {
+    &colors.outer
 }
 
 /// Internal label (different from the gjs `ICON` table — gjs used
@@ -201,14 +215,23 @@ fn svg_static(color: &str) -> String {
 /// Each static icon is a single `<circle r="9" fill="{color}">` — a
 /// solid dot. The set covers the five states the chip can be in:
 ///
-///   - `normal`:    from `colors.normal`  (provider-defined)
-///   - `warning`:   from `colors.warning` (provider-defined)
-///   - `throttled`: from `colors.throttled` (provider-defined; also
-///                  matches `quota-error` for visual consistency with
-///                  the legacy gjs chip)
+///   - `normal`:    inner dot color for the Normal bucket
+///                  (from `colors.inner.normal`)
+///   - `warning`:   inner dot color for the Warning bucket
+///                  (from `colors.inner.warning`)
+///   - `throttled`: inner dot color for the Throttled bucket
+///                  (from `colors.inner.throttled`; also matches
+///                  `quota-error` for visual consistency with the
+///                  legacy gjs chip)
 ///   - `error`:     same as throttled — the tray uses one red for both
 ///                  "exhausted" and "fetch failed"
 ///   - `offline`:   gray (`OFFLINE_COLOR`)
+///
+/// Static-state icons use the **inner** status color, not the outer
+/// ring color — they're rendered as solid dots when no percentage
+/// fill is meaningful (e.g. Throttled falls through to the static
+/// SVG instead of a ring render), so the inner-channel color is the
+/// only one that matters for these.
 pub fn write_static_svgs(colors: &RingColors) {
     let dir = std::env::var("TMPDIR")
         .ok()
@@ -218,10 +241,10 @@ pub fn write_static_svgs(colors: &RingColors) {
     // intentionally collapse these into a single visual state so
     // the user gets the same "I need attention" cue either way.
     let entries: [(&str, &str); 5] = [
-        ("normal",    &colors.normal),
-        ("warning",   &colors.warning),
-        ("throttled", &colors.throttled),
-        ("error",     &colors.throttled),
+        ("normal",    &colors.inner.normal),
+        ("warning",   &colors.inner.warning),
+        ("throttled", &colors.inner.throttled),
+        ("error",     &colors.inner.throttled),
         ("offline",   OFFLINE_COLOR),
     ];
     for (name, color) in entries {
@@ -247,7 +270,9 @@ pub fn write_static_svgs(colors: &RingColors) {
 pub fn write_ring_svg(pct: i64, bucket: Bucket, colors: &RingColors) -> std::path::PathBuf {
     let path = ring_svg_path(pct);
     if path.exists() { return path; }
-    let svg = svg_for(pct, &bucket_hex(bucket, colors));
+    let svg = svg_for(pct,
+                      &inner_color_for(bucket, colors),
+                      outer_color(colors));
     if let Err(e) = std::fs::write(&path, svg) {
         log::warn!("icon: failed to write ring SVG to {path:?}: {e}");
     }
@@ -262,22 +287,26 @@ pub fn write_ring_svg(pct: i64, bucket: Bucket, colors: &RingColors) -> std::pat
 /// `IconName`; hosts without SVG support fall through to the in-memory
 /// ARGB bytes from `render_pixmap()`:
 ///
-///   1. Faded full-circle track (`stroke` = color, `stroke-opacity`
-///      = 0.25). Same color as the progress arc, so the unfilled
-///      portion reads as "this much left" rather than as a separate
-///      grey ring that fights the panel theme.
-///   2. Progress arc (`stroke` = color, `stroke-linecap` = "round",
-///      `stroke-dasharray` = `(arc - halfStroke) (circumference -
-///      arc + halfStroke)`). The dasharray correction compensates for
-///      one round cap so the visible rounded terminus aligns with the
-///      12-o'clock start at pct=100 and the tail sits cleanly at
-///      pct<100 — matches gjs `arc - halfStroke`.
-///   3. Inner dot (`r=3.5`, `fill` = color). The dot is what makes the
-///      icon read as "ring with center" instead of an empty arc — the
-///      gjs version draws it explicitly; without it, the panel
-///      background shows through the middle and the icon looks like
-///      a thin curved line.
-fn svg_for(pct: i64, color: &str) -> String {
+///   1. Faded full-circle track (`stroke` = outer color,
+///      `stroke-opacity` = 0.25). The track uses the outer color so
+///      the unfilled portion reads as "this much left" rather than
+///      as a separate grey ring that fights the panel theme.
+///   2. Progress arc (`stroke` = outer color, `stroke-linecap`
+///      = "round", `stroke-dasharray` = `(arc - halfStroke)
+///      (circumference - arc + halfStroke)`). The dasharray
+///      correction compensates for one round cap so the visible
+///      rounded terminus aligns with the 12-o'clock start at
+///      pct=100 and the tail sits cleanly at pct<100 — matches gjs
+///      `arc - halfStroke`.
+///   3. Inner dot (`r=3.5`, `fill` = inner color). The dot is what
+///      makes the icon read as "ring with center" instead of an
+///      empty arc; the gjs version draws it explicitly; without it,
+///      the panel background shows through the middle and the icon
+///      looks like a thin curved line. The inner dot uses the
+///      bucket's status color so it flips through the green/yellow/
+///      red palette independently of the outer ring's percentage-
+///      fill color.
+fn svg_for(pct: i64, inner_color: &str, outer_color: &str) -> String {
     let circ = 2.0 * std::f32::consts::PI * RING_RADIUS;
     let filled = (pct.clamp(0, 100) as f32 / 100.0) * circ;
     // Round caps add ~half a stroke-width to each visible end, so the
@@ -289,10 +318,10 @@ fn svg_for(pct: i64, color: &str) -> String {
     let fg_rest = circ - fg_arc;
     format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {ICON_SIZE} {ICON_SIZE}" width="{ICON_SIZE}" height="{ICON_SIZE}">
-  <circle cx="11" cy="11" r="{RING_RADIUS}" fill="none" stroke="{color}" stroke-width="{RING_STROKE}" stroke-opacity="{TRACK_OPACITY}"/>
-  <circle cx="11" cy="11" r="{RING_RADIUS}" fill="none" stroke="{color}" stroke-width="{RING_STROKE}" stroke-linecap="round"
+  <circle cx="11" cy="11" r="{RING_RADIUS}" fill="none" stroke="{outer_color}" stroke-width="{RING_STROKE}" stroke-opacity="{TRACK_OPACITY}"/>
+  <circle cx="11" cy="11" r="{RING_RADIUS}" fill="none" stroke="{outer_color}" stroke-width="{RING_STROKE}" stroke-linecap="round"
           stroke-dasharray="{fg_arc:.3} {fg_rest:.3}" transform="rotate(-90 11 11)"/>
-  <circle cx="11" cy="11" r="{INNER_DOT_RADIUS}" fill="{color}"/>
+  <circle cx="11" cy="11" r="{INNER_DOT_RADIUS}" fill="{inner_color}"/>
 </svg>"#
     )
 }
@@ -306,26 +335,36 @@ fn svg_for(pct: i64, color: &str) -> String {
 /// The pixmap is composed of three tiny-skia primitives drawn in order
 /// (back to front):
 ///
-///   1. Faded full-circle track (stroke, opacity 0.25)
+///   1. Faded full-circle track (stroke, opacity 0.25) — drawn in the
+///      **outer** color so the unfilled portion reads as the
+///      percentage-fill channel faded into the panel.
 ///   2. Progress arc (stroke, round caps, dasharray, rotated −90°)
-///   3. Inner dot (fill, opacity 1.0)
+///      — drawn in the **outer** color so the percentage fill sits
+///      on the same channel as the track.
+///   3. Inner dot (fill, opacity 1.0) — drawn in the **inner**
+///      (bucket-status) color so it flips through Normal/Warning/
+///      Throttled independently of the outer ring's color.
 ///
-/// `colors` controls the ring + dot hue. MiniMax's defaults match the
-/// gjs `RING_COLOR` table (green/yellow/red); forked providers can
-/// override.
+/// `colors` controls both channels: `colors.outer` is the
+/// percentage-fill hue and `colors.inner.<bucket>` is the status
+/// hue. Forked providers can override either.
 ///
 /// Returns `None` only if `Pixmap::new` fails (effectively impossible
 /// for a 22×22 pixmap, but the API is fallible). Callers fall back to
 /// a theme icon name in that case.
 pub fn render_pixmap(pct: i64, bucket: Bucket, colors: &RingColors) -> Option<(u32, u32, Vec<u8>)> {
-    let (r, g, b) = parse_hex_rgb(&bucket_hex(bucket, colors))?;
+    let (or, og, ob) = parse_hex_rgb(outer_color(colors))?;
+    let (ir, ig, ib) = parse_hex_rgb(&inner_color_for(bucket, colors))?;
     let mut pixmap = Pixmap::new(ICON_SIZE, ICON_SIZE)?;
 
-    // 1. Track: stroke at 25% opacity. The alpha channel of the Paint
-    //    multiplies the stroke color — track_opacity=0.25 yields a
-    //    25%-opacity ring in the same hue as the progress arc.
+    // 1. Track: stroke at 25% opacity in the OUTER color. The alpha
+    //    channel of the Paint multiplies the stroke color —
+    //    track_opacity=0.25 yields a 25%-opacity ring in the outer
+    //    hue, so the unfilled portion reads as the same color
+    //    faded into the background rather than as a separate dark
+    //    grey that fights the panel theme.
     let mut track_paint = Paint::default();
-    track_paint.set_color(Color::from_rgba8(r, g, b, track_alpha()));
+    track_paint.set_color(Color::from_rgba8(or, og, ob, track_alpha()));
     track_paint.anti_alias = true;
 
     let track_path = {
@@ -346,11 +385,11 @@ pub fn render_pixmap(pct: i64, bucket: Bucket, colors: &RingColors) -> Option<(u
         None,
     );
 
-    // 2. Progress arc: same circle, but with the dashed pattern matching
-    //    gjs `arc - halfStroke`. The dash array must sum to a positive
-    //    finite value (tiny-skia rejects zero-length patterns); at pct=0
-    //    fg_arc is 0 but fg_rest is the full circumference so this
-    //    never triggers.
+    // 2. Progress arc: same circle, in the OUTER color, with the
+    //    dashed pattern matching gjs `arc - halfStroke`. The dash
+    //    array must sum to a positive finite value (tiny-skia
+    //    rejects zero-length patterns); at pct=0 fg_arc is 0 but
+    //    fg_rest is the full circumference so this never triggers.
     let circ = 2.0 * std::f32::consts::PI * RING_RADIUS;
     let filled = (pct.clamp(0, 100) as f32 / 100.0) * circ;
     let half_stroke = RING_STROKE / 2.0;
@@ -358,7 +397,7 @@ pub fn render_pixmap(pct: i64, bucket: Bucket, colors: &RingColors) -> Option<(u
     let fg_rest = (circ - fg_arc).max(0.0);
 
     let mut arc_paint = Paint::default();
-    arc_paint.set_color(Color::from_rgba8(r, g, b, 255));
+    arc_paint.set_color(Color::from_rgba8(or, og, ob, 255));
     arc_paint.anti_alias = true;
 
     let arc_path = {
@@ -389,10 +428,11 @@ pub fn render_pixmap(pct: i64, bucket: Bucket, colors: &RingColors) -> Option<(u
         None,
     );
 
-    // 3. Inner dot: filled circle. Tiny-skia ignores stroke vs fill
-    //    via fill_path; we don't need a stroke here.
+    // 3. Inner dot: filled circle in the INNER (bucket-status)
+    //    color. Tiny-skia ignores stroke vs fill via fill_path; we
+    //    don't need a stroke here.
     let mut dot_paint = Paint::default();
-    dot_paint.set_color(Color::from_rgba8(r, g, b, 255));
+    dot_paint.set_color(Color::from_rgba8(ir, ig, ib, 255));
     dot_paint.anti_alias = true;
 
     let dot_path = {
@@ -478,6 +518,7 @@ pub fn cache_step(pct: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::BucketColors;
 
     #[test]
     fn bucket_thresholds() {
@@ -534,9 +575,10 @@ mod tests {
 
     #[test]
     fn svg_contains_ring_elements() {
-        let s = svg_for(80, "#3a9d4d");
+        let s = svg_for(80, "#3a9d4d", "#3584e4");
         assert!(s.contains("<svg"));
-        assert!(s.contains("stroke=\"#3a9d4d\""));
+        assert!(s.contains("stroke=\"#3584e4\""),
+                "outer ring should use the outer color; got: {s}");
         // 80% of 2π·9 ≈ 45.239, minus halfStroke (1.25) ≈ 43.989.
         // Dasharray correction matches the gjs `arc - halfStroke` rule.
         assert!(s.contains("43.989") || s.contains("43.990"),
@@ -547,12 +589,26 @@ mod tests {
     fn svg_has_inner_dot() {
         // The ring-with-center-dot look is what makes the icon read as
         // a status indicator instead of a thin curve. gjs draws it as
-        // an explicit filled `<circle r="3.5" fill="${color}">`.
-        let s = svg_for(80, "#3a9d4d");
+        // an explicit filled `<circle r="3.5" fill="${color}">`. With
+        // the inner/outer split, the inner dot uses the bucket's
+        // status color (separate from the outer ring).
+        let s = svg_for(80, "#3a9d4d", "#3584e4");
         assert!(s.contains("r=\"3.5\""),
                 "inner dot circle missing (r=3.5); got: {s}");
         assert!(s.contains("fill=\"#3a9d4d\""),
-                "inner dot fill should match ring color; got: {s}");
+                "inner dot fill should match inner color (bucket); got: {s}");
+    }
+
+    #[test]
+    fn svg_inner_and_outer_use_distinct_colors() {
+        // When inner and outer colors differ, both must appear in the
+        // SVG verbatim — the inner dot uses the inner color, the
+        // outer ring strokes use the outer color.
+        let s = svg_for(80, "#ff0000", "#00ff00");
+        assert!(s.contains("stroke=\"#00ff00\""),
+                "outer ring stroke should use outer color #00ff00; got: {s}");
+        assert!(s.contains("fill=\"#ff0000\""),
+                "inner dot fill should use inner color #ff0000; got: {s}");
     }
 
     #[test]
@@ -560,7 +616,7 @@ mod tests {
         // Round caps are what makes the progress terminus look like a
         // rounded dot instead of a flat dasharray cut. The track (full
         // circle) doesn't need them — only the foreground arc.
-        let s = svg_for(80, "#3a9d4d");
+        let s = svg_for(80, "#3a9d4d", "#3584e4");
         assert!(s.contains("stroke-linecap=\"round\""),
                 "progress arc should use stroke-linecap=round; got: {s}");
     }
@@ -572,7 +628,7 @@ mod tests {
         // same color faded into the panel. The earlier Rust version
         // used a separate dark grey (#3a3a3a) which fights the panel
         // theme on light backgrounds.
-        let s = svg_for(80, "#3a9d4d");
+        let s = svg_for(80, "#3a9d4d", "#3584e4");
         assert!(s.contains("stroke-opacity=\"0.25\""),
                 "track should use stroke-opacity=0.25; got: {s}");
         assert!(!s.contains("#3a3a3a"),
@@ -583,36 +639,43 @@ mod tests {
     fn svg_stroke_width_matches_gjs() {
         // gjs uses stroke-width="2.5". The earlier Rust version used 3.0
         // which made the ring look chunkier than the gjs original.
-        let s = svg_for(80, "#3a9d4d");
+        let s = svg_for(80, "#3a9d4d", "#3584e4");
         assert!(s.contains("stroke-width=\"2.5\""),
                 "ring stroke-width should be 2.5 (matches gjs); got: {s}");
     }
 
     #[test]
     fn ring_colors_match_gjs() {
-        // Defaults match the gjs RING_COLOR table (green/yellow/red).
-        // The compile-time defaults in provider::default_ring_colors
-        // are the source of truth; this test guards against
-        // accidental edits.
+        // Defaults match the gjs RING_COLOR table (green/yellow/red) for
+        // the inner bucket colors. The outer ring defaults to a neutral
+        // accent (#3584e4). The compile-time defaults in
+        // provider::default_ring_colors are the source of truth; this
+        // test guards against accidental edits.
         let colors = crate::provider::default_ring_colors();
-        assert_eq!(bucket_hex(Bucket::Normal, &colors), "#3a9d4d");
-        assert_eq!(bucket_hex(Bucket::Warning, &colors), "#f6d32d");
-        assert_eq!(bucket_hex(Bucket::Throttled, &colors), "#e01b24");
+        assert_eq!(inner_color_for(Bucket::Normal,    &colors), "#3a9d4d");
+        assert_eq!(inner_color_for(Bucket::Warning,   &colors), "#f6d32d");
+        assert_eq!(inner_color_for(Bucket::Throttled, &colors), "#e01b24");
+        assert_eq!(outer_color(&colors), "#3584e4");
     }
 
     #[test]
     fn ring_colors_per_instance_override() {
         // A per-instance config can override ring colors (e.g. an
-        // orange scheme for one provider, blue for another). The
-        // bucket_hex lookup honors whatever the instance passes in.
+        // orange scheme for one provider, blue for another). Both the
+        // inner bucket colors and the outer ring color can be set
+        // independently.
         let alt = RingColors {
-            normal:   "#3366ff".to_string(),
-            warning:  "#ff9900".to_string(),
-            throttled: "#9933ff".to_string(),
+            inner: BucketColors {
+                normal:   "#3366ff".to_string(),
+                warning:  "#ff9900".to_string(),
+                throttled: "#9933ff".to_string(),
+            },
+            outer: "#1d8b3a".to_string(),
         };
-        assert_eq!(bucket_hex(Bucket::Normal, &alt), "#3366ff");
-        assert_eq!(bucket_hex(Bucket::Warning, &alt), "#ff9900");
-        assert_eq!(bucket_hex(Bucket::Throttled, &alt), "#9933ff");
+        assert_eq!(inner_color_for(Bucket::Normal,    &alt), "#3366ff");
+        assert_eq!(inner_color_for(Bucket::Warning,   &alt), "#ff9900");
+        assert_eq!(inner_color_for(Bucket::Throttled, &alt), "#9933ff");
+        assert_eq!(outer_color(&alt), "#1d8b3a");
     }
 
     #[test]
@@ -621,7 +684,7 @@ mod tests {
         // dasharray is `0 (circumference - 0) = 0 circ`. The visible
         // result should be just the faded track (no progress arc) plus
         // the center dot.
-        let s = svg_for(0, "#3a9d4d");
+        let s = svg_for(0, "#3a9d4d", "#3584e4");
         // fg_arc = max(0, 0 - 1.25) = 0; fg_rest = circ - 0 = circ.
         // dasharray should contain 0.000 and ~56.5 (the circumference).
         assert!(s.contains("0.000"),
@@ -631,8 +694,8 @@ mod tests {
     #[test]
     fn svg_clamps_pct() {
         // pct > 100 → clamped to 100; pct < 0 → clamped to 0.
-        let s1 = svg_for(150, "#a8d1a3");
-        let s2 = svg_for(-50, "#a8d1a3");
+        let s1 = svg_for(150, "#a8d1a3", "#3584e4");
+        let s2 = svg_for(-50, "#a8d1a3", "#3584e4");
         // Both should produce valid (filled + remaining = circumference).
         assert!(s1.contains("<svg"));
         assert!(s2.contains("<svg"));
@@ -662,23 +725,33 @@ mod tests {
     }
 
     #[test]
-    fn render_pixmap_byte_order_is_host_endian() {
-        // The receiving Cogl pipeline reads the bytes as a host-endian
-        // uint32 in ARGB_8888 format. On x86 (little-endian), the in-memory
-        // byte order is BGRA: [B, G, R, A]. Verify the ring-fill pixels
-        // have the right bytes in that order.
-        //
-        // Ring color is #3a9d4d (RGB = 58, 157, 77) — matches the gjs
-        // RING_COLOR.normal. Expected bytes for an opaque ring pixel:
-        // B=0x4d, G=0x9d, R=0x3a, A=0xff.
-        let (_w, _h, bytes) = render_pixmap(100, Bucket::Normal,
+    fn render_pixmap_uses_outer_color_for_ring() {
+        // Outer ring (track + arc) renders in the outer color, not the
+        // bucket color. With a fully-filled 100% ring, every ring
+        // pixel should be the outer color verbatim in BGRA host-endian
+        // order: #3584e4 = (R=53, G=132, B=228) → B=0xe4, G=0x84,
+        // R=0x35, A=0xff.
+        let (_w, _h, bytes) = render_pixmap(100, Bucket::Warning,
                                             &crate::provider::default_ring_colors()).unwrap();
         let any_ring_pixel = bytes.chunks_exact(4)
-            .any(|px| {
-                px[0] == 0x4d && px[1] == 0x9d && px[2] == 0x3a && px[3] == 0xff
-            });
+            .any(|px| px[0] == 0xe4 && px[1] == 0x84 && px[2] == 0x35 && px[3] == 0xff);
         assert!(any_ring_pixel,
-                "expected at least one BGRA pixel (0x4d, 0x9d, 0x3a, 0xff) in the 100% fill ring");
+                "expected outer-color pixel (0xe4, 0x84, 0x35, 0xff) in the 100% fill ring; \
+                 ring should be drawn in the outer color regardless of bucket");
+    }
+
+    #[test]
+    fn render_pixmap_uses_inner_color_for_dot() {
+        // Inner dot renders in the inner (bucket) color, not the outer
+        // color. With bucket=Warning and the default palette, the dot
+        // is #f6d32d = (R=246, G=211, B=45) → B=0x2d, G=0xd3, R=0xf6,
+        // A=0xff.
+        let (_w, _h, bytes) = render_pixmap(100, Bucket::Warning,
+                                            &crate::provider::default_ring_colors()).unwrap();
+        let any_dot_pixel = bytes.chunks_exact(4)
+            .any(|px| px[0] == 0x2d && px[1] == 0xd3 && px[2] == 0xf6 && px[3] == 0xff);
+        assert!(any_dot_pixel,
+                "expected inner-color pixel (0x2d, 0xd3, 0xf6, 0xff) for the Warning bucket dot");
     }
 
     #[test]

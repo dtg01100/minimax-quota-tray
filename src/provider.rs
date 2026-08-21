@@ -35,7 +35,7 @@
 //! shape — just create a new instance:
 //!
 //! ```bash
-//! minimax-quota-tray --instance=codex
+//! llm-quota-tray --instance=codex
 //! # then write ~/.config/minimax-quota-codex/config.json
 //! ```
 //!
@@ -49,35 +49,123 @@ use serde::{Deserialize, Serialize};
 // Ring colors
 // ============================================================================
 
-/// Per-instance hex colors for the chip's three bucket states. The
-/// center dot uses the same color as the ring — that's what makes
-/// the chip read as "ring with center" instead of an empty arc.
+/// Per-instance hex colors for the chip's two visual channels.
+///
+///   - `inner` colors the center dot (and the solid static-state
+///     icons). Three states: normal / warning / throttled. This is
+///     the **status** channel — what state the tray is in.
+///   - `outer` colors the outer ring (track + progress arc) and
+///     carries the **remaining-quota** signal — the percentage fill
+///     on the arc. A single color; the *length* of the arc encodes
+///     the percentage, the hue just has to stay visually distinct
+///     from the inner dot's hue so the two layers don't smear
+///     together.
+///
+/// Splitting them lets the inner dot flip through the bucket colors
+/// without re-coloring the percentage-fill arc on every state
+/// change. The default outer color is a neutral accent (GNOME blue)
+/// so it reads as a "progress meter" on light and dark panels
+/// regardless of which bucket the inner dot is in.
 ///
 /// Stored as `String` (not `&'static str`) so each instance's
 /// config.json can specify its own palette without recompiling.
-/// Examples: `["#ff9900", "#ff5500", "#ff0000"]` for an orange
-/// scheme, `["#3366ff", "#9933ff", "#cc00ff"]` for a blue/purple
-/// scheme.
+///
+/// Backward-compatible deserialization: legacy configs that used
+/// `{ "normal": ..., "warning": ..., "throttled": ... }` directly at
+/// the `ring_colors` level are still accepted — those fields map to
+/// `inner` and `outer` falls back to the default. See the
+/// `Deserialize` impl below for the exact shapes accepted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "RingColorsRepr")]
 pub struct RingColors {
+    pub inner: BucketColors,
+    pub outer: String,
+}
+
+/// Internal serde shuttle. Holds the wire shape and converts to the
+/// public `RingColors` via `From`. We accept three wire shapes:
+///
+///   1. `{}` — fully defaulted (empty object, common when the
+///      config omits `ring_colors`).
+///   2. `{ "inner": {normal, warning, throttled}, "outer": "..." }`
+///      — the canonical new shape; `inner` and `outer` are both
+///      optional, defaulting to compile-time fallbacks.
+///   3. `{ "normal": "...", "warning": "...", "throttled": "..." }`
+///      — the legacy flat shape (pre inner/outer split). The
+///      top-level bucket colors become `inner` and `outer` defaults
+///      to the neutral accent.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RingColorsRepr {
+    inner: Option<BucketColors>,
+    outer: Option<String>,
+    // Legacy flat fields. When `inner` is None and any of these is
+    // present, the conversion in `From` treats the payload as legacy.
+    normal: Option<String>,
+    warning: Option<String>,
+    throttled: Option<String>,
+}
+
+impl From<RingColorsRepr> for RingColors {
+    fn from(r: RingColorsRepr) -> Self {
+        let inner = if let Some(b) = r.inner {
+            // New shape wins outright.
+            b
+        } else if r.normal.is_some() || r.warning.is_some() || r.throttled.is_some() {
+            // Legacy shape — pull bucket colors off the top level.
+            BucketColors {
+                normal:   r.normal.unwrap_or_default(),
+                warning:  r.warning.unwrap_or_default(),
+                throttled: r.throttled.unwrap_or_default(),
+            }
+        } else {
+            // Empty payload — defaults.
+            default_inner_colors()
+        };
+        RingColors {
+            outer: r.outer.unwrap_or_else(|| DEFAULT_OUTER_COLOR.to_string()),
+            inner,
+        }
+    }
+}
+
+/// The three bucket-state colors for the inner dot. Same names and
+/// meaning as the legacy flat fields: `normal` for the healthy
+/// green/yellow/red state, `warning` for the burn-flip / yellow
+/// threshold state, `throttled` for the exhausted / red state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketColors {
     pub normal: String,
     pub warning: String,
     pub throttled: String,
 }
+
+/// Default inner-dot bucket colors. Classic gjs colors
+/// (green / yellow / red) — widely distinguishable on light and
+/// dark panel themes.
+pub fn default_inner_colors() -> BucketColors {
+    BucketColors {
+        normal:   "#3a9d4d".to_string(),
+        warning:  "#f6d32d".to_string(),
+        throttled: "#e01b24".to_string(),
+    }
+}
+
+/// Default outer-ring color. Neutral GNOME-blue accent (#3584e4) —
+/// visible on light and dark panels, doesn't compete with the
+/// inner dot's bucket colors when they're red/yellow/green.
+pub const DEFAULT_OUTER_COLOR: &str = "#3584e4";
 
 impl Default for RingColors {
     fn default() -> Self { default_ring_colors() }
 }
 
 /// Compile-time default ring colors. Used when config.json omits
-/// `ring_colors`. These are the classic gjs colors (green / yellow
-/// / red) — chosen because they're widely distinguishable on light
-/// and dark panel themes, not because of any provider branding.
+/// `ring_colors`. See `RingColors` for the inner/outer rationale.
 pub fn default_ring_colors() -> RingColors {
     RingColors {
-        normal:   "#3a9d4d".to_string(),
-        warning:  "#f6d32d".to_string(),
-        throttled: "#e01b24".to_string(),
+        inner: default_inner_colors(),
+        outer: DEFAULT_OUTER_COLOR.to_string(),
     }
 }
 
@@ -245,4 +333,4 @@ impl Default for PlanShape {
 /// Default User-Agent prefix. Used when config.json omits
 /// `user_agent`. The binary appends the crate version at build
 /// client time to produce `"<prefix>/<version>"`.
-pub const DEFAULT_USER_AGENT: &str = "minimax-quota-tray";
+pub const DEFAULT_USER_AGENT: &str = "llm-quota-tray";

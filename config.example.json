@@ -37,14 +37,17 @@
   },
 
   "ring_colors": {
-    "normal":   "#3a9d4d",
-    "warning":  "#f6d32d",
-    "throttled": "#e01b24"
+    "inner": {
+      "normal":   "#3a9d4d",
+      "warning":  "#f6d32d",
+      "throttled": "#e01b24"
+    },
+    "outer": "#3584e4"
   },
 
   "auth": {"type": "bearer"},
 
-  "user_agent": "minimax-quota-tray",
+  "user_agent": "llm-quota-tray",
 
   "refresh_seconds": 120,
   "refresh_min_seconds": 15,

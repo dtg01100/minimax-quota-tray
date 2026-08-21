@@ -1,5 +1,5 @@
 //! Config loading: each instance's `config.json` (path derived from
-//! `--instance=<name>`, defaulting to `~/.config/quota-tray/`).
+//! `--instance=<name>`, defaulting to `~/.config/llm-quota-tray/`).
 //!
 //! The config is the source of truth for everything per-instance:
 //! endpoint, label, dashboard URL, JSON shape, ring colors, auth
@@ -18,8 +18,8 @@ use crate::provider::{
 
 /// Default config dir basename (no instance suffix). Neutral — no
 /// provider name baked in. Per-instance names append `-<name>`:
-/// `quota-tray-coding`, `quota-tray-openai`, etc.
-pub const CONFIG_DIR_BASE: &str = "quota-tray";
+/// `llm-quota-tray-coding`, `llm-quota-tray-openai`, etc.
+pub const CONFIG_DIR_BASE: &str = "llm-quota-tray";
 pub const CONFIG_FILENAME: &str = "config.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,7 +46,7 @@ pub struct Config {
     pub auth: AuthConfig,
 
     /// User-Agent prefix (version auto-appended). Defaults to
-    /// `minimax-quota-tray`.
+    /// `llm-quota-tray`.
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
 
@@ -109,7 +109,7 @@ fn default_refresh_min_seconds() -> u64 { 15 }
 
 /// Per-instance config path: `<config_dir>/<instance>/config.json`.
 /// If `instance` is empty, returns the original single-instance
-/// path (`~/.config/quota-tray/config.json`).
+/// path (`~/.config/llm-quota-tray/config.json`).
 pub fn config_path_for(instance: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = if instance.is_empty() {
@@ -228,36 +228,111 @@ mod tests {
     #[test]
     fn per_instance_config_path() {
         assert!(config_path_for("").to_string_lossy()
-                .contains(".config/quota-tray/config.json"));
+                .contains(".config/llm-quota-tray/config.json"));
         assert!(config_path_for("codex").to_string_lossy()
-                .contains(".config/quota-tray-codex/config.json"));
+                .contains(".config/llm-quota-tray-codex/config.json"));
         assert!(config_path_for("openai").to_string_lossy()
-                .contains(".config/quota-tray-openai/config.json"));
+                .contains(".config/llm-quota-tray-openai/config.json"));
     }
 
     #[test]
     fn ring_colors_override_in_config() {
-        // A per-instance config can override ring colors (e.g.
-        // an orange scheme for one tray, blue for another).
-        // Note: `r##"..."##` (not `r#"..."#`) because the JSON
-        // contains `"#xxxxxx` hex-color literals — `r#` would
-        // close prematurely at the first `"#`.
+        // A per-instance config can override ring colors (e.g. an
+        // orange scheme for one tray, blue for another). The
+        // canonical new shape splits them into `inner` (status
+        // bucket colors) + `outer` (percentage-fill channel).
         let json = r##"{
             "endpoint": "https://example.invalid",
             "dashboard_url": "https://example.invalid/dash",
             "label": "Orange Tray",
             "ring_colors": {
-                "normal":   "#ff9900",
-                "warning":  "#ff5500",
-                "throttled": "#ff0000"
+                "inner": {
+                    "normal":   "#ff9900",
+                    "warning":  "#ff5500",
+                    "throttled": "#ff0000"
+                },
+                "outer": "#1d8b3a"
             },
             "refresh_seconds": 60,
             "refresh_max_backoff_seconds": 600
         }"##;
         let cfg: Config = serde_json::from_slice(json.as_bytes()).unwrap();
-        assert_eq!(cfg.ring_colors.normal,   "#ff9900");
-        assert_eq!(cfg.ring_colors.warning,  "#ff5500");
-        assert_eq!(cfg.ring_colors.throttled, "#ff0000");
+        assert_eq!(cfg.ring_colors.inner.normal,   "#ff9900");
+        assert_eq!(cfg.ring_colors.inner.warning,  "#ff5500");
+        assert_eq!(cfg.ring_colors.inner.throttled, "#ff0000");
+        assert_eq!(cfg.ring_colors.outer, "#1d8b3a");
+    }
+
+    #[test]
+    fn ring_colors_partial_override_inner_only() {
+        // Just the inner block, no outer → outer defaults to the
+        // neutral accent (see `provider::DEFAULT_OUTER_COLOR`).
+        let json = r##"{
+            "endpoint": "https://example.invalid",
+            "dashboard_url": "https://example.invalid/dash",
+            "label": "x",
+            "ring_colors": {
+                "inner": {
+                    "normal": "#00ff00",
+                    "warning": "#ffff00",
+                    "throttled": "#ff00ff"
+                }
+            },
+            "refresh_seconds": 60,
+            "refresh_max_backoff_seconds": 600
+        }"##;
+        let cfg: Config = serde_json::from_slice(json.as_bytes()).unwrap();
+        assert_eq!(cfg.ring_colors.inner.normal, "#00ff00");
+        assert_eq!(cfg.ring_colors.outer, crate::provider::DEFAULT_OUTER_COLOR);
+    }
+
+    #[test]
+    fn ring_colors_legacy_flat_shape_still_loads() {
+        // Backward-compat: configs from before the inner/outer split
+        // used `{normal, warning, throttled}` directly at the
+        // `ring_colors` level. Those must still parse — the legacy
+        // bucket colors become `inner`, and `outer` falls back to
+        // the neutral accent default.
+        let json = r##"{
+            "endpoint": "https://example.invalid",
+            "dashboard_url": "https://example.invalid/dash",
+            "label": "Legacy Tray",
+            "ring_colors": {
+                "normal":   "#3a9d4d",
+                "warning":  "#f6d32d",
+                "throttled": "#e01b24"
+            },
+            "refresh_seconds": 60,
+            "refresh_max_backoff_seconds": 600
+        }"##;
+        let cfg: Config = serde_json::from_slice(json.as_bytes()).unwrap();
+        assert_eq!(cfg.ring_colors.inner.normal,   "#3a9d4d");
+        assert_eq!(cfg.ring_colors.inner.warning,  "#f6d32d");
+        assert_eq!(cfg.ring_colors.inner.throttled, "#e01b24");
+        assert_eq!(cfg.ring_colors.outer, crate::provider::DEFAULT_OUTER_COLOR,
+                   "legacy config with no outer field should fall back to the neutral accent");
+    }
+
+    #[test]
+    fn ring_colors_empty_object_uses_defaults() {
+        // An empty `ring_colors: {}` should yield the compile-time
+        // defaults (inner = gjs green/yellow/red, outer = neutral
+        // accent) so an instance that wants all defaults can omit
+        // every inner/outer field explicitly.
+        let json = r##"{
+            "endpoint": "https://example.invalid",
+            "dashboard_url": "https://example.invalid/dash",
+            "label": "Default Tray",
+            "ring_colors": {},
+            "refresh_seconds": 60,
+            "refresh_max_backoff_seconds": 600
+        }"##;
+        let cfg: Config = serde_json::from_slice(json.as_bytes()).unwrap();
+        let defaults = crate::provider::default_ring_colors();
+        assert_eq!(cfg.ring_colors.inner.normal,    defaults.inner.normal);
+        assert_eq!(cfg.ring_colors.inner.warning,   defaults.inner.warning);
+        assert_eq!(cfg.ring_colors.inner.throttled, defaults.inner.throttled);
+        assert_eq!(cfg.ring_colors.outer,           defaults.outer);
     }
 
     #[test]

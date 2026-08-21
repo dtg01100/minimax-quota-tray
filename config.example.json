@@ -1,30 +1,60 @@
 {
-  "_comment": "minimax-quota-tray config. To port to a different provider, see src/provider.rs and the README 'Porting to another provider' section. Top-level fields:",
-  "_comment2": "  provider: optional — selects which Provider from src/provider.rs::PROVIDERS is active. Defaults to 'minimax' when absent.",
-  "_comment3": "  plan: which plan under the active provider is the default. The 'plans' map below can ADD plans without code changes as long as their endpoint returns JSON matching an existing PlanShape (referenced by 'shape').",
-  "provider": "minimax",
-  "plan": "coding_plan",
+  "_comment1": "Per-instance config. One instance = one tray icon. Run multiple",
+  "_comment2": "instances concurrently with --instance=<name> (different config dirs,",
+  "_comment3": "lock files, and keyring entries — see README multi-instance section).",
+  "_comment4": "All fields here are config-driven; no provider constants in source.",
+  "_comment5": "To rebrand for a different API: edit endpoint, shape, auth, ring_colors.",
+
+  "endpoint": "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
+  "dashboard_url": "https://platform.minimax.io/console/plan",
+  "label": "Coding Plan",
+
+  "shape": {
+    "entries_path": "/model_remains",
+    "windows": [
+      {
+        "id": "5h",
+        "field_prefix": "current_interval",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": false
+      },
+      {
+        "id": "weekly",
+        "field_prefix": "current_weekly",
+        "start_field": "weekly_start_time",
+        "reset_field": "weekly_remains_time",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": false
+      }
+    ],
+    "error_envelope": {
+      "code_path": "/base_resp/status_code",
+      "message_path": "/base_resp/status_msg",
+      "success_codes": [0]
+    }
+  },
+
+  "ring_colors": {
+    "normal":   "#3a9d4d",
+    "warning":  "#f6d32d",
+    "throttled": "#e01b24"
+  },
+
+  "auth": {"type": "bearer"},
+
+  "user_agent": "minimax-quota-tray",
+
   "refresh_seconds": 120,
   "refresh_min_seconds": 15,
   "refresh_max_backoff_seconds": 600,
-  "plans": {
-    "coding_plan": {
-      "endpoint": "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
-      "dashboard_url": "https://platform.minimax.io/console/plan",
-      "label": "Coding Plan",
-      "shape": "remains"
-    },
-    "token_plan": {
-      "endpoint": "https://api.minimax.io/v1/token_plan/remains",
-      "dashboard_url": "https://platform.minimax.io/console/plan",
-      "label": "Token Plan",
-      "shape": "remains"
-    }
-  },
+
   "thresholds": {
     "yellow": 60,
     "red": 85
   },
+
   "burn_warning": {
     "enabled": true,
     "min_history_ms": 600000,

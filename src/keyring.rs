@@ -1,7 +1,11 @@
 //! GNOME Keyring wrapper. Stores the API key as a Secret Service item,
-//! schema `{ application: "minimax-quota" }`. Falls back to a per-machine
-//! file at ~/.config/minimax-quota/key (mode 0600) when the keyring
-//! daemon isn't running — the gjs code used the same fallback.
+//! schema `{ application: <instance> }`. The `application` attribute
+//! is per-instance (see `crate::instance::keyring_application`) so
+//! two concurrent instances don't clobber each other's API key.
+//!
+//! Falls back to a per-machine file at
+//! `~/.config/<instance>/key` (mode 0600) when the keyring daemon
+//! isn't running — the gjs code used the same fallback.
 
 use anyhow::{Context, Result};
 use secret_service::blocking::SecretService;
@@ -9,9 +13,6 @@ use secret_service::EncryptionType;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-
-const ATTRS: &[(&str, &str)] = &[("application", "minimax-quota")];
-const LABEL: &str = "MiniMax API Key";
 
 /// One SecretService handle per process — opening the daemon connection
 /// is slow (~50ms), so we cache it.
@@ -24,8 +25,24 @@ fn service() -> Option<&'static SecretService<'static>> {
     r.as_ref().ok()
 }
 
+/// Build the search attributes for the active instance. The Secret
+/// Service `search_items` API takes `HashMap<&str, &str>`, so we
+/// leak the application attribute to `&'static` — this is one
+/// Box::leak per process and the string lives for the binary's
+/// entire lifetime, which is fine for an instance-name-derived
+/// value.
 fn attrs() -> HashMap<&'static str, &'static str> {
-    ATTRS.iter().copied().collect()
+    let app: &'static str = Box::leak(crate::instance::keyring_application().into_boxed_str());
+    let mut m: HashMap<&'static str, &'static str> = HashMap::new();
+    m.insert("application", app);
+    m
+}
+
+/// Label shown in the keyring GUI. Namespaced by instance so two
+/// instances' entries are distinguishable when the user opens
+/// Seahorse / KeePassXC / etc.
+fn label() -> String {
+    format!("{} API Key", crate::instance::config_dir_basename())
 }
 
 /// Look up the API key. Priority order matches the gjs `loadApiKey()`:
@@ -44,8 +61,9 @@ fn attrs() -> HashMap<&'static str, &'static str> {
 pub fn get() -> Option<String> {
     // 1. Secret Service
     if let Some(svc) = service() {
+        let attrs = attrs();
         if let Ok(collection) = svc.get_default_collection() {
-            if let Ok(items) = collection.search_items(attrs()) {
+            if let Ok(items) = collection.search_items(attrs.clone()) {
                 if let Some(item) = items.into_iter().next() {
                     if let Ok(bytes) = item.get_secret() {
                         if let Some(k) = secret_to_key(&bytes) {
@@ -91,8 +109,9 @@ pub fn set(value: &str) -> Result<()> {
         let collection = svc
             .get_default_collection()
             .context("opening default keyring collection")?;
+        let attrs = attrs();
         // Replace any existing item first so we don't accumulate duplicates.
-        if let Ok(items) = collection.search_items(attrs()) {
+        if let Ok(items) = collection.search_items(attrs.clone()) {
             for item in items {
                 let _ = item.delete();
             }
@@ -102,8 +121,8 @@ pub fn set(value: &str) -> Result<()> {
             .context("unlocking keyring for write")?;
         collection
             .create_item(
-                LABEL,
-                attrs(),
+                &label(),
+                attrs,
                 value.as_bytes(),
                 true, // replace_existing
                 "text/plain",
@@ -128,8 +147,9 @@ pub fn set(value: &str) -> Result<()> {
 #[allow(dead_code)]
 pub fn clear() -> Result<()> {
     if let Some(svc) = service() {
+        let attrs = attrs();
         if let Ok(collection) = svc.get_default_collection() {
-            if let Ok(items) = collection.search_items(attrs()) {
+            if let Ok(items) = collection.search_items(attrs) {
                 for item in items {
                     let _ = item.delete();
                 }
@@ -150,7 +170,14 @@ pub fn clear() -> Result<()> {
 
 fn legacy_key_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".config/.config/minimax-quota/key")
+    // Per-instance: matches the config dir naming (`<base>` or
+    // `<base>-<instance>`). The legacy `.config/.config/` doubled
+    // prefix is preserved for compatibility with old installs.
+    PathBuf::from(home)
+        .join(".config")
+        .join(".config")
+        .join(crate::instance::config_dir_basename())
+        .join("key")
 }
 
 #[cfg(test)]

@@ -30,6 +30,7 @@ mod burn;
 mod config;
 mod fetch;
 mod icon;
+mod instance;
 mod keyring;
 mod lock;
 mod menu;
@@ -52,6 +53,7 @@ use crate::config::Config;
 use crate::lock::Lock;
 use crate::menu::{MenuCommand, MenuInner};
 use crate::network::NetEvent;
+use crate::provider::RingColors;
 use crate::sni::Tray;
 
 /// Per-window burn sample history. ~16h at 120s baseline.
@@ -76,16 +78,16 @@ impl BucketRank {
     }
 }
 
-/// Per-window burn-rate sample history, keyed by `Window.id`. One
-/// `Vec<Sample>` per window — the burn-rate projection in
-/// `burn::compute_burn` reads its window's slice by id. We key on id
-/// (a `&'static str`) rather than position so adding or removing
-/// windows from the `PlanShape` doesn't reshuffle which history
-/// belongs to which window across restarts.
+/// Per-window burn-rate sample history, keyed by `Window.id` (a
+/// `String` now that window ids come from config). One `Vec<Sample>`
+/// per window — the burn-rate projection in `burn::compute_burn`
+/// reads its window's slice by id. We key on id rather than position
+/// so adding or removing windows from the `PlanShape` doesn't
+/// reshuffle which history belongs to which window across restarts.
 ///
 /// The map is unbounded in principle but each entry is capped to
 /// `BURN_MAX_SAMPLES` by `record_sample` (oldest-first eviction).
-type Histories = std::collections::HashMap<&'static str, Vec<Sample>>;
+type Histories = std::collections::HashMap<String, Vec<Sample>>;
 
 #[derive(Default)]
 struct AppState {
@@ -112,6 +114,12 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .init();
 
+    // Resolve the instance name from CLI/env first, so all the
+    // path-sensitive subsystems (lock, config, keyring) namespace
+    // themselves correctly.
+    let instance_name = instance::init();
+    log::info!("instance: {instance_name:?} (empty = default)");
+
     if let Err(e) = run().await {
         eprintln!("fatal: {e:#}");
         std::process::exit(1);
@@ -120,13 +128,18 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> Result<()> {
-    // Single-instance lock — refuses to start if another live instance
-    // already holds it. Best-effort: a lock error prints a warning
-    // and lets us proceed (we'd rather run than refuse to start).
+    // Per-instance single-instance lock — refuses to start if another
+    // live instance with the same name already holds it. Different
+    // instances (different `--instance=` flags) have different lock
+    // paths and can run concurrently. Best-effort: a lock error
+    // prints a warning and lets us proceed (we'd rather run than
+    // refuse to start).
     let _lock = match Lock::acquire() {
         Ok(Some(l)) => Some(l),
         Ok(None) => {
-            eprintln!("minimax-quota: another instance is already running; exiting.");
+            eprintln!(
+                "minimax-quota: another instance is already running; exiting. \
+                 (set --instance=<name> for an additional instance.)");
             return Ok(());
         }
         Err(e) => {
@@ -136,24 +149,21 @@ async fn run() -> Result<()> {
     };
 
     let cfg = Arc::new(config::load_or_init()?);
-    // Resolve the active provider from config. Unknown IDs fall back
-    // to DEFAULT_PROVIDER (with a warning logged) so a typo in
-    // config.json doesn't crash the tray.
-    let provider: &'static provider::Provider = config::resolve_provider(&cfg.provider);
-    if provider.id != cfg.provider {
-        // `resolve_provider` already logged a warning; we just need
-        // to know whether to keep going. Falling back is fine.
-    }
-    let http_client = fetch::build_client(provider).context("build HTTP client")?;
-    let dashboard_url = cfg.plans.get(&cfg.plan)
-        .map(|p| p.dashboard_url.clone())
-        .unwrap_or_default();
+    log::info!(
+        "started: endpoint={} label={:?} shape_windows={} auth={:?} rings={:?}/{:?}/{:?}",
+        cfg.endpoint, cfg.label, cfg.shape.windows.len(),
+        std::mem::discriminant(&cfg.auth),
+        cfg.ring_colors.normal, cfg.ring_colors.warning, cfg.ring_colors.throttled,
+    );
+
+    let http_client = fetch::build_client(&cfg.user_agent)
+        .context("build HTTP client")?;
     let state = Arc::new(Mutex::new(AppState {
         http_client: Some(http_client),
         ..Default::default()
     }));
     let tray = Arc::new(
-        Tray::new(dashboard_url).await.context("create SNI tray")?);
+        Tray::new(cfg.dashboard_url.clone()).await.context("create SNI tray")?);
 
     // Write the static SVG icons into ${TMPDIR} once at startup so the
     // SNI host can load them as `IconName` file paths. Hosts with
@@ -161,10 +171,10 @@ async fn run() -> Result<()> {
     // registered) render the SVG natively at the panel's target size;
     // hosts without SVG support fall through to the ARGB bytes in
     // `IconPixmap` (rendered via Cogl), which works everywhere.
-    icon::write_static_svgs(&provider.ring_colors);
+    icon::write_static_svgs(&cfg.ring_colors);
 
     // Run an initial render so the icon appears immediately.
-    render_initial(&tray, &cfg, provider).await;
+    render_initial(&tray, &cfg).await;
 
     // Channel for menu commands (Refresh, OpenDashboard, SetApiKey, Quit).
     let cmd_rx = tray.cmd_rx.clone();
@@ -178,7 +188,7 @@ async fn run() -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
     // Spawn the orchestrator: refresh loop + menu commands + network.
-    tokio::spawn(orchestrator(provider, cfg, state, tray.clone(), cmd_rx, net_rx, shutdown_tx));
+    tokio::spawn(orchestrator(cfg, state, tray.clone(), cmd_rx, net_rx, shutdown_tx));
 
     // Wait for SIGINT/SIGTERM or a menu Quit.
     let mut sigterm = tokio::signal::unix::signal(
@@ -200,7 +210,6 @@ async fn run() -> Result<()> {
 /// All three feed into the same refresh task. Menu Refresh and Net
 /// ForceRefresh collapse to the same operation (immediate refresh).
 async fn orchestrator(
-    provider: &'static provider::Provider,
     cfg: Arc<Config>,
     state: Arc<Mutex<AppState>>,
     tray: Arc<Tray>,
@@ -233,7 +242,7 @@ async fn orchestrator(
             _ = tokio::time::sleep(sleep_dur) => {
                 // Run the scheduled refresh (whether due now or after
                 // the wait elapsed).
-                let returned_ms = do_refresh(provider, &cfg, &state, &tray).await;
+                let returned_ms = do_refresh(&cfg, &state, &tray).await;
                 last_refresh_at = Some(now_ms());
                 next_interval_ms = compute_next_interval(
                     returned_ms, cfg.refresh_max_backoff_seconds);
@@ -258,7 +267,7 @@ async fn orchestrator(
                             let mut s = state.lock().await;
                             s.fail_streak = 0;
                         }
-                        let returned_ms = do_refresh(provider, &cfg, &state, &tray).await;
+                        let returned_ms = do_refresh(&cfg, &state, &tray).await;
                         last_refresh_at = Some(now_ms());
                         next_interval_ms = compute_next_interval(
                             returned_ms, cfg.refresh_max_backoff_seconds);
@@ -275,7 +284,7 @@ async fn orchestrator(
                                     let mut s = state.lock().await;
                                     s.fail_streak = 0;
                                 }
-                                let returned_ms = do_refresh(provider, &cfg, &state, &tray).await;
+                                let returned_ms = do_refresh(&cfg, &state, &tray).await;
                                 last_refresh_at = Some(now_ms());
                                 next_interval_ms = compute_next_interval(
                                     returned_ms, cfg.refresh_max_backoff_seconds);
@@ -322,7 +331,7 @@ async fn orchestrator(
                             let mut s = state.lock().await;
                             s.fail_streak = 0;
                         }
-                        let returned_ms = do_refresh(provider, &cfg, &state, &tray).await;
+                        let returned_ms = do_refresh(&cfg, &state, &tray).await;
                         last_refresh_at = Some(now_ms());
                         next_interval_ms = compute_next_interval(
                             returned_ms, cfg.refresh_max_backoff_seconds);
@@ -338,7 +347,6 @@ async fn orchestrator(
 /// Returns the next interval in ms (including backoff). Caller uses
 /// it to re-arm the timer.
 async fn do_refresh(
-    provider: &'static provider::Provider,
     cfg: &Config,
     state: &Arc<Mutex<AppState>>,
     tray: &Arc<Tray>,
@@ -364,31 +372,9 @@ async fn do_refresh(
             return cfg.refresh_seconds * 1000;
         }
     };
-    // gjs parity: an unknown `plan` value falls back to
-    // `coding_plan` rather than erroring. The user's config typo
-    // ("coding_pan") would otherwise silently leave the tray
-    // empty — gjs's `config.plans[config.plan] || config.plans.coding_plan`
-    // is a footgun but it IS the reference behavior we must match.
-    let plan_cfg = match cfg.plans.get(&cfg.plan).cloned()
-        .or_else(|| cfg.plans.get("coding_plan").cloned())
-    {
-        Some(p) => p,
-        None => {
-            // No plans at all (impossible with defaults but possible
-            // with a stripped-down config). Show error + bail.
-            render_error(tray, cfg, "No plan configured").await;
-            return cfg.refresh_seconds * 1000;
-        }
-    };
-    // Resolve the PlanShape for this plan from the active provider.
-    // Unknown shape IDs (typo in config.json) fall back to the
-    // provider's first registered shape — same fallback semantics
-    // as unknown plan IDs.
-    let shape = provider.shape(&plan_cfg.shape)
-        .or_else(|| provider.plan_shapes.first().map(|(_, s)| s))
-        .unwrap_or(&provider::MINIMAX_REMAINS);
-    // Refresh dashboard URL if the active plan changed.
-    tray.set_dashboard_url(plan_cfg.dashboard_url.clone()).await;
+
+    // Refresh dashboard URL if it changed.
+    tray.set_dashboard_url(cfg.dashboard_url.clone()).await;
 
     let client = {
         let s = state.lock().await;
@@ -402,9 +388,11 @@ async fn do_refresh(
         }
     };
 
-    let endpoint = plan_cfg.endpoint.clone();
+    let endpoint = cfg.endpoint.clone();
+    let auth = cfg.auth.clone();
+    let shape = cfg.shape.clone();
     let result = tokio::task::spawn_blocking(move || {
-        fetch::fetch_windows_blocking(&client, &endpoint, &api_key, provider, shape)
+        fetch::fetch_windows_blocking(&client, &endpoint, &api_key, &auth, &shape)
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("fetch task panicked: {e}")));
@@ -417,7 +405,7 @@ async fn do_refresh(
             // what "primary" means by listing it first (typically the
             // rolling short-interval window, the one most likely to
             // need urgent attention).
-            let primary = windows[0];
+            let primary = windows[0].clone();
             let prev_rank = s.last_good.as_ref()
                 .and_then(|w| w.first())
                 .map(|w| BucketRank::from_remaining(w.remaining_pct))
@@ -431,7 +419,7 @@ async fn do_refresh(
             // the burn-rate projection looks up the right slice.
             for w in &windows {
                 let hist = s.histories
-                    .entry(w.id)
+                    .entry(w.id.clone())
                     .or_insert_with(Vec::new);
                 record_sample(hist, w);
             }
@@ -447,15 +435,15 @@ async fn do_refresh(
             let mut pairs: Vec<(Window, Option<burn::BurnResult>)> =
                 Vec::with_capacity(windows.len());
             for w in &windows {
-                let history = s.histories.get(w.id).map(Vec::as_slice).unwrap_or(&[]);
+                let history = s.histories.get(&w.id).map(Vec::as_slice).unwrap_or(&[]);
                 let b = burn::decide_burn_row(
                     Some(w), history, now_ms(), &cfg.burn_warning);
-                pairs.push((*w, b));
+                pairs.push((w.clone(), b));
             }
             // Compute the primary's burn separately for icon bucket
             // selection (same data; doing it twice avoids borrow
             // gymnastics on the pairs vec).
-            let primary_burn = s.histories.get(primary.id)
+            let primary_burn = s.histories.get(&primary.id)
                 .and_then(|h| burn::decide_burn_row(
                     Some(&primary), h, now_ms(), &cfg.burn_warning))
                 .or_else(|| pairs.first().and_then(|(_, b)| b.clone()));
@@ -464,10 +452,10 @@ async fn do_refresh(
             // Borrow the pairs as (Window, Option<&BurnResult>) for
             // the menu builder.
             let pair_refs: Vec<(Window, Option<&burn::BurnResult>)> =
-                pairs.iter().map(|(w, b)| (*w, b.as_ref())).collect();
+                pairs.iter().map(|(w, b)| (w.clone(), b.as_ref())).collect();
 
             let menu_state = build_menu_state(
-                &plan_cfg.label,
+                &cfg.label,
                 &pair_refs,
                 None, false, now_ms() - s.last_good_at,
                 pct <= 0,
@@ -479,7 +467,7 @@ async fn do_refresh(
 
             let icon_name: String = match bucket {
                 icon::Bucket::Normal | icon::Bucket::Warning => {
-                    icon::write_ring_svg(pct, bucket, &provider.ring_colors)
+                    icon::write_ring_svg(pct, bucket, &cfg.ring_colors)
                         .to_string_lossy().into_owned()
                 }
                 icon::Bucket::Throttled => {
@@ -492,7 +480,7 @@ async fn do_refresh(
             // rows + burn rate row.
             let pixmap = match bucket {
                 icon::Bucket::Throttled => None,
-                _ => icon::render_pixmap(pct, bucket, &provider.ring_colors),
+                _ => icon::render_pixmap(pct, bucket, &cfg.ring_colors),
             };
 
             let interval = scheduler::next_interval(
@@ -513,7 +501,7 @@ async fn do_refresh(
             // tooltips and screen readers that announce the icon.
             let tip = format!(
                 "{} — {}% remaining",
-                plan_cfg.label, pct,
+                cfg.label, pct,
             );
             let _ = tray.update("", &icon_name, "Active", pixmap, &tip).await;
             let _ = tray.apply_menu(|m| install_menu_into(m, menu_state)).await;
@@ -523,14 +511,14 @@ async fn do_refresh(
                 if new_rank == BucketRank::Throttled {
                     notify::send(
                         "throttled",
-                        &format!("{plan_label} — throttled", plan_label = plan_cfg.label),
+                        &format!("{plan_label} — throttled", plan_label = cfg.label),
                         "Quota exhausted. The menu shows when it resets.",
                         notify::Urgency::Critical,
                     );
                 } else if new_rank == BucketRank::Warning {
                     notify::send(
                         "warning",
-                        &format!("{plan_label} — running low", plan_label = plan_cfg.label),
+                        &format!("{plan_label} — running low", plan_label = cfg.label),
                         &format!("Remaining dropped below {}%.", 100 - cfg.thresholds.yellow),
                         notify::Urgency::Normal,
                     );
@@ -557,7 +545,7 @@ async fn do_refresh(
                 tray, cfg, &err_str,
                 last_good.unwrap_or_default(),
                 age_ms,
-                &provider.ring_colors,
+                &cfg.ring_colors,
             ).await;
 
             scheduler::next_interval(
@@ -589,7 +577,7 @@ async fn do_refresh(
                 tray, cfg, &err_str,
                 last_good,
                 age_ms,
-                &provider.ring_colors,
+                &cfg.ring_colors,
             ).await;
 
             // On error: gjs calls `scheduleNext(null)`, which skips the
@@ -614,7 +602,7 @@ async fn do_refresh(
     }
 }
 
-async fn render_initial(tray: &Arc<Tray>, cfg: &Config, provider: &'static provider::Provider) {
+async fn render_initial(tray: &Arc<Tray>, cfg: &Config) {
     // Probe the keyring once so the absence of an API key shows up
     // in the log (and the menu's error row carries it). The chip
     // itself is just the icon — empty title (gjs parity).
@@ -626,10 +614,7 @@ async fn render_initial(tray: &Arc<Tray>, cfg: &Config, provider: &'static provi
     // No data yet — empty tooltip (gjs's "no data" case uses just the
     // plan label, not a detailed percentage; with empty data we
     // don't have a percentage to put in the desc).
-    let cfg_label = cfg.plans.get(&cfg.plan)
-        .map(|p| p.label.clone())
-        .unwrap_or_else(|| provider.id.to_string());
-    let tip = format!("{cfg_label}");
+    let tip = cfg.label.clone();
     let _ = tray.update(
         "",
         &icon::static_svg_path("normal").to_string_lossy(),
@@ -637,7 +622,7 @@ async fn render_initial(tray: &Arc<Tray>, cfg: &Config, provider: &'static provi
         None,
         &tip,
     ).await;
-    log::info!("started; plan={} (refresh every {}s)", cfg.plan, cfg.refresh_seconds);
+    log::info!("started; refresh every {}s", cfg.refresh_seconds);
 }
 
 async fn render_error(tray: &Arc<Tray>, cfg: &Config, msg: &str) {
@@ -645,13 +630,10 @@ async fn render_error(tray: &Arc<Tray>, cfg: &Config, msg: &str) {
     // The error message lives in the menu's error row + journald.
     // ToolTip desc: "${planLabel} — stale data" (matches gjs's
     // accessible string in the `set_label('', guide)` call).
-    let cfg_label = cfg.plans.get(&cfg.plan)
-        .map(|p| p.label.clone())
-        .unwrap_or_else(|| "MiniMax".to_string());
-    // Note: this function doesn't need provider/rings because it
+    // Note: this function doesn't need ring colors because it
     // uses the static "error" SVG (color is fixed at write_static_svgs
-    // time, shared across providers).
-    let tip = format!("{cfg_label} — stale data");
+    // time, shared across instances).
+    let tip = format!("{} — stale data", cfg.label);
     let _ = tray.update(
         "",
         &icon::static_svg_path("error").to_string_lossy(),
@@ -663,9 +645,7 @@ async fn render_error(tray: &Arc<Tray>, cfg: &Config, msg: &str) {
     // (no window data to show). Matches gjs updateMenu({error: ...}):
     // the header is still rendered, the window-row section is empty,
     // and the error row shows the message.
-    let plan_cfg_label = cfg.plans.get(&cfg.plan)
-        .map(|p| p.label.as_str())
-        .unwrap_or("MiniMax");
+    let plan_cfg_label = cfg.label.as_str();
     let menu_state = build_error_menu_state(plan_cfg_label, msg);
     let _ = tray.apply_menu(|m| install_menu_into(m, menu_state)).await;
     log::warn!("{msg}");
@@ -696,13 +676,8 @@ async fn render_error_with_stale(
     err: &str,
     stale_windows: Vec<Window>,
     age_ms: i64,
-    rings: &provider::RingColors,
+    rings: &RingColors,
 ) {
-    let plan_cfg = match cfg.plans.get(&cfg.plan) {
-        Some(p) => p.clone(),
-        None => return,
-    };
-
     // Icon selection: mirror gjs bucket-for-chip priority order.
     // The primary window is stale_windows[0] when available.
     let (icon_name, pixmap) = match stale_windows.first() {
@@ -730,19 +705,19 @@ async fn render_error_with_stale(
     // path. For ring rendering, use the last-good pct as the
     // description so hover-preview matches the visible ring.
     let stale_pct = stale_windows.first().map(|w| w.remaining_pct).unwrap_or(0);
-    let tip = format!("{} — stale data ({stale_pct}%)", plan_cfg.label);
+    let tip = format!("{} — stale data ({stale_pct}%)", cfg.label);
     let _ = tray.update("", &icon_name, "Active", pixmap, &tip).await;
     log::warn!("{err}");
 
     // Build menu pairs (Window, no burn result for stale data —
     // we don't have fresh samples to project on).
     let windows: Vec<(Window, Option<&BurnResult>)> =
-        stale_windows.iter().map(|w| (*w, None)).collect();
+        stale_windows.iter().map(|w| (w.clone(), None)).collect();
     let throttled = stale_windows.first()
         .map(|w| w.remaining_pct <= 0)
         .unwrap_or(false);
     let menu_state = build_menu_state(
-        &plan_cfg.label,
+        &cfg.label,
         &windows,
         Some(err),
         true, age_ms,
@@ -758,11 +733,8 @@ async fn render_out_of_menu(tray: &Arc<Tray>, cfg: &Config, offline: bool) {
         // The menu's error row carries the offline message.
         // ToolTip desc: "${planLabel} — offline" (matches gjs).
         // Note: offline uses the static "offline" SVG (gray), so no
-        // provider colors are needed here.
-        let cfg_label = cfg.plans.get(&cfg.plan)
-            .map(|p| p.label.clone())
-            .unwrap_or_else(|| "MiniMax".to_string());
-        let tip = format!("{cfg_label} — offline");
+        // ring colors are needed here.
+        let tip = format!("{} — offline", cfg.label);
         let _ = tray.update(
             "",
             &icon::static_svg_path("offline").to_string_lossy(),
@@ -801,7 +773,7 @@ fn build_menu_state(
         String::new()
     };
     for (w, burn_opt) in windows {
-        let label = w.id;
+        let label = &w.id;
         let resets_in_ms = (w.reset_at - now_ms()).max(0);
         labels.push(util::window_label(
             label, w.remaining_pct, resets_in_ms, stale,
@@ -1011,9 +983,9 @@ mod tests {
     use super::*;
     use crate::burn::{BurnConfig, BurnResult};
 
-    fn w(label: &'static str, pct: i64, start: i64, end: i64) -> Window {
+    fn w(label: &str, pct: i64, start: i64, end: i64) -> Window {
         Window {
-            id: label,
+            id: label.to_string(),
             total: 0,
             used: 0,
             remaining_pct: pct,

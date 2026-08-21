@@ -1,4 +1,10 @@
-//! Single-instance PID lock at `$XDG_RUNTIME_DIR/minimax-quota-tray.pid`.
+//! Single-instance PID lock at `$XDG_RUNTIME_DIR/<basename>.pid`,
+//! where `<basename>` is the per-instance name from
+//! `crate::instance` (e.g. `minimax-quota` for the default instance,
+//! `minimax-quota-codex` for `--instance=codex`).
+//!
+//! Two concurrent instances have different lock paths so they don't
+//! conflict — each has its own `pid` file in its own slot.
 //!
 //! gjs parity: matches `acquireSingleInstanceLock()` /
 //! `releaseSingleInstanceLock()`. Uses O_EXCL semantics for
@@ -12,8 +18,6 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-const LOCK_FILENAME: &str = "minimax-quota-tray.pid";
-
 /// Acquired lock state; holds the path so we can release on exit.
 pub struct Lock {
     path: PathBuf,
@@ -24,7 +28,7 @@ impl Lock {
     /// `Ok(None)` if another live instance holds it, `Err` if the
     /// lock file is malformed (e.g. non-numeric contents).
     pub fn acquire() -> Result<Option<Self>> {
-        let path = lock_path();
+        let path = crate::instance::lock_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -80,14 +84,6 @@ impl Drop for Lock {
     }
 }
 
-fn lock_path() -> PathBuf {
-    let dir = std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
-    PathBuf::from(dir).join(LOCK_FILENAME)
-}
-
 /// True iff `/proc/<pid>` exists — the cheap-and-cheerful
 /// liveness signal on Linux. Returns false on platforms without
 /// `/proc` (caller treats as "stale" → takeover).
@@ -133,7 +129,7 @@ mod tests {
         isolated_lock_path();
         // Write a fake stale PID (1 is init — usually alive, so use
         // a very high number that's definitely dead).
-        let path = lock_path();
+        let path = crate::instance::lock_path();
         std::fs::write(&path, "9999999").unwrap();
         let lock = Lock::acquire().expect("acquire").expect("stale takeover");
         lock.release();

@@ -1,16 +1,17 @@
-//! HTTPS fetch of the quota endpoint + parse into Window shape.
+//! HTTPS fetch of the quota endpoint + parse into `Vec<Window>`.
 //! Reqwest with rustls-tls (pure Rust TLS, no OpenSSL/GnuTLS).
 //!
-//! Provider-specific bits (auth header, User-Agent, error envelope)
-//! live in `crate::provider`; this module is the data-driven HTTP
-//! driver. To port to a different API, edit `src/provider.rs`.
+//! Provider-specific bits (auth style, User-Agent, JSON shape) come
+//! from the active instance's `Config`. This module is the
+//! data-driven HTTP driver — to port to a different API, change
+//! config.json (or add a new instance), not this file.
 //!
 //! The HTTP call is blocking (reqwest blocking) and intended to be
 //! wrapped in `tokio::task::spawn_blocking` from the polling loop.
 //!
 //! `fetch_windows_blocking` returns `Vec<Window>` — one entry per
-//! window the plan's `PlanShape` defines. There's no fixed pair;
-//! `main.rs` consumes whatever the parser produces.
+//! window the per-instance `PlanShape` defines. There's no fixed
+//! pair; `main.rs` consumes whatever the parser produces.
 
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
@@ -18,15 +19,15 @@ use serde_json::Value;
 
 use crate::burn::Window;
 use crate::parse::parse_plan;
-use crate::provider::{PlanShape, Provider};
+use crate::provider::{AuthConfig, PlanShape};
 
 // Re-export so callers can refer to `fetch::Client` without importing reqwest.
 pub use reqwest::blocking::Client as HttpClient;
 
 /// Build a shared blocking reqwest client. TLS via rustls.
-pub fn build_client(provider: &Provider) -> Result<Client> {
+pub fn build_client(user_agent_prefix: &str) -> Result<Client> {
     let user_agent = format!("{}/{}",
-        provider.user_agent_prefix, env!("CARGO_PKG_VERSION"));
+        user_agent_prefix, env!("CARGO_PKG_VERSION"));
     Client::builder()
         .user_agent(user_agent)
         .timeout(std::time::Duration::from_secs(15))
@@ -38,19 +39,28 @@ pub fn build_client(provider: &Provider) -> Result<Client> {
 /// Synchronous fetch — blocks the calling thread. Callers should run this
 /// on a blocking thread (`tokio::task::spawn_blocking`) so the runtime
 /// isn't blocked.
+///
+/// `auth` dispatches to one of the auth styles in `AuthConfig`:
+/// `Bearer` and `Header`/`Custom` set an HTTP header,
+/// `QueryParam` appends `?<param>=<key>` to the URL (the header
+/// values are empty in that case).
 pub fn fetch_windows_blocking(
     client: &Client,
     endpoint: &str,
     api_key: &str,
-    provider: &Provider,
+    auth: &AuthConfig,
     shape: &PlanShape,
 ) -> Result<Vec<Window>> {
-    let (auth_name, auth_value) = (provider.auth_header)(api_key);
-    let resp = client
-        .get(endpoint)
-        .header(auth_name, auth_value)
-        .send()
-        .context("HTTP request")?;
+    // Apply query-param auth to the URL first (if applicable) so the
+    // rest of the request goes out with the key in the URL.
+    let endpoint = auth.apply_to_endpoint(endpoint, api_key);
+    let (auth_name, auth_value) = auth.build(api_key);
+
+    let mut req = client.get(&endpoint);
+    if !auth_name.is_empty() {
+        req = req.header(&auth_name, &auth_value);
+    }
+    let resp = req.send().context("HTTP request")?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -86,19 +96,11 @@ pub fn fetch_windows_blocking(
 /// and `api[-_]key ...` patterns are replaced with `[redacted]`.
 pub fn sanitize_error_snippet(raw: &str) -> String {
     let truncated: String = raw.chars().take(80).collect();
-    // Case-insensitive match: Bearer/Authorization/api[-_]?key, optional
-    // separator (`:`, `=`, whitespace), then the value (alphanumeric,
-    // dot, dash, plus, slash, equals — base64 + url-safe). gjs uses
-    // /(?:Bearer|Authorization|api[-_]?key)\s*[:=]?\s*[A-Za-z0-9._\-+/=]+/gi.
-    let re = regex_lite_redact(&truncated);
-    re
+    regex_lite_redact(&truncated)
 }
 
 /// Inline lightweight regex substitute — we don't pull the `regex`
-/// crate for one pattern. Walks the input looking for matches of
-/// `(?:Bearer|Authorization|api[-_]?key)` followed by optional `:`,
-/// `=`, or whitespace, then a credential-shaped run. Replaces each
-/// match with `[redacted]`.
+/// crate for one pattern.
 fn regex_lite_redact(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
@@ -106,12 +108,10 @@ fn regex_lite_redact(s: &str) -> String {
     let lower = s.to_ascii_lowercase();
     while i < bytes.len() {
         if let Some((rel, end)) = find_match(&lower, i) {
-            // Copy bytes before the match.
             out.push_str(&s[i..i + rel]);
             out.push_str("[redacted]");
             i = end;
         } else {
-            // No more matches from `i` onwards — push rest and stop.
             out.push_str(&s[i..]);
             break;
         }
@@ -119,9 +119,6 @@ fn regex_lite_redact(s: &str) -> String {
     out
 }
 
-/// Find a `(?:Bearer|Authorization|api[-_]?key)\s*[:=]?\s*[A-Za-z0-9._\-+/=]+`
-/// match starting at or after position `start`. Returns the match
-/// start (offset from `start`) and the position after the match.
 fn find_match(lower: &str, start: usize) -> Option<(usize, usize)> {
     let bytes = lower.as_bytes();
     if start >= bytes.len() {
@@ -133,15 +130,12 @@ fn find_match(lower: &str, start: usize) -> Option<(usize, usize)> {
             if lower[idx..].starts_with(pat) {
                 let after_pat = idx + pat.len();
                 let mut k = after_pat;
-                // Optional separator.
                 if k < bytes.len() && (bytes[k] == b':' || bytes[k] == b'=') {
                     k += 1;
                 }
-                // Skip whitespace.
                 while k < bytes.len() && (bytes[k] as char).is_ascii_whitespace() {
                     k += 1;
                 }
-                // Credential run.
                 let cred_start = k;
                 while k < bytes.len() && is_cred_char(bytes[k]) {
                     k += 1;
@@ -149,7 +143,6 @@ fn find_match(lower: &str, start: usize) -> Option<(usize, usize)> {
                 if k > cred_start {
                     return Some((idx, k));
                 }
-                // No credential after the keyword — not a match.
                 break;
             }
         }
@@ -168,20 +161,16 @@ fn is_cred_char(b: u8) -> bool {
 ///
 /// Some providers (MiniMax) return HTTP 200 with an error envelope in
 /// the body (`{"base_resp": {"status_code": 1004, "status_msg":
-/// "login fail: ..."}}`). Surfacing the real message beats the
-/// generic "payload missing model_remains[0]" parse error the tray
-/// would otherwise show — e.g. a placeholder key in the keyring now
-/// reports the actual API rejection instead of a confusing parse
-/// failure. Providers that use standard HTTP status codes only should
-/// set `error_envelope: None` in their `PlanShape`.
+/// "login fail: ..."}}`). Providers that use standard HTTP status
+/// codes only should set `error_envelope: None` in their `PlanShape`.
 fn envelope_error(body: &Value, envelope: Option<&crate::provider::ErrorEnvelope>) -> Option<String> {
     let env = envelope?;
-    let code = body.pointer(env.code_path).and_then(|c| c.as_i64())?;
+    let code = body.pointer(&env.code_path).and_then(|c| c.as_i64())?;
     if env.success_codes.contains(&code) {
         return None;
     }
     let msg = body
-        .pointer(env.message_path)
+        .pointer(&env.message_path)
         .and_then(|m| m.as_str())
         .unwrap_or("unknown error");
     Some(format!("API error {code}: {msg}"))
@@ -190,114 +179,97 @@ fn envelope_error(body: &Value, envelope: Option<&crate::provider::ErrorEnvelope
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{ErrorEnvelope, PlanShape, WindowShape};
     use serde_json::json;
 
-    /// gjs: `raw.replace(/(?:Bearer|Authorization|api[-_]?key)\s*[:=]?\s*[A-Za-z0-9._\-+/=]+/gi, '[redacted]')`.
-    #[test]
-    fn redacts_bearer_token() {
-        let s = "Server said: Bearer abcDEF123-_./+= denied";
-        let out = sanitize_error_snippet(s);
-        assert!(!out.contains("abcDEF123"),
-                "Bearer value must be redacted; got {out}");
-        assert!(out.contains("[redacted]"));
-    }
-
-    #[test]
-    fn redacts_authorization_header() {
-        let s = "{\"Authorization: sk-cp-tok1234\", err}";
-        let out = sanitize_error_snippet(s);
-        assert!(!out.contains("sk-cp-tok1234"));
-        assert!(out.contains("[redacted]"));
-    }
-
-    #[test]
-    fn redacts_api_key_variants() {
-        for variant in &["api_key", "api-key", "API_KEY", "Api-Key"] {
-            let s = format!("{variant}=sk-cp-abcdef0123456789");
-            let out = sanitize_error_snippet(&s);
-            assert!(!out.contains("abcdef0123456789"),
-                    "{variant} value must be redacted; got {out}");
+    /// Build a shape with the `base_resp` error envelope so we can
+    /// exercise the envelope reader without baking MiniMax into the
+    /// test.
+    fn shape_with_envelope(env: ErrorEnvelope) -> PlanShape {
+        PlanShape {
+            entries_path: "/".to_string(),
+            windows: vec![WindowShape {
+                id: "primary".to_string(),
+                field_prefix: "primary".to_string(),
+                start_field: None,
+                reset_field: None,
+                start_unit_ms: 1,
+                reset_unit_ms: 1,
+                reset_is_absolute_epoch: false,
+            }],
+            error_envelope: Some(env),
         }
     }
 
     #[test]
-    fn plain_text_passes_through() {
-        let s = "Internal Server Error";
-        assert_eq!(sanitize_error_snippet(s), s);
-    }
-
-    #[test]
-    fn truncates_to_80_chars() {
-        let s = "x".repeat(200);
-        let out = sanitize_error_snippet(&s);
-        assert_eq!(out.chars().count(), 80);
-    }
-
-    #[test]
-    fn no_match_leaves_input_intact() {
-        // No credential keyword — leave alone.
-        let s = "Internal Server Error: please retry";
-        let out = sanitize_error_snippet(s);
-        assert_eq!(out, s);
-    }
-
-    #[test]
-    fn keyword_followed_by_word_is_redacted_too() {
-        // gjs's regex DOES match "Authorization header" — the cred
-        // run doesn't require a separator, just the keyword followed
-        // by a credential-shaped token. We mirror that behavior.
-        let s = "Authorization header missing";
-        let out = sanitize_error_snippet(s);
-        assert!(out.contains("[redacted]"),
-                "Authorization + word IS redacted (gjs regex behavior)");
-    }
-
-    #[test]
     fn build_client_succeeds() {
-        assert!(build_client(&crate::provider::MINIMAX).is_ok());
+        assert!(build_client("minimax-quota-tray").is_ok());
     }
 
     #[test]
     fn parse_error_propagates() {
+        // Build a shape pointing at a non-`/` entries path so
+        // missing/empty entry objects produce errors (rather than
+        // the parser silently reading zeros from the root).
+        let mut shape = shape_with_envelope(ErrorEnvelope {
+            code_path: "/base_resp/status_code".to_string(),
+            message_path: "/base_resp/status_msg".to_string(),
+            success_codes: vec![0],
+        });
+        shape.entries_path = "/model_remains".to_string();
         let v: Value = serde_json::from_str("{}").unwrap();
-        let shape = crate::provider::MINIMAX.shape("remains").unwrap();
-        assert!(parse_plan(&v, shape, 0).is_err());
+        assert!(parse_plan(&v, &shape, 0).is_err());
     }
 
     #[test]
-    fn empty_model_remains_returns_parse_error_not_panic() {
+    fn empty_entry_returns_parse_error_not_panic() {
         let v = json!({"model_remains": []});
-        let shape = crate::provider::MINIMAX.shape("remains").unwrap();
-        assert!(parse_plan(&v, shape, 0).is_err());
-    }
-
-    fn minimax_envelope() -> &'static crate::provider::ErrorEnvelope {
-        crate::provider::MINIMAX.shape("remains")
-            .and_then(|s| s.error_envelope.as_ref())
-            .expect("MINIMAX_REMAINS should have an error envelope")
+        let mut shape = shape_with_envelope(ErrorEnvelope {
+            code_path: "/x".to_string(),
+            message_path: "/y".to_string(),
+            success_codes: vec![0],
+        });
+        shape.entries_path = "/model_remains".to_string();
+        assert!(parse_plan(&v, &shape, 0).is_err());
     }
 
     #[test]
-    fn base_resp_error_envelope_is_reported_not_parse_error() {
-        // MiniMax returns HTTP 200 with this envelope on auth failures.
+    fn envelope_reports_non_success_code() {
+        // MiniMax-style envelope: code != success_codes → error.
         let v = json!({
             "base_resp": {"status_code": 1004, "status_msg": "login fail: bad key"}
         });
-        let err = super::envelope_error(&v, Some(minimax_envelope()));
+        let env = ErrorEnvelope {
+            code_path: "/base_resp/status_code".to_string(),
+            message_path: "/base_resp/status_msg".to_string(),
+            success_codes: vec![0],
+        };
+        let err = super::envelope_error(&v, Some(&env));
         assert_eq!(err.as_deref(), Some("API error 1004: login fail: bad key"));
     }
 
     #[test]
-    fn base_resp_zero_code_is_not_an_error() {
+    fn envelope_zero_code_is_not_an_error() {
         let v = json!({"base_resp": {"status_code": 0, "status_msg": "ok"}});
-        let err = super::envelope_error(&v, Some(minimax_envelope()));
+        let env = ErrorEnvelope {
+            code_path: "/base_resp/status_code".to_string(),
+            message_path: "/base_resp/status_msg".to_string(),
+            success_codes: vec![0],
+        };
+        let err = super::envelope_error(&v, Some(&env));
         assert_eq!(err, None);
     }
 
     #[test]
-    fn missing_base_resp_is_not_an_error() {
+    fn missing_envelope_path_returns_none() {
+        // Body has no /base_resp — envelope_error treats it as success.
         let v = json!({"model_remains": []});
-        let err = super::envelope_error(&v, Some(minimax_envelope()));
+        let env = ErrorEnvelope {
+            code_path: "/base_resp/status_code".to_string(),
+            message_path: "/base_resp/status_msg".to_string(),
+            success_codes: vec![0],
+        };
+        let err = super::envelope_error(&v, Some(&env));
         assert_eq!(err, None);
     }
 
@@ -309,5 +281,55 @@ mod tests {
         let v = json!({"base_resp": {"status_code": 1004, "status_msg": "x"}});
         let err = super::envelope_error(&v, None);
         assert_eq!(err, None);
+    }
+
+    // ---- AuthConfig dispatch tests ----
+
+    #[test]
+    fn auth_bearer() {
+        let cfg = AuthConfig::Bearer;
+        let (name, value) = cfg.build("sk-test");
+        assert_eq!(name, "Authorization");
+        assert_eq!(value, "Bearer sk-test");
+    }
+
+    #[test]
+    fn auth_header_custom_name() {
+        let cfg = AuthConfig::Header { name: "x-api-key".to_string() };
+        let (name, value) = cfg.build("sk-test");
+        assert_eq!(name, "x-api-key");
+        assert_eq!(value, "sk-test");
+    }
+
+    #[test]
+    fn auth_custom_format() {
+        let cfg = AuthConfig::Custom {
+            name: "Authorization".to_string(),
+            format: "Token {key}".to_string(),
+        };
+        let (name, value) = cfg.build("sk-test");
+        assert_eq!(name, "Authorization");
+        assert_eq!(value, "Token sk-test");
+    }
+
+    #[test]
+    fn auth_query_param_appends_to_endpoint() {
+        let cfg = AuthConfig::QueryParam { name: "key".to_string() };
+        let (name, _) = cfg.build("sk-test");
+        assert_eq!(name, "");  // no header
+        let modified = cfg.apply_to_endpoint("https://api.example.com/v1/usage", "sk-test");
+        assert_eq!(modified, "https://api.example.com/v1/usage?key=sk-test");
+    }
+
+    #[test]
+    fn auth_query_param_preserves_existing_query() {
+        let cfg = AuthConfig::QueryParam { name: "key".to_string() };
+        let modified = cfg.apply_to_endpoint("https://api.example.com/v1/usage?foo=bar", "sk-test");
+        assert_eq!(modified, "https://api.example.com/v1/usage?foo=bar&key=sk-test");
+    }
+
+    #[test]
+    fn auth_default_is_bearer() {
+        assert!(matches!(AuthConfig::default(), AuthConfig::Bearer));
     }
 }

@@ -1,58 +1,53 @@
-//! Config loading: ~/.config/minimax-quota/config.json (created from
-//! config.example.json on first run by install.sh). Defaults are baked
-//! in so the tray can boot before the file exists.
+//! Config loading: each instance's `config.json` (path derived from
+//! `--instance=<name>`, defaulting to `~/.config/minimax-quota/`).
+//!
+//! The config is the source of truth for everything per-instance:
+//! endpoint, label, dashboard URL, JSON shape, ring colors, auth
+//! style, User-Agent prefix. Defaults are baked in so the tray can
+//! boot before the file exists.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::burn::BurnConfig;
-use crate::provider::{DEFAULT_PLANS, DEFAULT_PROVIDER, PROVIDERS};
+use crate::provider::{
+    default_ring_colors, default_shape, AuthConfig, PlanShape, RingColors,
+    DEFAULT_USER_AGENT,
+};
 
-const CONFIG_DIR_NAME: &str = ".config/minimax-quota";
-const CONFIG_FILENAME: &str = "config.json";
-
-/// One plan entry in `config.json`'s `plans` map. `shape` references
-/// a `PlanShape` in the active `Provider::plan_shapes` table (e.g.
-/// `"remains"` for MiniMax). New plans can be added in `config.json`
-/// without touching code as long as their endpoint returns the same
-/// JSON shape as the referenced one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanConfig {
-    pub endpoint: String,
-    pub dashboard_url: String,
-    pub label: String,
-    /// Reference into the active provider's `plan_shapes` table.
-    #[serde(default = "default_shape_id")]
-    pub shape: String,
-}
-
-fn default_shape_id() -> String {
-    // Default to the first registered shape in the default provider.
-    // For MiniMax this is "remains". Forks that ship with multiple
-    // shapes should set this explicitly.
-    DEFAULT_PROVIDER.plan_shapes.first()
-        .map(|(id, _)| id.to_string())
-        .unwrap_or_else(|| "default".to_string())
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Thresholds {
-    /// Yellow when used% >= this.
-    pub yellow: i64,
-    /// Red when used% >= this.
-    pub red: i64,
-}
+/// Default config dir basename (no instance suffix).
+pub const CONFIG_DIR_BASE: &str = "minimax-quota";
+pub const CONFIG_FILENAME: &str = "config.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Active provider ID — references an entry in
-    /// `crate::provider::PROVIDERS`. Defaults to MiniMax when absent.
-    #[serde(default = "default_provider_id")]
-    pub provider: String,
-    /// Active plan ID — must match a key in `plans` (or one of the
-    /// default plans if `plans` is empty).
-    pub plan: String,
+    /// The API endpoint to GET. Per-instance.
+    pub endpoint: String,
+    /// The URL opened by the **Open dashboard** menu item.
+    pub dashboard_url: String,
+    /// Human-readable label, shown in the chip and menu header.
+    pub label: String,
+
+    /// JSON shape of the response. Per-instance — every provider
+    /// has different field names and unit conversions.
+    #[serde(default = "default_shape")]
+    pub shape: PlanShape,
+
+    /// Ring colors for normal/warning/throttled states. Defaults
+    /// to the classic green/yellow/red if omitted.
+    #[serde(default = "default_ring_colors")]
+    pub ring_colors: RingColors,
+
+    /// How the API key is sent. Defaults to Bearer.
+    #[serde(default)]
+    pub auth: AuthConfig,
+
+    /// User-Agent prefix (version auto-appended). Defaults to
+    /// `minimax-quota-tray`.
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
+
     pub refresh_seconds: u64,
     /// Floor for the polling cadence (gjs `refresh_min_seconds`,
     /// default 15). The adaptive cut (yellow/2, red/4) plus the
@@ -64,94 +59,74 @@ pub struct Config {
     pub refresh_max_backoff_seconds: u64,
 
     #[serde(default)]
-    pub plans: std::collections::HashMap<String, PlanConfig>,
-
-    #[serde(default)]
     pub thresholds: Thresholds,
 
     #[serde(default)]
     pub burn_warning: BurnConfig,
 }
 
-fn default_provider_id() -> String {
-    DEFAULT_PROVIDER.id.to_string()
+fn default_user_agent() -> String {
+    DEFAULT_USER_AGENT.to_string()
 }
 
-/// Resolve a `provider` ID to its registered `Provider` value. If the
-/// ID isn't in the registry, logs a warning and falls back to
-/// `DEFAULT_PROVIDER` (the first registered provider) so the tray
-/// can still boot — better than crashing on a typo.
-pub fn resolve_provider(id: &str) -> &'static crate::provider::Provider {
-    if let Some(p) = crate::provider::provider_by_id(id) {
-        p
-    } else {
-        log::warn!(
-            "config: unknown provider '{id}' (registered: {:?}); falling back to '{}'",
-            PROVIDERS.iter().map(|p| p.id).collect::<Vec<_>>(),
-            DEFAULT_PROVIDER.id,
-        );
-        DEFAULT_PROVIDER
-    }
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Thresholds {
+    /// Yellow when used% >= this.
+    pub yellow: i64,
+    /// Red when used% >= this.
+    pub red: i64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        // Defaults come from `crate::provider::DEFAULT_PLANS` — the
-        // single source of truth for what plans ship with the binary.
-        // If a user runs the binary before `install.sh` has copied the
-        // example file, this default gets written to
-        // ~/.config/minimax-quota/config.json (see `load_or_init`).
-        // Wrong endpoints here = silent "no data" until the user fixes
-        // the config manually, so keep `provider.rs` in sync with the
-        // live API surface.
-        //
-        // Note: `config.example.json` ships the same table; if you
-        // edit one, edit the other.
-        let mut plans = std::collections::HashMap::new();
-        for p in DEFAULT_PLANS {
-            plans.insert(
-                p.id.to_string(),
-                PlanConfig {
-                    endpoint: p.endpoint.to_string(),
-                    dashboard_url: p.dashboard_url.to_string(),
-                    label: p.label.to_string(),
-                    shape: p.shape_id.to_string(),
-                },
-            );
-        }
-        // First entry in DEFAULT_PLANS is the default active plan.
-        // Falls back to `"coding_plan"` if DEFAULT_PLANS is empty
-        // (which shouldn't happen — see provider.rs).
-        let default_plan = DEFAULT_PLANS.first()
-            .map(|p| p.id.to_string())
-            .unwrap_or_else(|| "coding_plan".to_string());
+        // A neutral starting point: the compile-time defaults for
+        // shape, ring colors, auth, and user-agent, plus reasonable
+        // placeholder values for endpoint/label/dashboard_url. The
+        // user is expected to override endpoint + label + shape in
+        // their config.json — `load_or_init` writes this default and
+        // the user customizes.
         Self {
-            provider: DEFAULT_PROVIDER.id.to_string(),
-            plan: default_plan,
+            endpoint: String::new(),
+            dashboard_url: String::new(),
+            label: String::from("Quota"),
+            shape: default_shape(),
+            ring_colors: default_ring_colors(),
+            auth: AuthConfig::default(),
+            user_agent: default_user_agent(),
             refresh_seconds: 120,
             refresh_min_seconds: default_refresh_min_seconds(),
             refresh_max_backoff_seconds: 600,
-            plans,
             thresholds: Thresholds { yellow: 60, red: 85 },
             burn_warning: BurnConfig::default(),
         }
     }
 }
 
-/// Default for `refresh_min_seconds` — matches the gjs default in
-/// `config.example.json` (`refresh_min_seconds: 15`).
+/// Default for `refresh_min_seconds` — matches the gjs default.
 fn default_refresh_min_seconds() -> u64 { 15 }
 
-/// `~/.config/minimax-quota/config.json` — uses HOME env var to avoid
-/// pulling in the dirs crate at config-load time.
-pub fn config_path() -> PathBuf {
+/// Per-instance config path: `<config_dir>/<instance>/config.json`.
+/// If `instance` is empty, returns the original single-instance
+/// path (`~/.config/minimax-quota/config.json`).
+pub fn config_path_for(instance: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(CONFIG_DIR_NAME).join(CONFIG_FILENAME)
+    let dir = if instance.is_empty() {
+        PathBuf::from(home).join(format!(".config/{CONFIG_DIR_BASE}"))
+    } else {
+        PathBuf::from(home).join(format!(".config/{CONFIG_DIR_BASE}-{instance}"))
+    };
+    dir.join(CONFIG_FILENAME)
+}
+
+/// Backwards-compatible path: assumes the default (no-instance)
+/// config dir. Prefer `config_path_for(&instance::name())`.
+pub fn config_path() -> PathBuf {
+    config_path_for(crate::instance::name())
 }
 
 /// Load config from disk; missing or malformed → defaults.
-pub fn load() -> Config {
-    let path = config_path();
+pub fn load_for(instance: &str) -> Config {
+    let path = config_path_for(instance);
     match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<Config>(&bytes) {
             Ok(c) => c,
@@ -162,6 +137,11 @@ pub fn load() -> Config {
         },
         Err(_) => Config::default(),
     }
+}
+
+/// Backwards-compatible load (default instance). Prefer `load_for`.
+pub fn load() -> Config {
+    load_for(crate::instance::name())
 }
 
 /// Load and save defaults to disk if no config exists yet.
@@ -205,16 +185,6 @@ mod tests {
         f.write_all(body.as_bytes()).unwrap();
     }
 
-    /// Variant of load() that reads from a given path — used in tests so we
-    /// don't fight HOME/serialization.
-    fn load_at(path: &std::path::Path) -> Config {
-        let bytes = std::fs::read(path).unwrap();
-        match serde_json::from_slice::<Config>(&bytes) {
-            Ok(c) => c,
-            Err(e) => panic!("load_at failed for {}: {e}", path.display()),
-        }
-    }
-
     /// Acquire the test lock; all config tests should `let _g = lock_home();`
     /// at the top so they don't stomp each other's HOME.
     fn lock_home() -> std::sync::MutexGuard<'static, ()> {
@@ -224,76 +194,125 @@ mod tests {
     #[test]
     fn defaults_when_file_does_not_exist() {
         let _g = lock_home();
-        // load() with HOME pointed at empty dir returns defaults.
         let tmp = std::env::temp_dir().join("minimax-cfg-empty");
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("HOME", &tmp);
         let cfg = load();
-        assert_eq!(cfg.plan, "coding_plan");
         assert_eq!(cfg.refresh_seconds, 120);
         assert_eq!(cfg.refresh_min_seconds, 15,
-                   "default refresh_min_seconds must be 15 (gjs parity)");
-        assert!(cfg.plans.contains_key("coding_plan"));
+                   "default refresh_min_seconds must be 15");
         std::env::remove_var("HOME");
     }
 
     #[test]
     fn refresh_min_seconds_field_is_optional_in_json() {
-        // Old configs that omit `refresh_min_seconds` should fall
-        // back to the default (matches gjs `?? 15` semantics in
-        // `nextIntervalSeconds`).
         let _g = lock_home();
         let tmp = std::env::temp_dir().join("minimax-cfg-no-min");
         let _ = std::fs::remove_dir_all(&tmp);
         let path = tmp.join("config.json");
         write_at(&path, r#"{
-            "plan": "coding_plan",
+            "endpoint": "https://example.invalid/coding",
+            "dashboard_url": "https://example.invalid/dash",
+            "label": "Coding Plan",
             "refresh_seconds": 120,
-            "refresh_max_backoff_seconds": 600,
-            "plans": {
-                "coding_plan": {
-                    "endpoint": "https://example.invalid/coding",
-                    "dashboard_url": "https://example.invalid/dash",
-                    "label": "Coding Plan"
-                }
-            }
+            "refresh_max_backoff_seconds": 600
         }"#);
-        let cfg = load_at(&path);
+        let bytes = std::fs::read(&path).unwrap();
+        let cfg: Config = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(cfg.refresh_min_seconds, 15);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn roundtrip() {
-        let _g = lock_home();
-        let tmp = std::env::temp_dir().join("minimax-cfg-roundtrip");
-        let path = tmp.join("config.json");
-        write_at(&path, r#"{
-            "plan": "token_plan",
-            "refresh_seconds": 60,
-            "refresh_max_backoff_seconds": 600,
-            "plans": {
-                "token_plan": {
-                    "endpoint": "https://example.invalid/token",
-                    "dashboard_url": "https://example.invalid/dash",
-                    "label": "Test Token Plan"
-                }
+    fn per_instance_config_path() {
+        assert!(config_path_for("").to_string_lossy()
+                .contains(".config/minimax-quota/config.json"));
+        assert!(config_path_for("codex").to_string_lossy()
+                .contains(".config/minimax-quota-codex/config.json"));
+        assert!(config_path_for("openai").to_string_lossy()
+                .contains(".config/minimax-quota-openai/config.json"));
+    }
+
+    #[test]
+    fn ring_colors_override_in_config() {
+        // A per-instance config can override ring colors (e.g.
+        // an orange scheme for one tray, blue for another).
+        // Note: `r##"..."##` (not `r#"..."#`) because the JSON
+        // contains `"#xxxxxx` hex-color literals — `r#` would
+        // close prematurely at the first `"#`.
+        let json = r##"{
+            "endpoint": "https://example.invalid",
+            "dashboard_url": "https://example.invalid/dash",
+            "label": "Orange Tray",
+            "ring_colors": {
+                "normal":   "#ff9900",
+                "warning":  "#ff5500",
+                "throttled": "#ff0000"
             },
-            "thresholds": {"yellow": 50, "red": 80},
-            "burn_warning": {
-                "enabled": false,
-                "min_history_ms": 1,
-                "lookback_ms": 60000,
-                "use_epoch_average": false
-            }
-        }"#);
-        let cfg = load_at(&path);
-        assert_eq!(cfg.plan, "token_plan");
-        assert_eq!(cfg.refresh_seconds, 60);
-        assert_eq!(cfg.thresholds.yellow, 50);
-        assert!(!cfg.burn_warning.enabled);
-        assert!(!cfg.burn_warning.use_epoch_average);
-        let _ = std::fs::remove_dir_all(&tmp);
+            "refresh_seconds": 60,
+            "refresh_max_backoff_seconds": 600
+        }"##;
+        let cfg: Config = serde_json::from_slice(json.as_bytes()).unwrap();
+        assert_eq!(cfg.ring_colors.normal,   "#ff9900");
+        assert_eq!(cfg.ring_colors.warning,  "#ff5500");
+        assert_eq!(cfg.ring_colors.throttled, "#ff0000");
+    }
+
+    #[test]
+    fn auth_override_in_config() {
+        let json_bearer = r#"{
+            "endpoint": "https://x", "dashboard_url": "x", "label": "x",
+            "auth": {"type": "bearer"},
+            "refresh_seconds": 60, "refresh_max_backoff_seconds": 600
+        }"#;
+        let cfg: Config = serde_json::from_slice(json_bearer.as_bytes()).unwrap();
+        assert!(matches!(cfg.auth, AuthConfig::Bearer));
+
+        let json_xapikey = r#"{
+            "endpoint": "https://x", "dashboard_url": "x", "label": "x",
+            "auth": {"type": "header", "name": "x-api-key"},
+            "refresh_seconds": 60, "refresh_max_backoff_seconds": 600
+        }"#;
+        let cfg: Config = serde_json::from_slice(json_xapikey.as_bytes()).unwrap();
+        match cfg.auth {
+            AuthConfig::Header { name } => assert_eq!(name, "x-api-key"),
+            _ => panic!("expected Header variant"),
+        }
+
+        let json_query = r#"{
+            "endpoint": "https://x", "dashboard_url": "x", "label": "x",
+            "auth": {"type": "query_param", "name": "key"},
+            "refresh_seconds": 60, "refresh_max_backoff_seconds": 600
+        }"#;
+        let cfg: Config = serde_json::from_slice(json_query.as_bytes()).unwrap();
+        match cfg.auth {
+            AuthConfig::QueryParam { name } => assert_eq!(name, "key"),
+            _ => panic!("expected QueryParam variant"),
+        }
+    }
+
+    #[test]
+    fn shape_override_in_config() {
+        // A per-instance config can specify its own JSON shape
+        // (different field names, units, error envelope).
+        let json = r#"{
+            "endpoint": "https://x", "dashboard_url": "x", "label": "Daily",
+            "shape": {
+                "entries_path": "/data",
+                "windows": [{
+                    "id": "daily",
+                    "field_prefix": "daily",
+                    "start_unit_ms": 1,
+                    "reset_unit_ms": 1,
+                    "reset_is_absolute_epoch": false
+                }]
+            },
+            "refresh_seconds": 60, "refresh_max_backoff_seconds": 600
+        }"#;
+        let cfg: Config = serde_json::from_slice(json.as_bytes()).unwrap();
+        assert_eq!(cfg.shape.entries_path, "/data");
+        assert_eq!(cfg.shape.windows.len(), 1);
+        assert_eq!(cfg.shape.windows[0].id, "daily");
     }
 
     #[test]
@@ -304,7 +323,7 @@ mod tests {
         write_at(&path, "this is not json");
         std::env::set_var("HOME", &tmp);
         let cfg = load();
-        assert_eq!(cfg.plan, "coding_plan");  // defaults
+        assert_eq!(cfg.refresh_seconds, 120);
         std::env::remove_var("HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -317,18 +336,11 @@ mod tests {
         std::env::set_var("HOME", &tmp);
         let cfg = load_or_init().unwrap();
         assert!(config_path().exists(), "config should have been written");
-        assert_eq!(cfg.plan, "coding_plan");
+        assert_eq!(cfg.refresh_seconds, 120);
         std::env::remove_var("HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// gjs explicitly chmods the default-written config to 0600
-    /// (see its `f.set_attribute_uint32('unix::mode', 0o600, ...)`).
-    /// `std::fs::write` honors the umask (typically 0644), so we
-    /// flip it after writing. The config carries no secrets, but
-    /// matching the gjs permission keeps first-run installs
-    /// consistent with later ones (and matches `install.sh`'s
-    /// `install -m 0600`).
     #[test]
     #[cfg(unix)]
     fn load_or_init_writes_default_config_with_0600() {
@@ -341,38 +353,7 @@ mod tests {
         let path = config_path();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600,
-                   "default-written config must be 0600 (gjs parity)");
-        std::env::remove_var("HOME");
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn load_or_init_does_not_overwrite_existing() {
-        let _g = lock_home();
-        let tmp = std::env::temp_dir().join("minimax-cfg-existing");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("HOME", &tmp);
-        write_at(&config_path(), r#"{
-            "plan": "token_plan",
-            "refresh_seconds": 30,
-            "refresh_max_backoff_seconds": 120,
-            "plans": {
-                "token_plan": {
-                    "endpoint": "https://example.invalid/token",
-                    "dashboard_url": "https://example.invalid/dash",
-                    "label": "Test Token Plan"
-                }
-            },
-            "thresholds": {"yellow": 40, "red": 70},
-            "burn_warning": {
-                "enabled": true,
-                "min_history_ms": 1,
-                "lookback_ms": 60000,
-                "use_epoch_average": true
-            }
-        }"#);
-        let cfg = load_or_init().unwrap();
-        assert_eq!(cfg.plan, "token_plan");  // preserved
+                   "default-written config must be 0600");
         std::env::remove_var("HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }

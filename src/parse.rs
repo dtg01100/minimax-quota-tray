@@ -1,19 +1,15 @@
-//! Parse a provider's JSON payload into the internal `Window` shape
-//! used by the burn-rate and menu code.
+//! Parse a per-instance JSON payload into the internal `Window`
+//! shape used by the burn-rate and menu code.
 //!
 //! All provider-specific details (JSON field names, unit conversions,
-//! error envelopes) live in `crate::provider` — this module is purely
-//! the data-driven reader. To port to a different API, edit
-//! `src/provider.rs`, not this file.
+//! error envelopes) come from the `PlanShape` in the instance's
+//! `config.json`. This module is the data-driven reader — no provider
+//! constants live here.
 //!
 //! The parser returns `Vec<Window>` with one entry per window the
-//! `PlanShape` defines. There's no fixed pair — `main.rs` consumes
-//! whatever windows the parser produces and renders one menu row per
-//! window; the first window drives the chip percentage.
-//!
-//! For the MiniMax live shape (verified 2026-08-18) see the doc on
-//! `provider::MINIMAX_REMAINS`. The Coding Plan and Token Plan use
-//! the same shape, just different endpoints.
+//! `PlanShape` defines. `main.rs` consumes whatever windows the
+//! parser produces and renders one menu row per window; the first
+//! window drives the chip percentage.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -45,8 +41,8 @@ fn parse_one_window(entry: &Value, w: &WindowShape, now_ms: i64) -> Window {
     let total = num(entry, &format!("{}_total_count", w.field_prefix));
     let used = num(entry, &format!("{}_usage_count", w.field_prefix));
     let remaining_pct = pct(entry, &format!("{}_remaining_percent", w.field_prefix));
-    let start_field = w.start_field.unwrap_or("start_time");
-    let reset_field = w.reset_field.unwrap_or("remains_time");
+    let start_field = w.start_field.as_deref().unwrap_or("start_time");
+    let reset_field = w.reset_field.as_deref().unwrap_or("remains_time");
     let start_at = num(entry, start_field) * w.start_unit_ms;
     let raw_reset = num(entry, reset_field) * w.reset_unit_ms;
     let reset_at = if w.reset_is_absolute_epoch {
@@ -54,7 +50,7 @@ fn parse_one_window(entry: &Value, w: &WindowShape, now_ms: i64) -> Window {
     } else {
         now_ms + raw_reset
     };
-    Window { id: w.id, total, used, remaining_pct, start_at, reset_at }
+    Window { id: w.id.clone(), total, used, remaining_pct, start_at, reset_at }
 }
 
 /// Look up the first entry in `payload` according to `shape`. For an
@@ -66,7 +62,7 @@ fn first_entry<'a>(payload: &'a Value, shape: &PlanShape) -> Option<&'a Value> {
         Some(payload)
     } else {
         payload
-            .pointer(shape.entries_path)
+            .pointer(&shape.entries_path)
             .and_then(|v| v.as_array())
             .and_then(|a| a.first())
     }
@@ -91,18 +87,56 @@ pub fn parse_plan(payload: &Value, shape: &PlanShape, now_ms: i64) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::MINIMAX_REMAINS;
     use serde_json::json;
+
+    /// The standard MiniMax shape — a 2-window shape with the
+    /// `model_remains` entry array, `current_interval_*` / `current_weekly_*`
+    /// field-name prefixes, and the `base_resp` error envelope. Tests
+    /// that need a real-world shape build this via JSON so we don't
+    /// need a compile-time MiniMax-specific constant.
+    fn minimax_shape() -> PlanShape {
+        serde_json::from_value(json!({
+            "entries_path": "/model_remains",
+            "windows": [
+                {
+                    "id": "5h",
+                    "field_prefix": "current_interval",
+                    "start_unit_ms": 1000,
+                    "reset_unit_ms": 1,
+                    "reset_is_absolute_epoch": false
+                },
+                {
+                    "id": "weekly",
+                    "field_prefix": "current_weekly",
+                    "start_field": "weekly_start_time",
+                    "reset_field": "weekly_remains_time",
+                    "start_unit_ms": 1000,
+                    "reset_unit_ms": 1,
+                    "reset_is_absolute_epoch": false
+                }
+            ],
+            "error_envelope": {
+                "code_path": "/base_resp/status_code",
+                "message_path": "/base_resp/status_msg",
+                "success_codes": [0]
+            }
+        })).expect("test fixture shape should deserialize")
+    }
 
     /// Convenience: parse the standard fixture and destructure the
     /// resulting Vec into the canonical 5h/weekly pair (MiniMax
     /// always produces exactly 2 windows for the `remains` shape).
     fn parse_minimax(payload: &Value, now_ms: i64) -> (crate::burn::Window, crate::burn::Window) {
-        let windows = parse_plan(payload, &MINIMAX_REMAINS, now_ms)
-            .expect("parse_plan(MINIMAX_REMAINS) should succeed on the fixture");
+        let shape = minimax_shape();
+        let mut windows = parse_plan(payload, &shape, now_ms)
+            .expect("parse_plan(MiniMax shape) should succeed on the fixture");
         assert_eq!(windows.len(), 2,
-                   "MINIMAX_REMAINS shape should produce exactly 2 windows");
-        (windows[0], windows[1])
+                   "MiniMax shape should produce exactly 2 windows");
+        // Vec::remove swaps the tail in, so this is O(1) — but
+        // for a 2-element test Vec it doesn't matter.
+        let weekly = windows.pop().expect("len checked");
+        let five_h = windows.pop().expect("len checked");
+        (five_h, weekly)
     }
 
     /// Fixture uses realistic values: `start_time` in epoch seconds,
@@ -227,13 +261,15 @@ mod tests {
     #[test]
     fn missing_model_remains_returns_error() {
         let v = json!({});
-        assert!(parse_plan(&v, &MINIMAX_REMAINS, 0).is_err());
+        let shape = minimax_shape();
+        assert!(parse_plan(&v, &shape, 0).is_err());
     }
 
     #[test]
     fn empty_model_remains_returns_error() {
         let v = json!({"model_remains": []});
-        assert!(parse_plan(&v, &MINIMAX_REMAINS, 0).is_err());
+        let shape = minimax_shape();
+        assert!(parse_plan(&v, &shape, 0).is_err());
     }
 
     #[test]
@@ -272,20 +308,16 @@ mod tests {
         // shape with one window and verify the Vec has one entry.
         // The entry path is `/` (the root object IS the entry —
         // `first_entry` wraps it into a one-element synthetic array).
-        use crate::provider::{PlanShape, WindowShape};
-        let shape = PlanShape {
-            entries_path: "/",
-            windows: &[WindowShape {
-                id: "daily",
-                field_prefix: "daily",
-                start_field: None,
-                reset_field: None,
-                start_unit_ms: 1000,
-                reset_unit_ms: 1,
-                reset_is_absolute_epoch: false,
-            }],
-            error_envelope: None,
-        };
+        let shape: PlanShape = serde_json::from_value(json!({
+            "entries_path": "/",
+            "windows": [{
+                "id": "daily",
+                "field_prefix": "daily",
+                "start_unit_ms": 1000,
+                "reset_unit_ms": 1,
+                "reset_is_absolute_epoch": false
+            }]
+        })).unwrap();
         let v = json!({
             "daily_total_count": 1000,
             "daily_usage_count": 200,
@@ -304,28 +336,17 @@ mod tests {
     fn three_window_shape_works() {
         // And the N>2 case — three windows from one shape, all sharing
         // the same entry object.
-        use crate::provider::{PlanShape, WindowShape};
-        let shape = PlanShape {
-            entries_path: "/",
-            windows: &[
-                WindowShape {
-                    id: "m5", field_prefix: "m5",
-                    start_field: None, reset_field: None,
-                    start_unit_ms: 1, reset_unit_ms: 1, reset_is_absolute_epoch: false,
-                },
-                WindowShape {
-                    id: "h1", field_prefix: "h1",
-                    start_field: None, reset_field: None,
-                    start_unit_ms: 1, reset_unit_ms: 1, reset_is_absolute_epoch: false,
-                },
-                WindowShape {
-                    id: "d1", field_prefix: "d1",
-                    start_field: None, reset_field: None,
-                    start_unit_ms: 1, reset_unit_ms: 1, reset_is_absolute_epoch: false,
-                },
-            ],
-            error_envelope: None,
-        };
+        let shape: PlanShape = serde_json::from_value(json!({
+            "entries_path": "/",
+            "windows": [
+                { "id": "m5", "field_prefix": "m5",
+                  "start_unit_ms": 1, "reset_unit_ms": 1, "reset_is_absolute_epoch": false },
+                { "id": "h1", "field_prefix": "h1",
+                  "start_unit_ms": 1, "reset_unit_ms": 1, "reset_is_absolute_epoch": false },
+                { "id": "d1", "field_prefix": "d1",
+                  "start_unit_ms": 1, "reset_unit_ms": 1, "reset_is_absolute_epoch": false }
+            ]
+        })).unwrap();
         let v = json!({
             "m5_total_count": 0, "m5_usage_count": 0, "m5_remaining_percent": 80,
             "start_time": 0, "remains_time": 100,

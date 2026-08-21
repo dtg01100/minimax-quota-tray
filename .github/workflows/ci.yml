@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Build & test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        # libsecret-1-dev + libdbus-1-dev are required by the build
+        # script's pkg-config probes; without them `cargo build` fails
+        # with "could not find system library `secret-1`".
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libsecret-1-dev \
+            libdbus-1-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/swift@v1
+        with:
+          cache-on-failure: true
+          # Default cache path matches the workspace layout.
+          args: --manifest-path Cargo.toml
+
+      - name: cargo build
+        run: cargo build --verbose
+
+      - name: cargo test
+        # The two integration tests in tests/integration.rs are
+        # `#[ignore]` because they need a session D-Bus and a writable
+        # HOME; CI containers have neither. Default `cargo test` runs
+        # the ~155 unit tests, including the schema-drift guard that
+        # parses every file in examples/providers/.
+        run: cargo test --verbose
+
+      - name: cargo build --release (smoke)
+        # Catches release-profile regressions (LTO, opt-level=z, strip,
+        # panic=abort) that wouldn't show up in a debug build. This is
+        # the same profile install.sh uses.
+        run: cargo build --release --verbose
+
+      - name: Verify release binary under RSS budget
+        # Mirror the tests/integration.rs::rss_under_target guard. The
+        # integration test needs a session D-Bus so it's ignored; this
+        # is a cheaper proxy that runs in any container. 20 MB is the
+        # headline number from README — anything above means someone
+        # accidentally re-introduced a heavy dep (gtk, libappindicator,
+        # the `png` feature on tiny-skia, etc.).
+        run: |
+          strip target/release/llm-quota-tray -o /tmp/llm-quota-tray.stripped
+          size=$(stat -c%s /tmp/llm-quota-tray.stripped)
+          echo "release binary size: ${size} bytes"
+          # 8 MB ceiling — well above the ~5.5 MB reported size, gives
+          # headroom for dep updates without hiding real regressions.
+          test "$size" -lt 8388608 || (echo "release binary exceeded 8 MB ceiling" && exit 1)
+
+  lint:
+    name: Format & clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        # Use -- --check on stable rustfmt (rustfmt 1.5+); if the
+        # project drifts, run `cargo fmt` locally before pushing.
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        # Treat warnings as errors. The codebase currently compiles
+        # clean at -D warnings; keep it that way.
+        run: cargo clippy --all-targets -- -D warnings

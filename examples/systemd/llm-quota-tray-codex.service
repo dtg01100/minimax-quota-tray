@@ -1,0 +1,22 @@
+[Unit]
+Description=LLM Quota Tray Indicator (instance: codex)
+# After graphical-session.target so we don't start until the user's
+# desktop session is up (which gives us DISPLAY / WAYLAND_DISPLAY /
+# XDG_CURRENT_DESKTOP via the session manager's env propagation).
+After=graphical-session.target
+
+[Service]
+Type=simple
+# Adjust the path if you install to a different prefix. The base
+# install.sh drops the binary at %h/.local/bin/llm-quota-tray.
+ExecStart=%h/.local/bin/llm-quota-tray --instance=codex
+Restart=on-failure
+RestartSec=5
+# No hardcoded env vars. After=graphical-session.target above ensures
+# the session is up, and the session DBus activation context propagates
+# DISPLAY / WAYLAND_DISPLAY / XDG_SESSION_TYPE / XDG_CURRENT_DESKTOP
+# to the spawned service. Makes the unit portable across single vs
+# multi-monitor, X11 vs Wayland, and non-GNOME desktops.
+
+[Install]
+WantedBy=default.target

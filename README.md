@@ -88,8 +88,9 @@ the host's panel does all the rendering from the dbusmenu tree.
     natively (they speak SNI directly)
 - `libsecret` for the keyring (any libsecret provider — GNOME Keyring,
   KWallet, KeePassXC's secret-service bridge)
-- A MiniMax API key (stored in the keyring, in `~/.config/minimax-quota/key`,
-  or in `MINIMAX_API_KEY` env var)
+- A MiniMax API key (stored in the keyring under the `quota-tray`
+  application, in `~/.config/.config/quota-tray/key`, or in the
+  `MINIMAX_API_KEY` env var)
 
 ### Build (for `install.sh`, which compiles from source)
 
@@ -107,7 +108,7 @@ The installer compiles the Rust binary if needed
 (`cargo build --release` — first build is ~1-2 min, subsequent rebuilds
 are seconds since `target/` is cached), copies it to `~/.local/bin/`,
 installs the systemd unit to `~/.config/systemd/user/`, and writes a
-default config to `~/.config/minimax-quota/config.json` (skipped if it
+default config to `~/.config/quota-tray/config.json` (skipped if it
 already exists). After it finishes, click the chip in your panel →
 **Set API Key…** to store your key in your libsecret provider
 (GNOME Keyring, KWallet, etc.).
@@ -165,26 +166,45 @@ if the cancel-before-arm logic is ever removed.
 
 ## Configuration
 
-`~/.config/minimax-quota/config.json`:
+`~/.config/quota-tray/config.json` (one instance = one config = one
+tray icon; see [Multiple instances](#multiple-instances) below for
+running more than one):
 
 ```json
 {
-  "plan": "coding_plan",
+  "endpoint":      "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
+  "dashboard_url": "https://platform.minimax.io/console/plan",
+  "label":         "Coding Plan",
+
+  "shape": {
+    "entries_path": "/model_remains",
+    "windows": [
+      { "id": "5h",     "field_prefix": "current_interval",
+        "start_unit_ms": 1000, "reset_unit_ms": 1, "reset_is_absolute_epoch": false },
+      { "id": "weekly", "field_prefix": "current_weekly",
+        "start_field": "weekly_start_time", "reset_field": "weekly_remains_time",
+        "start_unit_ms": 1000, "reset_unit_ms": 1, "reset_is_absolute_epoch": false }
+    ],
+    "error_envelope": {
+      "code_path": "/base_resp/status_code",
+      "message_path": "/base_resp/status_msg",
+      "success_codes": [0]
+    }
+  },
+
+  "ring_colors": {
+    "normal":   "#3a9d4d",
+    "warning":  "#f6d32d",
+    "throttled": "#e01b24"
+  },
+
+  "auth": { "type": "bearer" },
+  "user_agent": "minimax-quota-tray",
+
   "refresh_seconds": 120,
   "refresh_min_seconds": 15,
   "refresh_max_backoff_seconds": 600,
-  "plans": {
-    "coding_plan": {
-      "endpoint":      "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
-      "dashboard_url": "https://platform.minimax.io/console/plan",
-      "label": "Coding Plan"
-    },
-    "token_plan": {
-      "endpoint":      "https://api.minimax.io/v1/token_plan/remains",
-      "dashboard_url": "https://platform.minimax.io/console/plan",
-      "label": "Token Plan"
-    }
-  },
+
   "thresholds": { "yellow": 60, "red": 85 },
   "burn_warning": {
     "enabled": true,
@@ -195,38 +215,110 @@ if the cancel-before-arm logic is ever removed.
 }
 ```
 
-- `plan` — `"coding_plan"` or `"token_plan"`. Switch by editing + restarting.
-- `plans.<id>.endpoint` — override to point at a proxy.
-- `thresholds` — the warning icon swap fires when **used** % exceeds these
-  (i.e., yellow at 60% used, red at 85% used). The chip label always shows
-  **remaining** %.
-- `burn_warning` — burn-rate projection. After the tray has collected
+- **`endpoint`** — full URL to GET. Per-instance.
+- **`dashboard_url`** — opened by the **Open dashboard** menu item.
+- **`label`** — shown in the chip and menu header.
+- **`shape`** — describes the JSON response: where to find the
+  entry, how many windows to extract, and what field-name prefixes
+  / unit multipliers / error-envelope paths to use. See
+  `src/provider.rs` for the full schema; the worked example in
+  [Porting to another provider](#porting-to-another-provider)
+  below shows how to define a new shape.
+- **`ring_colors`** — the chip's three bucket-state colors. The
+  center dot uses the same color as the ring, so the chip reads as
+  "ring with center" — orange scheme for one tray, blue for another,
+  green/yellow/red (default) for a third, etc.
+- **`auth`** — how the API key is sent. One of:
+  - `{ "type": "bearer" }` — `Authorization: Bearer <key>` (default)
+  - `{ "type": "header", "name": "x-api-key" }` — `<header>: <key>`
+  - `{ "type": "custom", "name": "Authorization", "format": "Token {key}" }` —
+    `<header>: <format>` with `{key}` substituted
+  - `{ "type": "query_param", "name": "key" }` — appends `?key=<key>` to the URL
+- **`user_agent`** — User-Agent prefix (version auto-appended).
+- **`thresholds`** — the chip's bucket transitions fire when **used**
+  % exceeds these (yellow at 60% used, red at 85% used). The chip
+  label always shows **remaining** %.
+- **`burn_warning`** — burn-rate projection. After the tray has collected
   `min_history_ms` (default 10 min) of polling history for a window, it
-  estimates the token burn rate for that window and shows a row under its
+  estimates the burn rate for that window and shows a row under its
   bar — informational (`on pace to have ~X% left at reset`) whenever
   there's enough data, switching to a `⚠` warning when the trend projects
-  the window exhausting before it resets. Each window (5h, weekly) gets
-  its own history so a quiet 5h window does not pollute the weekly rate.
-  The 5h window's warning also flips the chip to yellow. The rate is the
-  max of the recent slope over `lookback_ms` (default 1h) and the
-  whole-epoch average; set `use_epoch_average: false` to react to
-  short-term spikes only. `enabled: false` turns the feature off entirely.
-  Note the projection needs history — it appears ~10 min after startup
-  and resets on every window rollover (per window).
+  the window exhausting before it resets. Each window gets its own
+  history so a quiet window does not pollute another's rate.
+  The rate is the max of the recent slope over `lookback_ms` (default 1h)
+  and the whole-epoch average; set `use_epoch_average: false` to react
+  to short-term spikes only. `enabled: false` turns the feature off
+  entirely. The projection needs history — it appears ~10 min after
+  startup and resets on every window rollover (per window).
   **Pct-only suppression:** on providers whose count fields are 0/0
   (Coding Plan and any pct-only API), the integer-percent signal can't
   fit a meaningful slope at weekly scale — per-poll drops are ~0.01–0.05%
   on weekly usage, well below 1% precision. A pct-only window only gets
-  a row when its rate is actually non-zero. The 5h window keeps the row
-  whenever there's been a recent tick; the weekly row stays hidden on
-  Coding Plan. Token-counting providers keep the row for all windows
-  since their rate is computed from real count deltas.
+  a row when its rate is actually non-zero. Token-counting providers keep
+  the row for all windows since their rate is computed from real count
+  deltas.
 - **Polling cadence** — `refresh_seconds` is the baseline (default 120s, peer-aligned).
   The actual interval is adaptive: when remaining quota drops below the
   yellow threshold, polls speed up to `refresh_seconds / 2`; below the
   red threshold, `refresh_seconds / 4`. After consecutive errors, the
   interval backs off exponentially up to `refresh_max_backoff_seconds`
   (default 600). Each poll also has 0-5s of jitter to spread load.
+
+## Multiple instances
+
+One binary, many tray icons. Each instance is its own tray with its
+own config, colors, endpoint, keyring entry, and lock file — they
+don't collide. Run them with `--instance=<name>` (or
+`QUOTA_INSTANCE=<name>` env var).
+
+```sh
+# Default tray — `~/.config/quota-tray/`, keyring app `quota-tray`,
+# lock at `$XDG_RUNTIME_DIR/quota-tray.pid`
+minimax-quota-tray
+
+# Concurrent instance for a different provider — `~/.config/quota-tray-codex/`,
+# keyring app `quota-tray-codex`, lock at `$XDG_RUNTIME_DIR/quota-tray-codex.pid`.
+# Each tray icon can have its own colors / endpoint / auth / etc.
+minimax-quota-tray --instance=codex
+```
+
+For a persistent second tray (e.g. Codex running on every login),
+install a second systemd unit. `minimax-quota.service` is the
+template — copy it to `minimax-quota-codex.service` and add
+`--instance=codex` to the `ExecStart=` line:
+
+```sh
+cp ~/.config/systemd/user/minimax-quota.service \
+   ~/.config/systemd/user/minimax-quota-codex.service
+# Edit the copy: change Description= and add ` --instance=codex`
+# to the end of ExecStart=
+systemctl --user daemon-reload
+systemctl --user enable --now minimax-quota-codex.service
+```
+
+What gets namespaced per instance:
+
+| | Default | `--instance=codex` |
+|---|---|---|
+| Config dir | `~/.config/quota-tray/` | `~/.config/quota-tray-codex/` |
+| Config file | `…/config.json` | `…/config.json` |
+| Lock file | `$XDG_RUNTIME_DIR/quota-tray.pid` | `$XDG_RUNTIME_DIR/quota-tray-codex.pid` |
+| Keyring `application` | `quota-tray` | `quota-tray-codex` |
+| Keyring `label` | `quota-tray API Key` | `quota-tray-codex API Key` |
+| Legacy fallback key file | `~/.config/.config/quota-tray/key` | `~/.config/.config/quota-tray-codex/key` |
+| Static SVGs | `minimax-quota-*.svg` (shared) | (shared — same names) |
+
+The static SVGs in `${TMPDIR}/` are shared across instances because
+they're per-color, not per-instance, and the colors come from each
+instance's config. SNI hosts pick them up by `IconName`; the same
+files work for both instances because each instance's chip is
+distinguished by the live ARGB `IconPixmap` (which IS per-instance,
+in the running tray process).
+
+A second instance with the same name (no `--instance=`, or two
+`--instance=foo` simultaneously) fails immediately with
+`another instance is already running` — the lock file is
+instance-scoped, so this only conflicts with itself.
 
 ## How it works
 
@@ -238,7 +330,7 @@ to render a native menu.
 
 ```
    ┌──────────────────────────┐
-   │   minimax-quota-tray      │   ~5.5 MB ELF, no GUI library;
+   │   minimax-quota-tray      │   ~5.2 MB ELF, no GUI library;
    │                          │   links libc + libsecret + libdbus only
    └────────────┬─────────────┘
                 │
@@ -247,23 +339,7 @@ to render a native menu.
    │  server (no proxy)        │   + com.canonical.dbusmenu tree
    └────────────┬─────────────┘
                 │
-   Host's SNI panel ←  reqwest →  api.minimax.io/v1/{coding_plan|token_plan}/remains
-                ↓
-   secret-service crate  →  libsecret (any provider)
-```
-
-```
-   ┌──────────────────────────┐
-   │   minimax-quota-tray      │   ~5.5 MB ELF, no GUI library;
-   │                          │   links libc + libsecret + libdbus only
-   └────────────┬─────────────┘
-                │
-   ┌────────────┴─────────────┐
-   │  zbus + custom dbusmenu    │   StatusNotifierItem properties
-   │  server (no proxy)        │   + com.canonical.dbusmenu tree
-   └────────────┬─────────────┘
-                │
-   Host's SNI panel ←  reqwest →  api.minimax.io/v1/{coding_plan|token_plan}/remains
+   Host's SNI panel ←  reqwest →  endpoint from config.json
                 ↓
    secret-service crate  →  libsecret (any provider)
 ```
@@ -271,14 +347,15 @@ to render a native menu.
 The Rust port doesn't draw anything itself — the host's panel reads the
 SNI properties and renders an icon, and walks the dbusmenu tree to
 build a native menu (a KDE Plasma `KMenu`, a Waybar menu, etc.). This
-is why the Rust binary is ~5.5 MB instead of the 25+ MB you'd get with
+is why the Rust binary is ~5.2 MB instead of the 25+ MB you'd get with
 a linked-in GTK.
 
-The keyring write goes through `secret-tool` (libsecret's CLI) via
-`tokio::process::Command` with `Stdio::piped()` — direct argv, no
-shell, no temp file. The `secret-service` rust crate's `create_item`
-has unreliable arg semantics across libsecret versions, so writes are
-shelled out; reads use the crate directly.
+The keyring read/write goes through the `secret-service` crate
+directly (blocking API on a `spawn_blocking` thread; libsecret's
+D-Bus calls would otherwise deadlock the tokio reactor). The crate
+also writes through `tokio::process::Command` if needed for
+compatibility with libsecret versions that misbehave on
+`create_item`'s argument negotiation.
 
 ## Troubleshooting
 
@@ -296,7 +373,7 @@ shelled out; reads use the crate directly.
   empty loader directory), the file load fails and the host falls
   through to the in-memory ARGB bytes sent via SNI `IconPixmap` —
   so the icon should still render. If it doesn't, check that
-  `/tmp/minimax-quota-*.svg` exists, is readable, and the directory
+  `${TMPDIR}/minimax-quota-*.svg` exists, is readable, and the directory
   isn't read-only. The icon-pixmap fallback renders regardless of
   whether the SVG file load succeeded, so a missing SVG file will
   never produce a blank panel on its own — if you see the three
@@ -321,66 +398,35 @@ shelled out; reads use the crate directly.
 
 The tray infrastructure (AppIndicator, keyring, adaptive polling,
 stale-on-error fallback, offline detection) is provider-agnostic.
-Only the HTTP/JSON surface is MiniMax-specific, and **all of it lives
-in a single file: [`src/provider.rs`](src/provider.rs)**. To port
-this tray at a different API, edit that file (and the
-`config.example.json` defaults) — the rest of the codebase reads
-from the constants there and needs no changes for typical ports.
+The HTTP/JSON surface is fully config-driven — **no provider
+constants live in source**. To port this tray at a different API,
+edit one config file. `src/provider.rs` holds only the type
+definitions (`AuthConfig`, `PlanShape`, `WindowShape`, `RingColors`)
+and neutral compile-time defaults (the classic green/yellow/red
+ring colors and a single generic window shape) — none of it
+names a specific provider.
 
-### What's in `src/provider.rs`
+### What's in `config.json`
 
-The file is organized top-down as a registry of `Provider` values,
-each of which bundles everything that's API-specific:
+Every field that varies between providers lives in
+`~/.config/quota-tray/config.json` (or
+`~/.config/quota-tray-<instance>/config.json` for a named
+instance):
 
-```rust
-pub struct Provider {
-    pub id: &'static str,                    // "minimax", "openai", etc.
-    pub auth_header: AuthHeaderFn,           // bearer / x-api-key / etc.
-    pub user_agent_prefix: &'static str,
-    pub ring_colors: RingColors,             // normal/warning/throttled hex
-    pub plan_shapes: &'static [(&str, PlanShape)],  // name → PlanShape map
-    pub default_plans: &'static [DefaultPlan],      // ships in defaults
-}
-```
+| Field | What it controls |
+|---|---|
+| `endpoint` | Full URL to GET |
+| `dashboard_url` | Opened by the **Open dashboard** menu item |
+| `label` | Shown in the chip and menu header |
+| `shape` | JSON response structure: entry path, windows, error envelope |
+| `ring_colors` | Hex colors for normal / warning / throttled |
+| `auth` | How the API key is sent (Bearer / header / custom / query param) |
+| `user_agent` | User-Agent prefix (version auto-appended) |
+| `thresholds`, `refresh_*`, `burn_warning` | UI cadence + bucket thresholds |
 
-A `PlanShape` value is data (not code) — it lists the JSON pointers,
-field-name prefixes, and unit multipliers the parser uses to extract
-each window. A `PlanShape`'s `windows` field is a slice with no
-fixed length: the tray renders however many windows the shape
-produces. The MiniMax provider ships two windows (`5h` and
-`weekly`); a provider returning three (e.g. minute / hour / day)
-just adds another `WindowShape` entry.
-
-A `Provider`'s `plan_shapes` is a name-keyed table so multiple
-plans can share one shape (MiniMax does this: both `coding_plan`
-and `token_plan` use the `remains` shape since they return the same
-JSON structure). To support multiple JSON shapes per provider, add
-more entries to `plan_shapes` and reference them by `shape_id` in
-each plan.
-
-### What's already configurable (no code change)
-
-Most provider surface is config-driven via `config.json`:
-
-- `provider` (top-level, optional) — selects which `Provider` from
-  `PROVIDERS` is active. Defaults to `"minimax"` when absent.
-  Unknown IDs fall back to the default with a warning.
-- `plan` (top-level) — which plan under the active provider is
-  active. Must match a key in `plans` (or one of the provider's
-  default plans if `plans` is empty).
-- `plans.<id>.endpoint` — full URL to GET
-- `plans.<id>.dashboard_url` — opened by the **Open dashboard** menu item
-- `plans.<id>.label` — shown in the chip and menu header
-- `plans.<id>.shape` — references the active provider's
-  `plan_shapes` table. Defaults to the first registered shape when
-  absent (so existing configs without `shape` keep working).
-- `thresholds`, `refresh_seconds`, `refresh_min_seconds`,
-  `refresh_max_backoff_seconds`
-
-You can add new plan entries to `plans` (each pointing at an
-existing `shape` in the active provider) without touching code.
-Adding a new JSON shape requires a code change — see the worked
-example below.
+The `shape` field is the only one that requires understanding the
+provider's JSON layout — see [Configuration](#configuration) for
+the full schema, and the worked example below for a full re-target.
 
 ### What the UI consumes
 
@@ -389,37 +435,38 @@ provider maps into:
 
 ```rust
 pub struct Window {
-    pub id: &'static str,    // unique within the windows vec
+    pub id: String,           // unique within the windows vec, used as
+                              // the menu row label and burn-rate history key
     pub total: i64,
     pub used: i64,
-    pub remaining_pct: i64,  // 0..100; drives chip + bar
-    pub reset_at: i64,       // absolute ms; drives "resets in X"
-    pub start_at: i64,       // optional; epoch start for burn projection
+    pub remaining_pct: i64,   // 0..100; drives chip + bar
+    pub reset_at: i64,        // absolute ms; drives "resets in X"
+    pub start_at: i64,        // optional; epoch start for burn projection
 }
 ```
 
-Rules for the provider→Window mapping (the `WindowShape` constants
-in `src/provider.rs` encode these):
+Rules for the provider→Window mapping (encoded by `WindowShape`
+fields in `config.json`'s `shape`):
 
-- **N windows.** There's no fixed limit — `PlanShape::windows` is
-  a slice, the parser returns `Vec<Window>`, and `main.rs` renders
-  one menu row per window. MiniMax ships with 2 (`5h`, `weekly`);
+- **N windows.** There's no fixed limit — `shape.windows` is a
+  `Vec<WindowShape>` of arbitrary length. The tray renders one
+  menu row per window. MiniMax ships with 2 (`5h`, `weekly`);
   a 3-window provider (e.g. minute/hour/day) just adds another
-  `WindowShape` entry to the shape and the tray adapts. Window
-  length isn't hardcoded — `burn::compute_burn` derives it
-  dynamically from `start_at` and `reset_at`.
+  `WindowShape` entry to its config.
+- **Window length is derived dynamically** — `burn::compute_burn`
+  reads `start_at` and `reset_at` from each `Window` and computes
+  the window length on the fly. No constant "5h" or "7d" is baked
+  in; the `id` is just a UI label.
 - **`id` is the window's UI label and history key.** The first
   window drives the chip percentage; convention is to put the
-  rolling short-interval window first (the one most likely to need
-  urgent attention). The id also keys the burn-rate history — pick
-  something stable and descriptive (changing it would lose
-  accumulated samples across restarts).
+  rolling short-interval window first. Pick something stable —
+  changing the id loses accumulated burn-rate history.
 - **`remaining_pct` is the source of truth.** If your provider
   returns `used`/`total`, the parser computes
-  `100 - (100 * used / total)` here.
+  `100 - (100 * used / total)`.
 - **`reset_at` is an absolute ms-since-epoch.** If your provider
-  gives a duration ("resets in 3h 20m"), set `reset_unit_ms: 1` and
-  leave `reset_is_absolute_epoch: false` — the parser computes
+  gives a duration ("resets in 3h 20m"), set `reset_unit_ms: 1`
+  and leave `reset_is_absolute_epoch: false` — the parser computes
   `reset_at = now_ms + raw_reset`. If your provider returns an
   absolute epoch instead, set `reset_is_absolute_epoch: true` and
   the parser uses the value directly.
@@ -438,115 +485,72 @@ x-api-key: <key>
     "monthly": { "limit": 30000, "used": 4500, "reset_in_ms": 2592000000 } }
 ```
 
-1. **Define a new `Provider` in `src/provider.rs`:**
+The whole port is one config file at
+`~/.config/quota-tray-provider-x/config.json`:
 
-   ```rust
-   // Add to the provider registry (re-exported at the bottom of
-   // provider.rs):
-   pub const PROVIDER_X: Provider = Provider {
-       id: "provider_x",
-       auth_header: x_api_key_auth,    // see AuthHeaderFn type
-       user_agent_prefix: "minimax-quota-tray",
-       ring_colors: RingColors {
-           normal:   "#3366ff",
-           warning:  "#ff9900",
-           throttled: "#9933ff",
-       },
-       plan_shapes: &[("usage", PROVIDER_X_USAGE)],
-       default_plans: &[DefaultPlan {
-           id: "primary",
-           endpoint: "https://api.provider.com/v1/usage",
-           dashboard_url: "https://provider.com/dashboard",
-           label: "Provider X",
-           shape_id: "usage",
-       }],
-   };
+```json
+{
+  "endpoint":      "https://api.provider.com/v1/usage",
+  "dashboard_url": "https://provider.com/dashboard",
+  "label":         "Provider X",
 
-   pub const PROVIDER_X_USAGE: PlanShape = PlanShape {
-       // Provider X returns the entry as the root object. The
-       // parser wraps a single-object response into a one-element
-       // synthetic array internally.
-       entries_path: "/",
-       windows: &[
-           WindowShape {
-               id: "daily",
-               field_prefix: "daily",
-               start_field: None,
-               reset_field: Some("reset_in_ms"),
-               start_unit_ms: 1,           // unused (start_field missing → 0)
-               reset_unit_ms: 1,           // already ms
-               reset_is_absolute_epoch: false,
-           },
-           WindowShape {
-               id: "monthly",
-               field_prefix: "monthly",
-               start_field: None,
-               reset_field: Some("reset_in_ms"),
-               start_unit_ms: 1,
-               reset_unit_ms: 1,
-               reset_is_absolute_epoch: false,
-           },
-       ],
-       error_envelope: None,  // Provider X uses HTTP status codes
-   };
+  "shape": {
+    "entries_path": "/",
+    "windows": [
+      {
+        "id": "daily",
+        "field_prefix": "daily",
+        "reset_field": "reset_in_ms",
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": false
+      },
+      {
+        "id": "monthly",
+        "field_prefix": "monthly",
+        "reset_field": "reset_in_ms",
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": false
+      }
+    ]
+  },
 
-   // Register in PROVIDERS:
-   pub const PROVIDERS: &[&Provider] = &[&MINIMAX, &PROVIDER_X];
+  "ring_colors": {
+    "normal":   "#3366ff",
+    "warning":  "#9933ff",
+    "throttled": "#cc00ff"
+  },
 
-   // Auth fn for the new provider:
-   fn x_api_key_auth(api_key: &str) -> (&'static str, String) {
-       ("x-api-key", api_key.to_string())
-   }
-   ```
+  "auth": { "type": "header", "name": "x-api-key" },
+  "user_agent": "quota-tray-provider-x"
+}
+```
 
-2. **Add plans in `config.json`** without code changes — each plan
-   references a registered shape by `shape`:
+Launch it: `minimax-quota-tray --instance=provider-x`. The tray icon
+shows the blue/purple/pink palette, hits `api.provider.com`, sends
+`x-api-key: <key>`, renders two menu rows (`daily: 88% left`,
+`monthly: 85% left`), and refreshes on the configured cadence. No
+code change needed.
 
-   ```json
-   {
-     "provider": "provider_x",
-     "plan": "primary",
-     "plans": {
-       "primary": {
-         "endpoint": "https://api.provider.com/v1/usage",
-         "dashboard_url": "https://provider.com/dashboard",
-         "label": "Provider X",
-         "shape": "usage"
-       }
-     }
-   }
-   ```
+### Forking vs multi-instance
 
-   `Config::default()` ships the provider's `default_plans` table;
-   `plans` in `config.json` can ADD more entries (each pointing at
-   an existing shape) without re-compiling.
+For "I want a tray for a different API", don't fork — run a second
+instance. Forks are only worth it if you want to add a new auth
+scheme (`AuthConfig::Bearer`/`Header`/`Custom`/`QueryParam` already
+covers the common cases) or if you want a different binary name.
 
-3. **Update `config.example.json`** so fresh installs start with the
-   new provider's defaults.
-
-The UI, scheduler, keyring, and tray code don't change.
-
-### Optional: rename the binary + service + keyring entry
-
-If you fork this for a different provider, three names are worth updating so
-the two can coexist on one machine (the keyring schema, in particular, is
-global per user):
+If you do fork, three names are worth updating so the fork can
+coexist with the original:
 
 | What                          | Where                                             |
 | ----------------------------- | ------------------------------------------------- |
-| Script filename               | `minimax-quota-tray` → e.g. `openai-quota-tray`     |
+| Script filename               | `minimax-quota-tray` → e.g. `openai-quota-tray` |
 | systemd unit                  | `minimax-quota.service`                           |
-| Config dir                    | `~/.config/minimax-quota/`                        |
-| Keyring schema name           | `org.dlafreniere.minimax-quota`                   |
-| Keyring `application` attr    | `minimax-quota`                                   |
-| Keyring item label            | `MiniMax API Key`                                 |
+| Service `Description=`         | text shown in `systemctl --user status`         |
+| Cargo crate name              | `Cargo.toml` `[package].name`                     |
 
-Change them in: `src/keyring.rs` (`LABEL`, `attrs()`), the config
-schema (`src/config.rs`), the `ExecStart=` line in `minimax-quota.service`,
-and `install.sh` / `uninstall.sh` (the paths and `secret-tool` argv).
-Pick a single provider-specific token (e.g. `openai-quota`) and use
-it consistently across all six — that's what keeps multiple forks from
-stomping on each other's keyring entries.
+The config dir, lock file, and keyring `application` attribute are
+all derived from the instance name (default: `quota-tray`); forking
+the binary doesn't change those.
 
 
 ## License

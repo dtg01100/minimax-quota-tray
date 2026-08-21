@@ -1,5 +1,5 @@
 //! Config loading: each instance's `config.json` (path derived from
-//! `--instance=<name>`, defaulting to `~/.config/minimax-quota/`).
+//! `--instance=<name>`, defaulting to `~/.config/quota-tray/`).
 //!
 //! The config is the source of truth for everything per-instance:
 //! endpoint, label, dashboard URL, JSON shape, ring colors, auth
@@ -16,8 +16,10 @@ use crate::provider::{
     DEFAULT_USER_AGENT,
 };
 
-/// Default config dir basename (no instance suffix).
-pub const CONFIG_DIR_BASE: &str = "minimax-quota";
+/// Default config dir basename (no instance suffix). Neutral — no
+/// provider name baked in. Per-instance names append `-<name>`:
+/// `quota-tray-coding`, `quota-tray-openai`, etc.
+pub const CONFIG_DIR_BASE: &str = "quota-tray";
 pub const CONFIG_FILENAME: &str = "config.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,7 +109,7 @@ fn default_refresh_min_seconds() -> u64 { 15 }
 
 /// Per-instance config path: `<config_dir>/<instance>/config.json`.
 /// If `instance` is empty, returns the original single-instance
-/// path (`~/.config/minimax-quota/config.json`).
+/// path (`~/.config/quota-tray/config.json`).
 pub fn config_path_for(instance: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = if instance.is_empty() {
@@ -226,11 +228,11 @@ mod tests {
     #[test]
     fn per_instance_config_path() {
         assert!(config_path_for("").to_string_lossy()
-                .contains(".config/minimax-quota/config.json"));
+                .contains(".config/quota-tray/config.json"));
         assert!(config_path_for("codex").to_string_lossy()
-                .contains(".config/minimax-quota-codex/config.json"));
+                .contains(".config/quota-tray-codex/config.json"));
         assert!(config_path_for("openai").to_string_lossy()
-                .contains(".config/minimax-quota-openai/config.json"));
+                .contains(".config/quota-tray-openai/config.json"));
     }
 
     #[test]

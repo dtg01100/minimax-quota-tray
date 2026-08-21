@@ -1,7 +1,7 @@
 //! Single-instance PID lock at `$XDG_RUNTIME_DIR/<basename>.pid`,
 //! where `<basename>` is the per-instance name from
-//! `crate::instance` (e.g. `minimax-quota` for the default instance,
-//! `minimax-quota-codex` for `--instance=codex`).
+//! `crate::instance` (e.g. `quota-tray` for the default instance,
+//! `quota-tray-codex` for `--instance=codex`).
 //!
 //! Two concurrent instances have different lock paths so they don't
 //! conflict — each has its own `pid` file in its own slot.

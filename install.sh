@@ -13,7 +13,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_SRC="$ROOT/target/release/minimax-quota-tray"
 BIN_DEST="$HOME/.local/bin/minimax-quota-tray"
 SERVICE_DEST="$HOME/.config/systemd/user/minimax-quota.service"
-CONFIG_DIR="$HOME/.config/minimax-quota"
+# Default config dir uses a neutral basename (`quota-tray`) so the
+# path doesn't bake the provider name in. Named instances append
+# `-<name>` (e.g. `quota-tray-coding`, `quota-tray-openai`).
+CONFIG_DIR="$HOME/.config/quota-tray"
 CONFIG_DEST="$CONFIG_DIR/config.json"
 
 # Sanity checks

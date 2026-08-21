@@ -48,7 +48,7 @@ fn label() -> String {
 /// Look up the API key. Priority order matches the gjs `loadApiKey()`:
 ///
 ///   1. Secret Service (GNOME Keyring / KWallet via libsecret).
-///   2. Legacy plaintext file at `$HOME/.config/.config/minimax-quota/key`
+///   2. Legacy plaintext file at `$HOME/.config/.config/quota-tray/key`
 ///      (auto-migrated to the keyring on first run by the gjs code;
 ///      here we just read it as a fallback if the keyring daemon is
 ///      unreachable).
@@ -281,7 +281,7 @@ mod tests {
         let path = legacy_key_path();
         assert!(path.starts_with(std::env::var("HOME").unwrap_or_default())
                 || path.starts_with("/tmp"));
-        assert!(path.ends_with(".config/.config/minimax-quota/key"));
+        assert!(path.ends_with(".config/.config/quota-tray/key"));
     }
 
     #[test]

@@ -5,13 +5,13 @@
 //! same endpoint with different colors). Each instance is
 //! identified by a name (the "instance name") which namespaces:
 //!
-//!   - config dir  → `~/.config/minimax-quota-<name>/config.json`
-//!   - lock file   → `${XDG_RUNTIME_DIR}/minimax-quota-<name>.pid`
-//!   - keyring app → `minimax-quota-<name>`
+//!   - config dir  → `~/.config/quota-tray-<name>/config.json`
+//!   - lock file   → `${XDG_RUNTIME_DIR}/quota-tray-<name>.pid`
+//!   - keyring app → `quota-tray-<name>`
 //!
-//! The default instance (no name) keeps the original single-instance
-//! paths (`~/.config/minimax-quota/`, etc.) for backwards
-//! compatibility.
+//! The basename `quota-tray` is deliberately neutral — no provider
+//! name baked in. The default instance (no `--instance=` flag) uses
+//! just `quota-tray`; named instances append `-<name>`.
 //!
 //! ## Sources for the instance name
 //!
@@ -81,19 +81,10 @@ pub fn is_default() -> bool {
 /// Used to build `~/.config/<basename>/config.json`.
 pub fn config_dir_basename() -> String {
     if is_default() {
-        "minimax-quota".to_string()
+        "quota-tray".to_string()
     } else {
-        format!("minimax-quota-{}", name())
+        format!("quota-tray-{}", name())
     }
-}
-
-/// Per-instance config path: `~/.config/<basename>/config.json`.
-/// Kept for callers (notably `config::load_or_init`) that need the
-/// path without reading the config.
-pub fn config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".config").join(config_dir_basename())
-        .join("config.json")
 }
 
 /// Per-instance lock file path: `${XDG_RUNTIME_DIR}/<basename>.pid`.
@@ -154,7 +145,7 @@ mod tests {
 
     #[test]
     fn config_dir_basename_default() {
-        // Empty name → "minimax-quota" (legacy single-instance).
+        // Empty name → "quota-tray" (legacy single-instance).
         // We can't safely mutate INSTANCE_NAME across tests, but
         // since the helper derives from `name()` which defaults to
         // "" when uninitialized, this matches the production
@@ -163,12 +154,12 @@ mod tests {
         // the helper is a pure function over `name()` so it's
         // covered by the path test below.
         let s = if is_default() {
-            "minimax-quota".to_string()
+            "quota-tray".to_string()
         } else {
-            format!("minimax-quota-{}", name())
+            format!("quota-tray-{}", name())
         };
         // The test is more meaningful once we've initialized —
         // covered by the multi-instance doc tests in main.rs.
-        assert!(s == "minimax-quota" || s.starts_with("minimax-quota-"));
+        assert!(s == "quota-tray" || s.starts_with("quota-tray-"));
     }
 }

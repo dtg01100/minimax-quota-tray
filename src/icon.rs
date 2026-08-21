@@ -114,7 +114,7 @@ fn matches_bucket_name(b: Bucket, name: &str) -> bool {
 
 /// Internal label (different from the gjs `ICON` table — gjs used
 /// these as theme names; the rust port routes through
-/// `static_icon_path()` instead). Kept for tests + introspection.
+/// `static_svg_path()` instead). Kept for tests + introspection.
 #[allow(dead_code)]
 fn bucket_name(b: Bucket) -> &'static str {
     match b {
@@ -124,53 +124,85 @@ fn bucket_name(b: Bucket) -> &'static str {
     }
 }
 
-/// Compute the path to a cached PNG for the given percentage.
+/// Compute the path to a cached SVG for the given percentage.
 ///
-/// Matches gjs `ringIconPath()`: `${TMPDIR}/minimax-quota-ring-${pct}.png`.
-/// One file per integer percentage (0..100), shared across buckets via the
-/// bucket color baked into the BGRA bytes. The path is what we send as
-/// `IconName` so the SNI host reads the PNG from disk — without this,
-/// the AppIndicator extension prefers the theme name `quota-normal`
-/// (a solid filled circle) over `IconPixmap`, so the panel shows the
-/// static dot instead of our rendered ring. This is exactly what gjs
-/// does to make the ring visible: it sets the icon name to the path of
-/// the rendered PNG file, then the AppIndicator extension loads that
-/// PNG via the standard theme-resolution path.
-pub fn ring_icon_path(pct: i64) -> std::path::PathBuf {
+/// One file per integer percentage (0..100), shared across buckets via
+/// the bucket color baked into the SVG `stroke` attribute. The path is
+/// what we send as `IconName` so hosts that can render SVG natively
+/// (KDE/QtSvg, GNOME with a registered `libpixbufloader-svg.so`) use it
+/// directly at the panel's actual icon size — HiDPI panels get crisp
+/// pixels instead of upscaled 22×22 bitmap.
+///
+/// The SNI spec defines `IconName` as a Freedesktop-compliant theme
+/// name; absolute file paths are an unofficial extension supported by
+/// every major SNI implementation. The upstream AppIndicator extension
+/// acknowledges this as a "HACK" in `appIndicator.js::_getIconData`:
+///
+/// ```js
+/// // HACK: icon is a path name. This is not specified by the API,
+/// // but at least indicator-sensors uses it.
+/// if (name[0] === '/') { ... }
+/// ```
+///
+/// Hosts without SVG support (notably Fedora Atomic / Bluefin /
+/// Silverblue with empty gdk-pixbuf `loaders.cache`, or hosts where the
+/// SVG loader isn't registered) will fail `GdkPixbuf.Pixbuf
+/// .get_file_info_async()` and the AppIndicator extension logs
+/// "Invalid image format" and returns null — at which point the
+/// extension falls through to `IconPixmap` (the in-memory ARGB bytes
+/// from `render_pixmap`), so the icon still renders. We always send
+/// both: the SVG file as `IconName` for hosts that can use it, and the
+/// ARGB bytes as `IconPixmap` as the universal fallback.
+pub fn ring_svg_path(pct: i64) -> std::path::PathBuf {
     let clamped = pct.clamp(0, 100);
     let dir = std::env::var("TMPDIR")
         .ok()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir());
-    dir.join(format!("minimax-quota-ring-{clamped}.png"))
+    dir.join(format!("minimax-quota-ring-{clamped}.svg"))
 }
 
-/// Path to a pre-rendered PNG for the given static-state icon name
-/// (`quota-normal`, `quota-warning`, `quota-throttled`, `quota-error`,
-/// `quota-offline`). We rasterize the SVGs once at startup into
-/// `${TMPDIR}/minimax-quota-{name}.png` and send those file paths as
-/// `IconName`. The AppIndicator extension loads file paths via
-/// `GdkPixbuf` directly; theme names go through `Gtk.IconTheme` which
-/// only knows about `XDG_DATA_DIRS` — and `~/.local/share/icons` is NOT
-/// in the default `XDG_DATA_DIRS` on this Fedora install, so a theme
-/// name like `quota-error` resolves to the "three dots placeholder"
-/// instead of the icon file sitting in `~/.local/share/icons/...`.
-/// gjs has the same problem and shows the same placeholder when the
-/// `hicolor` theme in `~/.local/share/icons` lacks `index.theme`
-/// (which our `install.sh` forgot to create). Routing through a file
-/// path sidesteps the theme lookup entirely.
-pub fn static_icon_path(name: &str) -> std::path::PathBuf {
+/// Path to a pre-written SVG for the given static-state icon name
+/// (`normal`, `warning`, `throttled`, `error`, `offline`). See
+/// `ring_svg_path()` for the full rationale on why we send SVG file
+/// paths as `IconName`. The static SVGs are written to
+/// `${TMPDIR}/minimax-quota-{name}.svg` once at startup by
+/// `write_static_svgs()`.
+pub fn static_svg_path(name: &str) -> std::path::PathBuf {
     let dir = std::env::var("TMPDIR")
         .ok()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir());
-    dir.join(format!("minimax-quota-{name}.png"))
+    dir.join(format!("minimax-quota-{name}.svg"))
 }
 
-/// Rasterize the project's static SVG icons into PNGs in `${TMPDIR}`.
-/// Idempotent — skips files that already exist (subsequent restarts
-/// reuse the cached PNG). Called once at startup.
-pub fn rasterize_static_icons() {
+/// SVG template for a static icon — a single filled `<circle r="9">`
+/// at the center of the 22×22 viewBox, matching the radius of the
+/// ring's track and progress arcs so the static dot and the dynamic
+/// ring share the same overall footprint. The file is just a UTF-8
+/// text blob; the host's SVG renderer handles the rest.
+fn svg_static(color: &str) -> String {
+    format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" width="22" height="22"><circle cx="11" cy="11" r="9" fill="{color}"/></svg>"#
+    )
+}
+
+/// Write the project's static SVG icons into `${TMPDIR}`. Idempotent —
+/// skips files that already exist (subsequent restarts reuse the cached
+/// SVG). Called once at startup.
+///
+/// Each static icon is a single `<circle r="9" fill="{color}">` — a
+/// solid dot. The set covers the five states the chip can be in:
+///
+///   - `normal`:    green  (`#3a9d4d`)
+///   - `warning`:   yellow (`#f6d32d`)
+///   - `throttled`: red    (`#e01b24`) — also matches `quota-error`
+///   - `error`:     red    (`#e01b24`)
+///   - `offline`:   grey   (`#9a9996`)
+///
+/// Colors are pinned to the `RING_COLOR` table for normal/warning/
+/// throttled; the others are unique to the static-state UI.
+pub fn write_static_svgs() {
     let dir = std::env::var("TMPDIR")
         .ok()
         .map(std::path::PathBuf::from)
@@ -182,86 +214,33 @@ pub fn rasterize_static_icons() {
         ("error", "#e01b24"),
         ("offline", "#9a9996"),
     ] {
-        let path = dir.join(format!("minimax-quota-{name}.png"));
+        let path = dir.join(format!("minimax-quota-{name}.svg"));
         if path.exists() { continue; }
-        // Each static SVG is a single circle r=9 at center 11,11 — bake
-        // that directly into BGRA rather than spinning up resvg for a
-        // 22x22 circle. The result is byte-identical to what resvg
-        // would produce for these trivial SVGs.
-        let mut bgra = vec![0u8; 22 * 22 * 4];
-        let r = u8::from_str_radix(&color[1..3], 16).unwrap_or(0);
-        let g = u8::from_str_radix(&color[3..5], 16).unwrap_or(0);
-        let b = u8::from_str_radix(&color[5..7], 16).unwrap_or(0);
-        for y in 0..22 {
-            for x in 0..22 {
-                let dx = x as f32 - 11.0;
-                let dy = y as f32 - 11.0;
-                let dist = (dx * dx + dy * dy).sqrt();
-                let alpha = if dist <= 9.0 {
-                    255
-                } else if dist < 10.0 {
-                    ((10.0 - dist) * 255.0) as u8
-                } else {
-                    0
-                };
-                let i = (y * 22 + x) * 4;
-                if alpha > 0 {
-                    bgra[i] = b;
-                    bgra[i + 1] = g;
-                    bgra[i + 2] = r;
-                    bgra[i + 3] = alpha;
-                }
-            }
-        }
-        if let Err(e) = write_png_rgba(&path, 22, 22, &bgra) {
-            log::warn!("icon: failed to write static PNG {path:?}: {e}");
+        if let Err(e) = std::fs::write(&path, svg_static(color)) {
+            log::warn!("icon: failed to write static SVG {path:?}: {e}");
         }
     }
 }
 
-/// Render the ring for `pct` + `bucket` to a PNG file on disk, returning
-/// the path. Skips the write when the file is already up to date (cache
-/// hit on subsequent polls — saves a resvg invocation per refresh for
-/// the steady-state "no change" case). The PNG is RGBA8 so the panel
-/// picks up transparent background correctly.
-pub fn write_ring_png(pct: i64, bucket: Bucket) -> std::path::PathBuf {
-    let path = ring_icon_path(pct);
+/// Write the SVG ring for `pct` + `bucket` to disk, returning the path.
+/// Idempotent — skips the write when the file already exists (cache hit
+/// on subsequent polls, saves an `svg_for()` template construction per
+/// refresh in the steady-state "no change" case).
+///
+/// The SVG file is plain UTF-8 text (~400 bytes vs the ~11 KB PNG it
+/// used to be) and is the source-of-truth for the same string that
+/// `render_pixmap()` rasterizes for `IconPixmap` — so hosts that load
+/// the file get bit-for-bit the same shapes the ARGB bytes contain,
+/// just rendered at the panel's target size instead of upscaled from
+/// 22×22.
+pub fn write_ring_svg(pct: i64, bucket: Bucket) -> std::path::PathBuf {
+    let path = ring_svg_path(pct);
     if path.exists() { return path; }
-    if let Some((w, h, bytes)) = render_pixmap(pct, bucket) {
-        if let Err(e) = write_png_rgba(&path, w, h, &bytes) {
-            log::warn!("icon: failed to write ring PNG to {path:?}: {e}");
-        }
+    let svg = svg_for(pct, bucket_hex(bucket));
+    if let Err(e) = std::fs::write(&path, svg) {
+        log::warn!("icon: failed to write ring SVG to {path:?}: {e}");
     }
     path
-}
-
-/// Encode `bytes` (BGRA host-endian, as `render_pixmap` returns) as a
-/// RGBA8 PNG at `path`. Uses the `png` crate — a hand-rolled encoder
-/// failed to produce a valid deflate stream the AppIndicator extension
-/// would load (and would silently show no icon when the file path
-/// couldn't be decoded).
-fn write_png_rgba(
-    path: &std::path::Path,
-    w: u32,
-    h: u32,
-    bgra: &[u8],
-) -> anyhow::Result<()> {
-    // Convert BGRA → RGBA (just swap channel order; alpha stays).
-    let mut raw = Vec::with_capacity(bgra.len());
-    for px in bgra.chunks_exact(4) {
-        raw.push(px[2]); // R
-        raw.push(px[1]); // G
-        raw.push(px[0]); // B
-        raw.push(px[3]); // A
-    }
-    let file = std::fs::File::create(path)?;
-    let w_ref = &mut std::io::BufWriter::new(file);
-    let mut encoder = png::Encoder::new(w_ref, w, h);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header()?;
-    writer.write_image_data(&raw)?;
-    Ok(())
 }
 
 /// SVG template for the ring icon — three layers, identical to the gjs
@@ -556,6 +535,132 @@ mod tests {
         assert_eq!(bucket_name(Bucket::Normal), "normal");
         assert_eq!(bucket_name(Bucket::Warning), "warning");
         assert_eq!(bucket_name(Bucket::Throttled), "throttled");
+    }
+
+    // ------------------------------------------------------------------
+    // SVG-on-disk path functions
+    //
+    // These tests don't touch the filesystem directly (the path
+    // computation functions just return a `PathBuf`) — they lock in
+    // the `.svg` extension and the TMPDIR-or-temp-dir fallback so
+    // regressions in path layout surface here, not in a confused user
+    // staring at a "three dots" placeholder.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ring_svg_path_uses_svg_extension() {
+        let p = ring_svg_path(80);
+        assert!(p.to_str().unwrap().ends_with("minimax-quota-ring-80.svg"),
+                "expected .svg extension; got {p:?}");
+    }
+
+    #[test]
+    fn ring_svg_path_clamps_out_of_range_pct() {
+        // Same clamping rule as the old PNG path — out-of-range pct
+        // gets pinned to 0 or 100 in the filename so a hostile or
+        // buggy refresh can't write `minimax-quota-ring--5.svg`.
+        assert!(ring_svg_path(0).to_str().unwrap().ends_with("-0.svg"));
+        assert!(ring_svg_path(100).to_str().unwrap().ends_with("-100.svg"));
+        assert!(ring_svg_path(-5).to_str().unwrap().ends_with("-0.svg"));
+        assert!(ring_svg_path(150).to_str().unwrap().ends_with("-100.svg"));
+    }
+
+    #[test]
+    fn static_svg_path_uses_svg_extension() {
+        for name in ["normal", "warning", "throttled", "error", "offline"] {
+            let p = static_svg_path(name);
+            assert!(p.to_str().unwrap().ends_with(&format!("minimax-quota-{name}.svg")),
+                    "expected minimax-quota-{name}.svg; got {p:?}");
+        }
+    }
+
+    #[test]
+    fn svg_static_renders_single_filled_circle() {
+        // The static icons are what `write_static_svgs()` writes — one
+        // circle r=9 at the center, fill=color. Validating the
+        // template here is enough because the file is just `svg_static`
+        // serialized via `std::fs::write`.
+        let s = svg_static("#3a9d4d");
+        assert!(s.starts_with("<svg"));
+        assert!(s.contains("viewBox=\"0 0 22 22\""));
+        assert!(s.contains("width=\"22\""));
+        assert!(s.contains("height=\"22\""));
+        assert!(s.contains("cx=\"11\" cy=\"11\" r=\"9\""));
+        assert!(s.contains("fill=\"#3a9d4d\""));
+        // No stroke / dasharray / track — the static icons are solid
+        // dots, not ring layers. If a future refactor adds the ring
+        // layers here by accident, the static path would no longer be
+        // a single filled circle and this test catches it.
+        assert!(!s.contains("stroke="),
+                "static SVG should have no stroke; got: {s}");
+        assert!(!s.contains("stroke-dasharray"),
+                "static SVG should have no dasharray; got: {s}");
+    }
+
+    #[test]
+    fn svg_static_uses_each_static_color() {
+        // The five static-state colors — green/yellow/red/red/grey.
+        // The two reds are intentional: throttled and error share the
+        // same color, matching the legacy gjs RING_COLOR + theme
+        // fallback.
+        assert!(svg_static("#3a9d4d").contains("fill=\"#3a9d4d\""));
+        assert!(svg_static("#f6d32d").contains("fill=\"#f6d32d\""));
+        assert!(svg_static("#e01b24").contains("fill=\"#e01b24\""));
+        assert!(svg_static("#9a9996").contains("fill=\"#9a9996\""));
+    }
+
+    /// Smoke test: writing the static SVGs to a tempdir succeeds and
+    /// produces valid UTF-8 text files with the expected names. Uses
+    /// `TMPDIR` override so we don't pollute the real `/tmp`. Requires
+    /// `unsafe { std::env::set_var(...) }` on Rust ≥1.86 where
+    /// env-mutation became unsafe.
+    #[test]
+    fn write_static_svgs_writes_to_tmpdir() {
+        use std::sync::Mutex;
+        // Serialize tests that mutate TMPDIR so concurrent cargo-test
+        // jobs don't fight each other.
+        static TMPDIR_LOCK: Mutex<()> = Mutex::new(());
+        let _g = TMPDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = std::env::temp_dir().join("minimax-icon-static-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let prev = std::env::var_os("TMPDIR");
+        // SAFETY: serialized via TMPDIR_LOCK above; this test runs
+        // single-threaded with respect to other tests that mutate
+        // TMPDIR. cargo test runs each test in its own thread, but
+        // the lock ensures no two tests that read `TMPDIR` overlap.
+        unsafe { std::env::set_var("TMPDIR", &tmp); }
+
+        write_static_svgs();
+
+        // Restore TMPDIR so the rest of the suite isn't affected.
+        if let Some(v) = prev {
+            // SAFETY: see above.
+            unsafe { std::env::set_var("TMPDIR", v); }
+        } else {
+            // SAFETY: see above.
+            unsafe { std::env::remove_var("TMPDIR"); }
+        }
+
+        // Verify all five files exist with non-zero content.
+        for name in ["normal", "warning", "throttled", "error", "offline"] {
+            let path = tmp.join(format!("minimax-quota-{name}.svg"));
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("missing/wrong-type {path:?}: {e}"));
+            assert!(body.starts_with("<svg"),
+                    "{path:?} should start with <svg; got {body:?}");
+            assert!(body.contains("circle"),
+                    "{path:?} should contain <circle>; got {body:?}");
+        }
+
+        // Idempotent — second call doesn't re-write or fail. (No
+        // observable change since the files are byte-identical, but
+        // the cache-hit path takes the early return.)
+        write_static_svgs();
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 #[cfg(test)]

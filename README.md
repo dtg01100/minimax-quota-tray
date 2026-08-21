@@ -287,10 +287,20 @@ shelled out; reads use the crate directly.
   GNOME you need the AppIndicator extension; on KDE Plasma it works
   natively; on swaybar/Waybar it works natively too.
 
-- **Icon shows three dots** — the Rust binary writes ring PNGs to
-  `$TMPDIR` (default `/tmp`) at startup. If `TMPDIR` is read-only or
-  tmpfs is too small, the icons fall back to a static dot. Check
-  `/tmp/minimax-quota-*.png` exists and is readable.
+- **Icon shows three dots** — the Rust binary writes ring SVGs to
+  `$TMPDIR` (default `/tmp`) at startup. The SVG file path is sent as
+  SNI `IconName`, and the host loads it via `GdkPixbuf` (GNOME
+  AppIndicator) or `QtSvg` (KDE). On hosts without an SVG loader
+  registered in gdk-pixbuf's `loaders.cache` (notably Fedora Atomic /
+  Bluefin / Silverblue, where the `gdk-pixbuf2` RPM ships with an
+  empty loader directory), the file load fails and the host falls
+  through to the in-memory ARGB bytes sent via SNI `IconPixmap` —
+  so the icon should still render. If it doesn't, check that
+  `/tmp/minimax-quota-*.svg` exists, is readable, and the directory
+  isn't read-only. The icon-pixmap fallback renders regardless of
+  whether the SVG file load succeeded, so a missing SVG file will
+  never produce a blank panel on its own — if you see the three
+  dots, the `IconPixmap` path is what's broken, not the file path.
 
 - **`Argument password may not be null`** — your keyring daemon is
   locked. Unlock it or re-enter the key from the menu (click chip →

@@ -133,12 +133,13 @@ async fn run() -> Result<()> {
     let tray = Arc::new(
         Tray::new(dashboard_url).await.context("create SNI tray")?);
 
-    // Rasterize the static SVG icons into PNGs in ${TMPDIR} once at
-    // startup so the AppIndicator extension can load them as file
-    // paths (which works on this Fedora install) rather than theme
-    // names (which don't resolve because ~/.local/share/icons
-    // isn't on XDG_DATA_DIRS).
-    icon::rasterize_static_icons();
+    // Write the static SVG icons into ${TMPDIR} once at startup so the
+    // SNI host can load them as `IconName` file paths. Hosts with
+    // SVG support (KDE/QtSvg, GNOME with libpixbufloader-svg.so
+    // registered) render the SVG natively at the panel's target size;
+    // hosts without SVG support fall through to the ARGB bytes in
+    // `IconPixmap` (rendered via Cogl), which works everywhere.
+    icon::write_static_svgs();
 
     // Run an initial render so the icon appears immediately.
     render_initial(&tray, &cfg).await;
@@ -411,10 +412,10 @@ async fn do_refresh(
 
             let icon_name: String = match bucket {
                 icon::Bucket::Normal | icon::Bucket::Warning => {
-                    icon::write_ring_png(pct, bucket).to_string_lossy().into_owned()
+                    icon::write_ring_svg(pct, bucket).to_string_lossy().into_owned()
                 }
                 icon::Bucket::Throttled => {
-                    icon::static_icon_path("throttled").to_string_lossy().into_owned()
+                    icon::static_svg_path("throttled").to_string_lossy().into_owned()
                 }
             };
             // SNI Title is empty (gjs parity — chip carries the
@@ -535,7 +536,7 @@ async fn render_initial(tray: &Arc<Tray>, cfg: &Config) {
     let tip = format!("{cfg_label}");
     let _ = tray.update(
         "",
-        &icon::static_icon_path("normal").to_string_lossy(),
+        &icon::static_svg_path("normal").to_string_lossy(),
         "Active",
         None,
         &tip,
@@ -554,7 +555,7 @@ async fn render_error(tray: &Arc<Tray>, cfg: &Config, msg: &str) {
     let tip = format!("{cfg_label} — stale data");
     let _ = tray.update(
         "",
-        &icon::static_icon_path("error").to_string_lossy(),
+        &icon::static_svg_path("error").to_string_lossy(),
         "Active",
         None,
         &tip,
@@ -603,7 +604,7 @@ async fn render_error_with_stale(
     // Icon selection: mirror gjs bucket-for-chip priority order.
     let (icon_name, pixmap) = match (five_h, weekly) {
         (Some(w), _) if w.remaining_pct <= 0 => {
-            (icon::static_icon_path("throttled").to_string_lossy().into_owned(), None)
+            (icon::static_svg_path("throttled").to_string_lossy().into_owned(), None)
         }
         (Some(w), _) => {
             // Stale but not throttled — show the ring at the last
@@ -612,13 +613,13 @@ async fn render_error_with_stale(
             let bucket = icon::bucket_for(w.remaining_pct, false,
                                           cfg.thresholds.yellow, cfg.thresholds.red,
                                           None);
-            let path = icon::write_ring_png(w.remaining_pct, bucket)
+            let path = icon::write_ring_svg(w.remaining_pct, bucket)
                 .to_string_lossy().into_owned();
             let pix = icon::render_pixmap(w.remaining_pct, bucket);
             (path, pix)
         }
         _ => {
-            (icon::static_icon_path("error").to_string_lossy().into_owned(), None)
+            (icon::static_svg_path("error").to_string_lossy().into_owned(), None)
         }
     };
 
@@ -657,7 +658,7 @@ async fn render_out_of_menu(tray: &Arc<Tray>, cfg: &Config, offline: bool) {
         let tip = format!("{cfg_label} — offline");
         let _ = tray.update(
             "",
-            &icon::static_icon_path("offline").to_string_lossy(),
+            &icon::static_svg_path("offline").to_string_lossy(),
             "Active",
             None,
             &tip,

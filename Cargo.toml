@@ -34,10 +34,6 @@ thiserror = "1"
 log = "0.4"
 env_logger = "0.11"
 
-# PNG encoding for the rendered ring (so the AppIndicator extension can
-# load the file by path; the project doesn't otherwise need PNG I/O).
-png = "0.17"
-
 [dev-dependencies]
 approx = "0.5"
 serde_json = "1"

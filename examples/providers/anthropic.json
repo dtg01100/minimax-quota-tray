@@ -1,0 +1,135 @@
+{
+  "_comment1": "Anthropic instance. Tracks token usage from the admin usage endpoint.",
+  "_comment2": "Run as: llm-quota-tray --instance=anthropic",
+  "_comment3": "",
+  "_comment4": "Anthropic exposes usage via the admin org endpoint",
+  "_comment5": "/v1/organizations/usage, which requires an ADMIN API key (not",
+  "_comment6": "a regular user key). If you only have a regular user key, the",
+  "_comment7": "tray will get HTTP 403 on each poll and the chip will stay red",
+  "_comment8": "(see `error_envelope` for the failure surface).",
+  "_comment9": "",
+  "_comment10": "SHAPE FIT: requires admin key + adapter — Anthropic's response",
+  "_comment11": "exposes CONSUMPTION (input/output token counts) broken down by",
+  "_comment12": "model and bucketed by time. It does NOT expose tier limits or",
+  "_comment13": "remaining-percent. The adapter has to inject the tier limits",
+  "_comment14": "and compute the remaining-percent from known caps.",
+  "_comment15": "",
+  "_comment16": "For regular (non-admin) user keys, Anthropic exposes rate-limit",
+  "_comment17": "headers on every API response (`anthropic-ratelimit-tokens-`,",
+  "_comment18": "`anthropic-ratelimit-requests-`, `retry-after`). The tray reads",
+  "_comment19": "JSON bodies, not headers — so to use Anthropic with a non-admin",
+  "_comment20": "key, you need a small proxy that hits a known Anthropic endpoint",
+  "_comment21": "and emits the headers as JSON. See `_rate_limit_proxy` below.",
+
+  "endpoint": "https://api.anthropic.com/v1/organizations/usage",
+  "dashboard_url": "https://console.anthropic.com/settings/usage",
+  "label": "Anthropic",
+
+  "shape": {
+    "entries_path": "/data",
+    "windows": [
+      {
+        "id": "monthly",
+        "field_prefix": "bucket",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": true,
+        "_win_comment1": "Anthropic returns usage buckets keyed by `date` (YYYY-MM-DD)",
+        "_win_comment2": "and `model`. Each bucket has `uncached_input_tokens`,",
+        "_win_comment3": "`output_tokens`, `cache_creation_input_tokens`,",
+        "_win_comment4": "`cache_read_input_tokens`, and `web_search_requests`.",
+        "_win_comment5": "Sum them all for the total token count per day.",
+        "_win_comment6": "",
+        "_win_comment7": "The adapter has to know the tier's monthly cap to compute",
+        "_win_comment8": "`bucket_total_count` and `bucket_remaining_percent`."
+      }
+    ]
+  },
+
+  "ring_colors": {
+    "inner": {
+      "_inner_comment": "Anthropic brand colors — burnt orange / tan / coral red.",
+      "normal":   "#c96442",
+      "warning":  "#d97706",
+      "throttled": "#dc2626"
+    },
+    "outer": "#7c2d12"
+  },
+
+  "auth": {
+    "type": "custom",
+    "name": "x-api-key",
+    "format": "{key}",
+    "_auth_comment": "Anthropic uses x-api-key (NOT Authorization: Bearer) plus",
+    "_auth_comment2": "an anthropic-version header. The `format` field here doesn't",
+    "_auth_comment3": "support setting two headers; for production use the rate-limit",
+    "_auth_comment4": "proxy pattern below, OR extend provider.rs::AuthConfig to",
+    "_auth_comment5": "support multi-header auth."
+  },
+
+  "user_agent": "llm-quota-tray",
+
+  "refresh_seconds": 120,
+  "refresh_min_seconds": 15,
+  "refresh_max_backoff_seconds": 600,
+
+  "thresholds": {
+    "yellow": 60,
+    "red": 85
+  },
+
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true,
+    "_burn_comment": "Once an adapter injects `bucket_total_count` / `bucket_usage_count`,",
+    "_burn_comment2": "the row will show '5.2k tok/h'. The pct-only suppression still",
+    "_burn_comment3": "applies: Anthropic buckets by day, so per-poll deltas are small."
+  },
+
+  "adapter": {
+    "_rate_limit_proxy": {
+      "_note": "Alternative for non-admin keys — proxy the headers as JSON.",
+      "_note2": "Send any request to the Anthropic API; capture the response headers;",
+      "_note3": "emit them as JSON:",
+      "_shell": "curl -s -i https://api.anthropic.com/v1/messages \\",
+      "_shell2": "  -H \"x-api-key: $ANTHROPIC_KEY\" \\",
+      "_shell3": "  -H \"anthropic-version: 2023-06-01\" \\",
+      "_shell4": "  -H \"content-type: application/json\" \\",
+      "_shell5": "  -d '{\"model\":\"claude-haiku-4-5\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}' \\",
+      "_shell6": "  | awk '/^anthropic-ratelimit-tokens-remaining:/{...}' \\",
+      "_shell7": "  | jq '{data: [{",
+      "_shell8": "      bucket_total_count:        .tier_tpm,",
+      "_shell9": "      bucket_usage_count:        (.tier_tpm - .tokens_remaining),",
+      "_shell10": "      bucket_remaining_percent:  (.tokens_remaining / .tier_tpm * 100 | floor),",
+      "_shell11": "      bucket_start_time:         (now | floor),",
+      "_shell12": "      bucket_remains_time:       ((.tokens_reset - now) * 1000)",
+      "_shell13": "    }]}'",
+      "_note4": "The proxy has to know your tier's TPM to inject `bucket_total_count`."
+    },
+
+    "_admin_adapter": {
+      "_note": "For admin keys:",
+      "_shell": "curl -s -H \"x-api-key: $ANTHROPIC_KEY\" \\",
+      "_shell2": "  -H \"anthropic-version: 2023-06-01\" \\",
+      "_shell3": "  https://api.anthropic.com/v1/organizations/usage | jq '",
+      "_shell4": "  (.data | map({",
+      "_shell5": "    d: .date,",
+      "_shell6": "    total: ((.uncached_input_tokens // 0) + (.output_tokens // 0) +",
+      "_shell7": "            (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0))",
+      "_shell8": "  }) | sort_by(.d) | last) as $today | {",
+      "_shell9": "    data: [{",
+      "_shell10": "      bucket_total_count:       1000000,    # hardcode tier limit",
+      "_shell11": "      bucket_usage_count:       $today.total,",
+      "_shell12": "      bucket_remaining_percent: (((1000000 - $today.total) / 1000000 * 100) | floor),",
+      "_shell13": "      bucket_start_time:        ($today.d + \"T00:00:00Z\" | fromdate),",
+      "_shell14": "      bucket_remains_time:      (((($today.d + \"T00:00:00Z\" | fromdate) + 2592000) - now) * 1000)",
+      "_shell15": "    }]",
+      "_shell16": "  }'",
+      "_note2": "Run that as a sidecar (`socat`/`caddy` on 127.0.0.1:8088) and point",
+      "_note3": "this config's `endpoint` at it. Drop the `x-api-key` adapter in your",
+      "_note4": "sidecar — the tray can't set two headers via the JSON config alone."
+    }
+  }
+}

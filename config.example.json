@@ -42,7 +42,7 @@
       "warning":  "#f6d32d",
       "throttled": "#e01b24"
     },
-    "outer": "#3584e4"
+    "outer": "#0c8599"
   },
 
   "auth": {"type": "bearer"},

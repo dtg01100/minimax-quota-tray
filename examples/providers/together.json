@@ -1,0 +1,101 @@
+{
+  "_comment1": "Together AI instance. Tracks the credit balance for the account.",
+  "_comment2": "Run as: llm-quota-tray --instance=together",
+  "_comment3": "",
+  "_comment4": "Together's /v1/billing/credit endpoint (if exposed for your tier)",
+  "_comment5": "returns the per-account credit info. The shape varies by account",
+  "_comment6": "type (prepaid vs. monthly allowance); see SHAPE FIT below.",
+  "_comment7": "",
+  "_comment8": "SHAPE FIT: depends on tier — Together's public billing API is",
+  "_comment9": "limited. The response shape documented here is the historical",
+  "_comment10": "/v1/billing/credit shape (USD floats). For many accounts the",
+  "_comment11": "endpoint requires admin privileges; for others it's gated behind",
+  "_comment12": "the dashboard. If your account can't reach this endpoint, the",
+  "_comment13": "tray will surface 'HTTP 4xx' on each poll — switch to a",
+  "_comment14": "different endpoint or use the rate-limit-header adapter pattern.",
+  "_comment15": "",
+  "_comment16": "Response shape (prepaid / grant accounts):",
+  "_comment17": "{",
+  "_comment18": "  'object': 'credit',",
+  "_comment19": "  'total_credit':    25.00,         // USD, float",
+  "_comment20": "  'total_usage':     3.21,          // USD, float",
+  "_comment21": "  'remaining_credit': 21.79,        // USD, float (may be absent)",
+  "_comment22": "  'next_refill_at':  null           // ISO date string or null (prepaid)",
+  "_comment23": "}",
+
+  "endpoint": "https://api.together.xyz/v1/billing/credit",
+  "dashboard_url": "https://api.together.xyz/settings/billing",
+  "label": "Together",
+
+  "shape": {
+    "entries_path": "/",
+    "windows": [
+      {
+        "id": "credit",
+        "field_prefix": "credit",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": false,
+        "_win_comment1": "`credit_total_count` and `credit_usage_count` aren't in Together's",
+        "_win_comment2": "response — the fields are `total_credit` and `total_usage` (floats).",
+        "_win_comment3": "The parser truncates floats to int; for $25 / $3.21 it returns 25",
+        "_win_comment4": "and 3 (works, lossy). For sub-dollar usage it truncates to 0.",
+        "_win_comment5": "",
+        "_win_comment6": "`credit_remaining_percent` isn't returned. For prepaid accounts",
+        "_win_comment7": "set it to 100 (credit doesn't expire); for monthly grant accounts",
+        "_win_comment8": "compute it via adapter."
+      }
+    ]
+  },
+
+  "ring_colors": {
+    "inner": {
+      "_inner_comment": "Together's brand teal / cyan.",
+      "normal":   "#0d9488",
+      "warning":  "#fbbf24",
+      "throttled": "#dc2626"
+    },
+    "outer": "#0e7490"
+  },
+
+  "auth": {
+    "type": "bearer",
+    "_auth_comment": "Together accepts Bearer auth."
+  },
+
+  "user_agent": "llm-quota-tray",
+
+  "refresh_seconds": 120,
+  "refresh_min_seconds": 15,
+  "refresh_max_backoff_seconds": 600,
+
+  "thresholds": {
+    "yellow": 60,
+    "red": 85
+  },
+
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true,
+    "_burn_comment": "For prepaid credit accounts the burn rate is in $/h.",
+    "_burn_comment2": "Burn-warning projection only meaningful with a 'resets at' time."
+  },
+
+  "_adapter_example": {
+    "_note": "If you want the chip to display a meaningful percentage:",
+    "_shell": "curl -s -H \"Authorization: Bearer $TOGETHER_KEY\" \\",
+    "_shell2": "  https://api.together.xyz/v1/billing/credit | jq '. | {",
+    "_shell3": "  credit_total_count:        (.total_credit  * 100 | floor),",
+    "_shell4": "  credit_usage_count:        (.total_usage   * 100 | floor),",
+    "_shell5": "  credit_remaining_percent:  (((.total_credit - .total_usage) / .total_credit * 100) | floor),",
+    "_shell6": "  credit_start_time:         (now | floor),",
+    "_shell7": "  credit_remains_time:       2592000000    # 30d placeholder",
+    "_shell8": "}'",
+    "_note2": "",
+    "_note3": "For monthly grant accounts, replace the 30d placeholder with the",
+    "_note4": "actual days-to-reset from the dashboard, or query the response for",
+    "_note5": "`next_refill_at` and convert to a duration."
+  }
+}

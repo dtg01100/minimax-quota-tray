@@ -1,0 +1,95 @@
+{
+  "_comment1": "MiniMax (Coding Plan / Token Plan) instance.",
+  "_comment2": "Run as: llm-quota-tray --instance=minimax",
+  "_comment3": "Set key with: --set-key (one-time, stored in OS keyring).",
+  "_comment4": "",
+  "_comment5": "This is the canonical shape — the parser's contract (provider.rs +",
+  "_comment6": "parse.rs) was designed around it. The tray's tests and example menu",
+  "_comment7": "in README.md are both built from this exact shape. If you're",
+  "_comment8": "writing a new template, copy this file and edit endpoint / auth /",
+  "_comment9": "shape fields rather than starting from scratch.",
+  "_comment10": "",
+  "_comment11": "Two windows:",
+  "_comment12": "  5h     — current_interval_*   fields, sliding 5-hour window",
+  "_comment13": "  weekly — current_weekly_*     fields, calendar-week window",
+  "_comment14": "",
+  "_comment15": "Both windows track consumption via *_remaining_percent only on the",
+  "_comment16": "Coding Plan (total/usage counts are 0). Token plans expose real",
+  "_comment17": "count fields — the same template works for both; only the server",
+  "_comment18": "side differs.",
+  "_comment19": "",
+  "_comment20": "This template mirrors ../../config.example.json (the default first-",
+  "_comment21": "launch config at the project root). The two files are intentionally",
+  "_comment22": "in sync — keep them aligned if you edit one.",
+
+  "endpoint": "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
+  "dashboard_url": "https://platform.minimax.io/console/plan",
+  "label": "Coding Plan",
+
+  "shape": {
+    "entries_path": "/model_remains",
+    "windows": [
+      {
+        "id": "5h",
+        "field_prefix": "current_interval",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": false,
+        "_win_comment1": "5-hour rolling window. `current_interval_start_time` is epoch",
+        "_win_comment2": "seconds (multiplier 1000). `current_interval_remains_time` is",
+        "_win_comment3": "ms-until-reset (multiplier 1, no epoch conversion). The parser",
+        "_win_comment4": "computes reset_at = now_ms + remains_time_ms for the menu row."
+      },
+      {
+        "id": "weekly",
+        "field_prefix": "current_weekly",
+        "start_field": "weekly_start_time",
+        "reset_field": "weekly_remains_time",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": false,
+        "_win_comment1": "Calendar-week window. The server uses different field names",
+        "_win_comment2": "(`weekly_start_time`, `weekly_remains_time`) — override the",
+        "_win_comment3": "defaults via `start_field` and `reset_field`. Unit conversions",
+        "_win_comment4": "match the 5h window."
+      }
+    ],
+    "error_envelope": {
+      "code_path": "/base_resp/status_code",
+      "message_path": "/base_resp/status_msg",
+      "success_codes": [0],
+      "_env_comment": "MiniMax returns HTTP 200 with an error envelope on auth failures",
+      "_env_comment2": "and rate-limit hits. The parser surfaces these as proper errors",
+      "_env_comment3": "instead of falling through to 'payload missing entry'."
+    }
+  },
+
+  "ring_colors": {
+    "inner": {
+      "normal":   "#3a9d4d",
+      "warning":  "#f6d32d",
+      "throttled": "#e01b24"
+    },
+    "outer": "#0c8599"
+  },
+
+  "auth": {"type": "bearer"},
+
+  "user_agent": "llm-quota-tray",
+
+  "refresh_seconds": 120,
+  "refresh_min_seconds": 15,
+  "refresh_max_backoff_seconds": 600,
+
+  "thresholds": {
+    "yellow": 60,
+    "red": 85
+  },
+
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true
+  }
+}

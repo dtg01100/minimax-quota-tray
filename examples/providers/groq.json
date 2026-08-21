@@ -1,0 +1,132 @@
+{
+  "_comment1": "Groq instance. Tracks rate-limit budget from response headers.",
+  "_comment2": "Run as: llm-quota-tray --instance=groq",
+  "_comment3": "",
+  "_comment4": "Groq does NOT expose a public quota or usage endpoint. Every",
+  "_comment5": "inference response carries rate-limit headers (x-ratelimit-*)",
+  "_comment6": "with the remaining token / request budget and the reset time.",
+  "_comment7": "The tray reads JSON bodies, not headers — so this template",
+  "_comment8": "needs a small proxy that emits the headers as JSON. See",
+  "_comment9": "`_rate_limit_proxy` below.",
+  "_comment10": "",
+  "_comment11": "SHAPE FIT: requires adapter — the proxy endpoint returns the",
+  "_comment12": "parser-shaped fields and the tray renders them normally.",
+  "_comment13": "",
+  "_comment14": "If you don't want to run a proxy, set this instance aside —",
+  "_comment15": "the tray will display 'HTTP 404' on each poll because /v1",
+  "_comment16": "doesn't have a quota endpoint. The error row is the only",
+  "_comment17": "thing the chip will show.",
+
+  "endpoint": "http://127.0.0.1:8088/groq/quota",
+  "_dashboard_endpoint_note": "Replace this with your sidecar's listener address. See below.",
+  "dashboard_url": "https://console.groq.com/usage",
+  "label": "Groq",
+
+  "shape": {
+    "entries_path": "/",
+    "windows": [
+      {
+        "id": "tokens",
+        "field_prefix": "tokens",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": false,
+        "_win_comment1": "The proxy injects:",
+        "_win_comment2": "  tokens_total_count:        <TPM cap, adapter-set>",
+        "_win_comment3": "  tokens_usage_count:        <TPM cap - remaining>",
+        "_win_comment4": "  tokens_remaining_percent:  <remaining / cap * 100>",
+        "_win_comment5": "  tokens_start_time:         <now - elapsed, adapter-set>",
+        "_win_comment6": "  tokens_remains_time:       <reset_time - now, in ms>",
+        "_win_comment7": "",
+        "_win_comment8": "Groq's headers: x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens,",
+        "_win_comment9": "x-ratelimit-reset-tokens (seconds until reset). The proxy maps these."
+      }
+    ]
+  },
+
+  "ring_colors": {
+    "inner": {
+      "_inner_comment": "Groq brand orange / pink.",
+      "normal":   "#f55036",
+      "warning":  "#fbbf24",
+      "throttled": "#dc2626"
+    },
+    "outer": "#7c2d12"
+  },
+
+  "auth": {
+    "type": "bearer",
+    "_auth_comment": "Bearer auth is used by the SIDE PROXY when it makes the upstream",
+    "_auth_comment2": "request to Groq. The tray itself doesn't reach Groq directly."
+  },
+
+  "user_agent": "llm-quota-tray",
+
+  "refresh_seconds": 60,
+  "refresh_min_seconds": 15,
+  "refresh_max_backoff_seconds": 600,
+  "_refresh_comment": "60s is shorter than the default — Groq's rate windows are short",
+
+  "thresholds": {
+    "yellow": 60,
+    "red": 85
+  },
+
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true
+  },
+
+  "_rate_limit_proxy": {
+    "_note": "Required — the tray can't read response headers. Run a 30-line",
+    "_note2": "sidecar that hits any Groq endpoint and rewrites the headers",
+    "_note3": "as the parser-shaped JSON. Two options:",
+    "_option_a": {
+      "_name": "Option A — socat + jq wrapper",
+      "_shell": "# Send a probe request to /v1/models; capture the headers; emit JSON.",
+      "_shell2": "# (Replace $GROQ_TPM with your tier's TPM cap — Groq publishes them",
+      "_shell3": "# per model; the proxy should know the model you're tracking.)",
+      "_shell4": "GROQ_TPM=6000",
+      "_shell5": "curl -s -i https://api.groq.com/openai/v1/models \\",
+      "_shell6": "  -H \"Authorization: Bearer $GROQ_KEY\" 2>&1 | awk -v cap=$GROQ_TPM '",
+      "_shell7": "  /^x-ratelimit-remaining-tokens:/ { rem = $2 }",
+      "_shell8": "  /^x-ratelimit-reset-tokens:/      { rst = $2 }",
+      "_shell9": "  END { printf \"{\\\"tokens_total_count\\\":%d,\\\"tokens_usage_count\\\":%d,\\\"tokens_remaining_percent\\\":%d,\\\"tokens_start_time\\\":%d,\\\"tokens_remains_time\\\":%d}\\n\",",
+      "_shell10": "            cap, cap - rem, (rem / cap * 100), systime() - rst, rst * 1000 }' ",
+      "_note": "Wrap that in a `socat`/`caddy`/`nginx` listener and point the tray",
+      "_note2": "at it."
+    },
+    "_option_b": {
+      "_name": "Option B — minimal Python proxy",
+      "_python": "#!/usr/bin/env python3",
+      "_python2": "import http.server, json, os, time, urllib.request",
+      "_python3": "GROQ_KEY = os.environ['GROQ_KEY']",
+      "_python4": "GROQ_TPM = int(os.environ.get('GROQ_TPM', '6000'))",
+      "_python5": "class Q(http.server.BaseHTTPRequestHandler):",
+      "_python6": "    def do_GET(self):",
+      "_python7": "        req = urllib.request.Request(",
+      "_python8": "            'https://api.groq.com/openai/v1/models',",
+      "_python9": "            headers={'Authorization': f'Bearer {GROQ_KEY}'})",
+      "_python10": "        r = urllib.request.urlopen(req)",
+      "_python11": "        rem = int(r.headers['x-ratelimit-remaining-tokens'])",
+      "_python12": "        rst = int(r.headers['x-ratelimit-reset-tokens'])",
+      "_python13": "        now = int(time.time())",
+      "_python14": "        body = json.dumps({",
+      "_python15": "            'tokens_total_count':       GROQ_TPM,",
+      "_python16": "            'tokens_usage_count':       GROQ_TPM - rem,",
+      "_python17": "            'tokens_remaining_percent': int(rem / GROQ_TPM * 100),",
+      "_python18": "            'tokens_start_time':        now - rst,",
+      "_python19": "            'tokens_remains_time':      rst * 1000,",
+      "_python20": "        }).encode()",
+      "_python21": "        self.send_response(200)",
+      "_python22": "        self.send_header('content-type', 'application/json')",
+      "_python23": "        self.send_header('content-length', str(len(body)))",
+      "_python24": "        self.end_headers()",
+      "_python25": "        self.wfile.write(body)",
+      "_python26": "    def log_message(self, *a): pass",
+      "_python27": "http.server.HTTPServer(('127.0.0.1', 8088), Q).serve_forever()"
+    }
+  }
+}

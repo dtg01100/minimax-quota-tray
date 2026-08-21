@@ -1,0 +1,99 @@
+{
+  "_comment1": "OpenRouter instance. Tracks the per-key USD credit usage.",
+  "_comment2": "Run as: llm-quota-tray --instance=openrouter",
+  "_comment3": "Set key with: --set-key (one-time, stored in OS keyring).",
+  "_comment4": "OpenRouter's /api/v1/key endpoint returns the credit usage, the",
+  "_comment5": "credit cap, and the remaining credit. The tray reads the JSON body,",
+  "_comment6": "so the response has to match the parser's contract (see ../README.md).",
+  "_comment7": "",
+  "_comment8": "SHAPE FIT: partial — OpenRouter returns `usage` and `limit` as floats,",
+  "_comment9": "not integers, and there is no `*_remaining_percent` field. The tray's",
+  "_comment10": "parser (parse.rs) accepts f64 and truncates to i64, so values < 1.0",
+  "_comment11": "become 0. For free-tier users (limit = $20, usage usually <$1/day)",
+  "_comment12": "this means the chip shows 0% remaining because the parser can't see",
+  "_comment13": "sub-dollar precision. A 5-line `socat` adapter can multiply the",
+  "_comment14": "float by 100 (to cents) and inject a `*_remaining_percent` field;",
+  "_comment15": "see the `adapter` example at the bottom of this file.",
+
+  "endpoint": "https://openrouter.ai/api/v1/key",
+  "dashboard_url": "https://openrouter.ai/settings/keys",
+  "label": "OpenRouter",
+
+  "shape": {
+    "entries_path": "/data",
+    "windows": [
+      {
+        "id": "credit",
+        "field_prefix": "credit",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": false,
+        "_win_comment1": "`start_time` and `remains_time` are absent on OpenRouter; the",
+        "_win_comment2": "parser falls through to 0, which means the menu row will show",
+        "_win_comment3": "'resets in <0s'. Set `reset_is_absolute_epoch: true` and override",
+        "_win_comment4": "the fields to inject real values via an adapter if you need them."
+      }
+    ]
+  },
+
+  "ring_colors": {
+    "inner": {
+      "_inner_comment": "OpenRouter brand colors (deep blue → cyan → amber) chosen",
+      "_inner_comment2": "to stay readable on light and dark panels without colliding",
+      "_inner_comment3": "with the GNOME blue outer accent.",
+      "normal":   "#3b82f6",
+      "warning":  "#06b6d4",
+      "throttled": "#e01b24"
+    },
+    "outer": "#1e293b"
+  },
+
+  "auth": {
+    "type": "bearer",
+    "_auth_comment": "OpenRouter accepts Bearer auth. The key is sent as-is."
+  },
+
+  "user_agent": "llm-quota-tray",
+
+  "refresh_seconds": 120,
+  "refresh_min_seconds": 15,
+  "refresh_max_backoff_seconds": 600,
+
+  "thresholds": {
+    "yellow": 60,
+    "red": 85,
+    "_thr_comment": "Triggers are based on `*_remaining_percent` (clamped 0-100).",
+    "_thr_comment2": "Yellow at 60% remaining used (40% remaining), red at 85% used (15% remaining)."
+  },
+
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true,
+    "_burn_comment": "For credit-based accounts, the burn rate is in $/(window).",
+    "_burn_comment2": "If your adapter scales usage to cents, the row will show '12c/h'."
+  },
+
+  "_adapter_example": {
+    "_note": "Optional — only needed if you want the chip to display a meaningful",
+    "_note2": "percentage. Pipe the upstream response through `jq` to inject the",
+    "_note3": "fields the parser expects. Example shell pipeline:",
+    "_note4": "",
+    "_shell": "curl -s -H \"Authorization: Bearer $OPENROUTER_KEY\" \\",
+    "_shell2": "  https://openrouter.ai/api/v1/key | jq '.data | . as $d | {",
+    "_shell3": "    credit_total_count: (.limit * 100 | floor),",
+    "_shell4": "    credit_usage_count: (.usage * 100 | floor),",
+    "_shell5": "    credit_remaining_percent: (((.limit - .usage) / .limit) * 100 | floor),",
+    "_shell6": "    credit_start_time: (now | floor),",
+    "_shell7": "    credit_remains_time: 2592000000  # ~30d placeholder",
+    "_shell8": "  } | {data: .}'",
+    "_note5": "",
+    "_note6": "Run that as a sidecar (e.g. behind a `socat`/`caddy` listener on",
+    "_note7": "127.0.0.1:8088) and point this config's `endpoint` at it.",
+    "_note8": "",
+    "_note9": "If you don't run an adapter, the chip will show 0% (the parser falls",
+    "_note10": "through to 0 when `*_remaining_percent` is absent). The menu row",
+    "_note11": "still works — it shows 'credit: 0 / 20 left', reflecting the truncation."
+  }
+}

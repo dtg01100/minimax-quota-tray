@@ -434,4 +434,77 @@ mod tests {
         std::env::remove_var("HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    /// Walk every `*.json` file under `examples/providers/` and
+    /// deserialize each as a `Config`. Catches typos and schema drift
+    /// in the templates at `cargo test` time rather than at tray
+    /// runtime. The templates are allowed to contain extra
+    /// `_comment*` / `_win_comment*` / `_adapter_example` keys —
+    /// those are silently ignored (the `Config` types don't use
+    /// `deny_unknown_fields`).
+    #[test]
+    fn provider_templates_deserialize() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/providers");
+        assert!(dir.is_dir(),
+                "examples/providers/ should exist next to Cargo.toml \
+                 — got {}", dir.display());
+
+        let mut found_any = false;
+        let mut errors: Vec<String> = Vec::new();
+
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read_dir(examples/providers)")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        entries.sort_by_key(|e| e.path());
+
+        for entry in entries {
+            found_any = true;
+            let path = entry.path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => { errors.push(format!("{name}: read error: {e}")); continue; }
+            };
+            let cfg: Config = match serde_json::from_slice(&bytes) {
+                Ok(c) => c,
+                Err(e) => { errors.push(format!("{name}: parse error: {e}")); continue; }
+            };
+
+            // Required fields a template is expected to populate.
+            // Empty values usually mean the template was started from
+            // a partial scaffold and never finished.
+            if cfg.endpoint.trim().is_empty() {
+                errors.push(format!("{name}: endpoint is empty"));
+            }
+            if cfg.label.trim().is_empty() {
+                errors.push(format!("{name}: label is empty"));
+            }
+            if cfg.shape.windows.is_empty() {
+                errors.push(format!("{name}: shape has no windows"));
+            }
+            for w in &cfg.shape.windows {
+                if w.id.trim().is_empty() {
+                    errors.push(format!("{name}: window has empty id"));
+                }
+                if w.field_prefix.trim().is_empty() {
+                    errors.push(format!("{name}: window {} has empty field_prefix",
+                                        w.id));
+                }
+            }
+            // 0 means 'never poll' — almost certainly a typo.
+            if cfg.refresh_seconds == 0 {
+                errors.push(format!("{name}: refresh_seconds is 0"));
+            }
+        }
+
+        assert!(found_any,
+                "no .json templates found under {}", dir.display());
+        if !errors.is_empty() {
+            panic!("provider template validation failed:\n  - {}",
+                   errors.join("\n  - "));
+        }
+    }
 }

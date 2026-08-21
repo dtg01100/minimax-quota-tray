@@ -1,0 +1,112 @@
+{
+  "_comment1": "Google AI Studio (Gemini API) instance.",
+  "_comment2": "Run as: llm-quota-tray --instance=gemini",
+  "_comment3": "",
+  "_comment4": "Google AI Studio's free tier exposes rate limits (RPM/RPD) on",
+  "_comment5": "429 responses, NOT a public quota endpoint. The only programmatic",
+  "_comment6": "quota signal is from Cloud Monitoring for paid (Vertex) accounts.",
+  "_comment7": "This template documents both paths and provides a sidecar-based",
+  "_comment8": "approach for both.",
+  "_comment9": "",
+  "_comment10": "SHAPE FIT: requires adapter — Gemini doesn't expose quota JSON.",
+  "_comment11": "Use one of:",
+  "_comment12": "  (a) For paid (Vertex AI / Cloud): query Cloud Monitoring's time",
+  "_comment13": "      series API for the 'aiplatform.googleapis.com/quota/*' metrics.",
+  "_comment14": "  (b) For free tier: poll a known endpoint, watch for 429 responses,",
+  "_comment15": "      and emit the rate-limit headers as JSON via a proxy.",
+  "_comment16": "  (c) For the API key itself: Google Cloud's IAM endpoint",
+  "_comment17": "      `https://apikeys.googleapis.com/v2/projects/*/locations/*/keys/*`",
+  "_comment18": "      returns the key metadata, but not the quota usage.",
+  "_comment19": "",
+  "_comment20": "Without an adapter, the tray will display 'HTTP 404' on each poll",
+
+  "endpoint": "http://127.0.0.1:8088/gemini/quota",
+  "_dashboard_endpoint_note": "Replace with your sidecar's listener address. See below.",
+  "dashboard_url": "https://aistudio.google.com/apikey",
+  "label": "Gemini",
+
+  "shape": {
+    "entries_path": "/",
+    "windows": [
+      {
+        "id": "rpm",
+        "field_prefix": "rpm",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": false,
+        "_win_comment1": "Adapter injects (for RPM/RPD tracking):",
+        "_win_comment2": "  rpm_total_count:        <RPM cap, adapter-set>",
+        "_win_comment3": "  rpm_usage_count:        <RPM cap - remaining>",
+        "_win_comment4": "  rpm_remaining_percent:  <remaining / cap * 100>",
+        "_win_comment5": "  rpm_start_time:         <now - elapsed>",
+        "_win_comment6": "  rpm_remains_time:       <reset_time - now, in ms>"
+      }
+    ]
+  },
+
+  "ring_colors": {
+    "inner": {
+      "_inner_comment": "Google brand blue palette — clean and recognizable.",
+      "normal":   "#4285f4",
+      "warning":  "#fbbc04",
+      "throttled": "#ea4335"
+    },
+    "outer": "#34a853"
+  },
+
+  "auth": {
+    "type": "header",
+    "name": "x-goog-api-key",
+    "_auth_comment": "The SIDE PROXY uses this header. The tray itself doesn't reach",
+    "_auth_comment2": "Google's API directly when running against a sidecar."
+  },
+
+  "user_agent": "llm-quota-tray",
+
+  "refresh_seconds": 60,
+  "refresh_min_seconds": 15,
+  "refresh_max_backoff_seconds": 600,
+  "_refresh_comment": "60s — Gemini's free tier RPM limits are tight (e.g., 15/min).",
+
+  "thresholds": {
+    "yellow": 60,
+    "red": 85
+  },
+
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true
+  },
+
+  "_adapter_options": {
+    "_option_a_vertex": {
+      "_name": "Option A — Vertex AI (paid tier via Google Cloud Monitoring)",
+      "_shell": "# Vertex exposes per-region per-model quota usage through",
+      "_shell2": "# Cloud Monitoring. Query the 'aiplatform.googleapis.com/quota/",
+      "_shell3": "# online_quota_used' time series:",
+      "_shell4": "gcloud monitoring time-series list \\",
+      "_shell5": "  --project=$GCP_PROJECT \\",
+      "_shell6": "  --filter='metric.type=\"aiplatform.googleapis.com/quota/online_quota_used\"' \\",
+      "_shell7": "  --format=json | jq '...'",
+      "_note": "Wrap the gcloud output in a sidecar that emits the parser-shaped",
+      "_note2": "JSON. Non-trivial — this is only worth doing for paid accounts."
+    },
+    "_option_b_proxy": {
+      "_name": "Option B — Free tier sidecar (probe /v1/models, capture headers)",
+      "_shell": "curl -s -i \\",
+      "_shell2": "  'https://generativelanguage.googleapis.com/v1/models?key=$GEMINI_KEY' \\",
+      "_shell3": "  | awk '",
+      "_shell4": "    /^x-ratelimit-remaining:/{ rem = $2 }",
+      "_shell5": "    /^x-ratelimit-limit:/{     cap = $2 }",
+      "_shell6": "    /^x-ratelimit-reset:/{     rst = $2 }",
+      "_shell7": "    END { printf \"{\\\"rpm_total_count\\\":%d,\\\"rpm_usage_count\\\":%d,\\\"rpm_remaining_percent\\\":%d,\\\"rpm_start_time\\\":%d,\\\"rpm_remains_time\\\":%d}\\n\",",
+      "_shell8": "              cap, cap - rem, (rem / cap * 100), systime() - rst, rst * 1000 }'",
+      "_note": "Gemini's response headers vary by model and endpoint; verify the",
+      "_note2": "exact header names by hitting /v1/models with curl -i. If the",
+      "_note3": "headers are absent, the proxy can't track quota — fall back to",
+      "_note4": "Vertex / Cloud Monitoring for paid accounts."
+    }
+  }
+}

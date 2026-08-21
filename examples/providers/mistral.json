@@ -1,0 +1,109 @@
+{
+  "_comment1": "Mistral AI instance. Tracks the daily token usage.",
+  "_comment2": "Run as: llm-quota-tray --instance=mistral",
+  "_comment3": "",
+  "_comment4": "Mistral's /v1/usage endpoint returns a paginated set of daily",
+  "_comment5": "usage buckets in `data[]`. Each bucket has `timestamp` (epoch sec),",
+  "_comment6": "`n_requests`, `prompt_tokens`, `completion_tokens`, and a few",
+  "_comment7": "aggregates. There is no `*_remaining_percent` field — Mistral",
+  "_comment8": "exposes consumption, not remaining. See SHAPE FIT below.",
+  "_comment9": "",
+  "_comment10": "SHAPE FIT: partial — `data[]` is a LIST of daily buckets. The tray",
+  "_comment11": "reads entry[0], so it tracks TODAY's usage. The chip will show 0%",
+  "_comment12": "remaining unless an adapter injects a `*_remaining_percent` field.",
+  "_comment13": "Tokens-per-day limits depend on the user's tier and aren't returned",
+  "_comment14": "by the API, so the adapter has to know the tier limit.",
+
+  "endpoint": "https://api.mistral.ai/v1/usage",
+  "dashboard_url": "https://console.mistral.ai/usage",
+  "label": "Mistral",
+
+  "shape": {
+    "entries_path": "/data",
+    "windows": [
+      {
+        "id": "daily",
+        "field_prefix": "bucket",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": true,
+        "_win_comment1": "`bucket_total_count` and `bucket_usage_count` aren't in Mistral's",
+        "_win_comment2": "response — the fields are `prompt_tokens`, `completion_tokens`,",
+        "_win_comment3": "and `n_requests`. Without an adapter the tray shows 0 / 0.",
+        "_win_comment4": "",
+        "_win_comment5": "`bucket_start_time` is mapped from `timestamp` (epoch sec).",
+        "_win_comment6": "`bucket_remains_time` is set to a placeholder; `reset_is_absolute_epoch`",
+        "_win_comment7": "doesn't apply (no reset timestamp on usage buckets — they're daily",
+        "_win_comment8": "buckets that the calendar resets)."
+      }
+    ]
+  },
+
+  "ring_colors": {
+    "inner": {
+      "_inner_comment": "Mistral brand orange / amber palette.",
+      "normal":   "#f97316",
+      "warning":  "#fbbf24",
+      "throttled": "#dc2626"
+    },
+    "outer": "#7c2d12"
+  },
+
+  "auth": {
+    "type": "bearer",
+    "_auth_comment": "Mistral accepts Bearer auth. The key is sent as-is."
+  },
+
+  "user_agent": "llm-quota-tray",
+
+  "refresh_seconds": 120,
+  "refresh_min_seconds": 15,
+  "refresh_max_backoff_seconds": 600,
+
+  "thresholds": {
+    "yellow": 60,
+    "red": 85
+  },
+
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true,
+    "_burn_comment": "Once an adapter injects `bucket_usage_count` and `bucket_total_count`,",
+    "_burn_comment2": "the burn rate is in tokens/h. Without an adapter the row is suppressed",
+    "_burn_comment3": "(used=0, total=0 → no signal)."
+  },
+
+  "_adapter_example": {
+    "_note": "Mistral's response:",
+    "_shape": "{",
+    "_shape2": "  'data': [{",
+    "_shape3": "    'timestamp': 1720747200,             // epoch SECONDS",
+    "_shape4": "    'n_requests': 13,",
+    "_shape5": "    'prompt_tokens': 1000,",
+    "_shape6": "    'completion_tokens': 500,",
+    "_shape7": "    'total_tokens': 1500,                // NOT in the response — the",
+    "_shape8": "                                            // adapter has to know your",
+    "_shape9": "                                            // tier's daily token cap.",
+    "_shape10": "    'tier_limit': 1000000                // ADAPTER INJECTS",
+    "_shape11": "  }, ...]",
+    "_shape12": "  'object': 'list',",
+    "_shape13": "  'has_more': false",
+    "_shape14": "}",
+    "_note2": "Adapter pipeline (jq, run as a sidecar):",
+    "_shell": "curl -s -H \"Authorization: Bearer $MISTRAL_KEY\" \\",
+    "_shell2": "  https://api.mistral.ai/v1/usage | jq '.data[0] | . as $d | {",
+    "_shell3": "  bucket_total_count:       1000000,    # hardcode your tier limit",
+    "_shell4": "  bucket_usage_count:       $d.total_tokens,",
+    "_shell5": "  bucket_remaining_percent: (((1000000 - $d.total_tokens) / 1000000) * 100 | floor),",
+    "_shell6": "  bucket_start_time:        $d.timestamp,",
+    "_shell7": "  bucket_remains_time:      (((($d.timestamp + 86400) - (now | floor))))",
+    "_shell8": "} | {data: [.]} | .data[0] |= . + {timestamp: $d.timestamp}'",
+    "_note3": "",
+    "_note4": "Without an adapter, the tray still launches cleanly — it just shows",
+    "_note5": "0 / 0 and 0% because the parser sees zeros for the unmapped fields.",
+    "_note6": "The menu row's 'resets in <X>' will be wrong (because remains_time",
+    "_note7": "is also missing) but the tray won't crash."
+  }
+}

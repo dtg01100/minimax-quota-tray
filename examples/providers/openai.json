@@ -1,0 +1,109 @@
+{
+  "_comment1": "OpenAI instance. Tracks the daily token usage for the account.",
+  "_comment2": "Run as: llm-quota-tray --instance=openai",
+  "_comment3": "",
+  "_comment4": "OpenAI's /v1/usage endpoint returns paginated daily usage buckets",
+  "_comment5": "with prompt and completion token counts. The array is sorted by",
+  "_comment6": "`aggregation_timestamp` ascending; entry[0] is OLDEST in the page.",
+  "_comment7": "To track today's usage, use the LAST entry of the most recent day",
+  "_comment8": "— the tray reads entry[0], so the adapter has to sort desc and",
+  "_comment9": "put today first. See the adapter at the bottom of this file.",
+  "_comment10": "",
+  "_comment11": "SHAPE FIT: requires adapter — OpenAI's response does NOT contain",
+  "_comment12": "`*_total_count`, `*_usage_count`, or `*_remaining_percent`. It has",
+  "_comment13": "`n_context_tokens_total`, `n_generated_tokens_total`, and",
+  "_comment14": "`aggregation_timestamp` per daily bucket. Tier limits (RPM/TPM)",
+  "_comment15": "are not returned by the API; the adapter has to inject them.",
+  "_comment16": "",
+  "_comment17": "There is also /v1/organization/usage for admin keys; that returns",
+  "_comment18": "an aggregated set of buckets broken down by model + project. Use",
+  "_comment19": "it instead of /v1/usage if you have an admin key.",
+
+  "endpoint": "https://api.openai.com/v1/usage",
+  "dashboard_url": "https://platform.openai.com/usage",
+  "label": "OpenAI",
+
+  "shape": {
+    "entries_path": "/data",
+    "windows": [
+      {
+        "id": "daily",
+        "field_prefix": "bucket",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": true,
+        "_win_comment1": "OpenAI buckets expose `aggregation_timestamp` (epoch sec),",
+        "_win_comment2": "`n_context_tokens_total`, and `n_generated_tokens_total` per day.",
+        "_win_comment3": "Map `bucket_start_time` ← `aggregation_timestamp` (multiplier 1000).",
+        "_win_comment4": "Map `bucket_total_count` ← tier's daily token cap (adapter-injected).",
+        "_win_comment5": "Map `bucket_usage_count` ← `n_context_tokens_total + n_generated_tokens_total`.",
+        "_win_comment6": "Compute `bucket_remaining_percent` from the two above."
+      }
+    ]
+  },
+
+  "ring_colors": {
+    "inner": {
+      "_inner_comment": "OpenAI brand teal-green.",
+      "normal":   "#10a37f",
+      "warning":  "#fbbf24",
+      "throttled": "#dc2626"
+    },
+    "outer": "#0f766e"
+  },
+
+  "auth": {
+    "type": "bearer",
+    "_auth_comment": "OpenAI accepts Bearer auth. For /v1/usage the key needs to be",
+    "_auth_comment2": "a USER key with usage read scope; for /v1/organization/usage",
+    "_auth_comment3": "use an ADMIN key."
+  },
+
+  "user_agent": "llm-quota-tray",
+
+  "refresh_seconds": 120,
+  "refresh_min_seconds": 15,
+  "refresh_max_backoff_seconds": 600,
+
+  "thresholds": {
+    "yellow": 60,
+    "red": 85
+  },
+
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true,
+    "_burn_comment": "Once an adapter injects `bucket_total_count` / `bucket_usage_count`,",
+    "_burn_comment2": "the row will show '12.4k tok/h'. The pct-only suppression still",
+    "_burn_comment3": "applies: if `bucket_usage_count` doesn't move between polls (token",
+    "_burn_comment4": "buckets are daily, not per-minute), the row is suppressed."
+  },
+
+  "_adapter_example": {
+    "_note": "Required for the chip to show a meaningful percentage. Pipe the",
+    "_note2": "upstream response through jq to convert daily buckets to the tray's",
+    "_note3": "expected fields. Assumes tier1 limits (60k TPM, no daily cap):",
+    "_shell": "TIER_TPM=600000",
+    "_shell2": "curl -s -H \"Authorization: Bearer $OPENAI_KEY\" \\",
+    "_shell3": "  https://api.openai.com/v1/usage | jq --argjson cap $TIER_TPM '",
+    "_shell4": "  (.data | last) as $d | {",
+    "_shell5": "    data: [{",
+    "_shell6": "      bucket_total_count:       $cap,",
+    "_shell7": "      bucket_usage_count:       ($d.n_context_tokens_total + $d.n_generated_tokens_total),",
+    "_shell8": "      bucket_remaining_percent: ((($cap - ($d.n_context_tokens_total + $d.n_generated_tokens_total)) / $cap * 100) | floor),",
+    "_shell9": "      bucket_start_time:        $d.aggregation_timestamp,",
+    "_shell10": "      bucket_remains_time:      ((86400 - (($d.aggregation_timestamp % 86400))) * 1000)",
+    "_shell11": "    }]",
+    "_shell12": "  }'",
+    "_note4": "",
+    "_note5": "Run that as a sidecar (`socat` or `caddy` listening on 127.0.0.1:8088)",
+    "_note6": "and change `endpoint` to `http://127.0.0.1:8088/usage`.",
+    "_note7": "",
+    "_note8": "ALTERNATIVE: skip the JSON-shape adapter and instead poll an arbitrary",
+    "_note9": "endpoint (e.g. one of yours) that returns the parser's shape. The tray",
+    "_note10": "is happy with any endpoint that matches the contract — see provider.rs",
+    "_note11": "for the field-by-field contract."
+  }
+}

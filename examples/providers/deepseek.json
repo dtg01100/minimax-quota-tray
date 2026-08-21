@@ -1,0 +1,90 @@
+{
+  "_comment1": "DeepSeek instance. Tracks the per-account CNY balance.",
+  "_comment2": "Run as: llm-quota-tray --instance=deepseek",
+  "_comment3": "",
+  "_comment4": "DeepSeek's /user/balance endpoint returns an array of currency",
+  "_comment5": "balances. The CNY entry is what prepaid accounts care about; the",
+  "_comment6": "array element at index 0 is what the tray reads.",
+  "_comment7": "",
+  "_comment8": "SHAPE FIT: partial — DeepSeek returns balance as a STRING",
+  "_comment9": "('total_balance': '104.86'), not an integer. The parser's num()",
+  "_comment10": "falls back to f64→i64 truncation; for string fields it returns 0.",
+  "_comment11": "That means the parser sees 0 CNY for both used and total, so the",
+  "_comment12": "menu row will show '0 / 0 left' and the chip will show 0%.",
+  "_comment13": "A 5-line jq adapter rewrites the string to a number (see below).",
+
+  "endpoint": "https://api.deepseek.com/user/balance",
+  "dashboard_url": "https://platform.deepseek.com/usage",
+  "label": "DeepSeek",
+
+  "shape": {
+    "entries_path": "/balance_infos",
+    "windows": [
+      {
+        "id": "balance",
+        "field_prefix": "balance",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": false,
+        "_win_comment1": "DeepSeek's response doesn't expose start/reset timestamps for",
+        "_win_comment2": "the balance (prepaid credits don't expire until used). The",
+        "_win_comment3": "parser falls through to 0 for both, so the menu row will show",
+        "_win_comment4": "'balance: X / Y left, resets in <0s'. Acceptable for prepaid",
+        "_win_comment5": "credit accounts where 'resets' isn't meaningful."
+      }
+    ]
+  },
+
+  "ring_colors": {
+    "inner": {
+      "_inner_comment": "DeepSeek brand-aligned blues with a coral red for throttled.",
+      "normal":   "#1d4ed8",
+      "warning":  "#f59e0b",
+      "throttled": "#e01b24"
+    },
+    "outer": "#0ea5e9"
+  },
+
+  "auth": {
+    "type": "bearer",
+    "_auth_comment": "DeepSeek accepts Bearer auth. The key is sent as-is."
+  },
+
+  "user_agent": "llm-quota-tray",
+
+  "refresh_seconds": 120,
+  "refresh_min_seconds": 15,
+  "refresh_max_backoff_seconds": 600,
+
+  "thresholds": {
+    "yellow": 60,
+    "red": 85
+  },
+
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true,
+    "_burn_comment": "For prepaid credit accounts the burn rate is mostly idle.",
+    "_burn_comment2": "If your adapter scales balance to cents, the row will show",
+    "_burn_comment3": "'on pace to have ~50.00 CNY left at reset' in cents/h."
+  },
+
+  "_adapter_example": {
+    "_note": "Optional — pipe the upstream response through jq to convert the",
+    "_note2": "string fields to numbers and inject a `balance_remaining_percent`:",
+    "_shell": "curl -s -H \"Authorization: Bearer $DEEPSEEK_KEY\" \\",
+    "_shell2": "  https://api.deepseek.com/user/balance | jq '.balance_infos[0] | . as $b | {",
+    "_shell3": "  balance_total_count:   ($b.total_balance  | tonumber * 100 | floor),",
+    "_shell4": "  balance_usage_count:   (($b.total_balance | tonumber) - ($b.granted_balance | tonumber) | . * 100 | floor),",
+    "_shell5": "  balance_remaining_percent: 100,",
+    "_shell6": "  balance_start_time:    (now | floor),",
+    "_shell7": "  balance_remains_time:  31536000000  # 1y placeholder for prepaid",
+    "_shell8": "} | {balance_infos: [. | to_entries | map(.value = .value) | .]}'",
+    "_note3": "",
+    "_note4": "For prepaid credits, `remaining_percent` is effectively always 100",
+    "_note5": "(you don't lose them unless you spend). Set it to the actual remaining",
+    "_note6": "percent if your account has a monthly allowance that resets."
+  }
+}

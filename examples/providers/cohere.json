@@ -1,0 +1,147 @@
+{
+  "_comment1": "Cohere instance.",
+  "_comment2": "Run as: llm-quota-tray --instance=cohere",
+  "_comment3": "",
+  "_comment4": "Cohere does NOT expose a public quota / usage endpoint. The only",
+  "_comment5": "quota signal is in the `meta-tokens-*` and rate-limit headers on",
+  "_comment6": "responses from /v1/chat, /v1/embeddings, /v1/rerank, and friends.",
+  "_comment7": "The tray reads JSON bodies, not headers — so this template needs a",
+  "_comment8": "small sidecar proxy. See `_rate_limit_proxy` below.",
+  "_comment9": "",
+  "_comment10": "SHAPE FIT: requires adapter — Cohere's quota is in response",
+  "_comment11": "headers, not a JSON body. Without a proxy the tray will display",
+  "_comment12": "'HTTP 404' on each poll (no public quota endpoint exists).",
+  "_comment13": "",
+  "_comment14": "Cohere response headers to capture:",
+  "_comment15": "  meta-billed-units:  billed token units for this request",
+  "_comment16": "  meta-tokens-input:  input tokens for this request",
+  "_comment17": "  meta-tokens-output: output tokens for this request",
+  "_comment18": "  (no public rate-limit headers on Cohere's response)",
+
+  "endpoint": "http://127.0.0.1:8088/cohere/quota",
+  "_dashboard_endpoint_note": "Replace with your sidecar's listener address. See below.",
+  "dashboard_url": "https://dashboard.cohere.com/api-keys",
+  "label": "Cohere",
+
+  "shape": {
+    "entries_path": "/",
+    "windows": [
+      {
+        "id": "monthly",
+        "field_prefix": "month",
+        "start_unit_ms": 1000,
+        "reset_unit_ms": 1,
+        "reset_is_absolute_epoch": true,
+        "_win_comment1": "Adapter injects (tracking monthly billed-units):",
+        "_win_comment2": "  month_total_count:        <monthly cap in billed-units, adapter-set>",
+        "_win_comment3": "  month_usage_count:        <cumulative billed-units this month>",
+        "_win_comment4": "  month_remaining_percent:  <remaining / cap * 100>",
+        "_win_comment5": "  month_start_time:         <start of current month, epoch sec>",
+        "_win_comment6": "  month_remains_time:       <ms-until-month-end, adapter-set>"
+      }
+    ]
+  },
+
+  "ring_colors": {
+    "inner": {
+      "_inner_comment": "Cohere brand red/coral palette.",
+      "normal":   "#e03131",
+      "warning":  "#f59e0b",
+      "throttled": "#dc2626"
+    },
+    "outer": "#1e1e1e"
+  },
+
+  "auth": {
+    "type": "bearer",
+    "_auth_comment": "Bearer auth is used by the SIDE PROXY when it makes the upstream",
+    "_auth_comment2": "request to Cohere. The tray itself doesn't reach Cohere directly."
+  },
+
+  "user_agent": "llm-quota-tray",
+
+  "refresh_seconds": 60,
+  "refresh_min_seconds": 15,
+  "refresh_max_backoff_seconds": 600,
+  "_refresh_comment": "60s — Cohere's rate windows are short on free/trial tier",
+
+  "thresholds": {
+    "yellow": 60,
+    "red": 85
+  },
+
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true
+  },
+
+  "_rate_limit_proxy": {
+    "_note": "Required — Cohere's quota is only in response headers. Run a",
+    "_note2": "sidecar that polls an endpoint, accumulates billed-units, and",
+    "_note3": "emits the parser-shaped JSON. The sidecar has to track state",
+    "_note4": "across requests (billed-units are cumulative per month).",
+
+    "_python_stub": "#!/usr/bin/env python3",
+    "_python_stub2": "\"\"\"Minimal Cohere proxy. Tracks billed-units across probes and",
+    "_python_stub3": "    emits the tray's parser-shaped JSON on each GET.\"\"\"",
+    "_python_stub4": "import http.server, json, os, time, urllib.request",
+    "_python_stub5": "",
+    "_python_stub6": "COHERE_KEY    = os.environ['COHERE_KEY']",
+    "_python_stub7": "MONTHLY_CAP   = int(os.environ.get('COHERE_MONTHLY_CAP', '1000000'))  # billed-units",
+    "_python_stub8": "PROBE_EVERY   = int(os.environ.get('COHERE_PROBE_EVERY', '60'))       # seconds",
+    "_python_stub9": "",
+    "_python_stub10": "state = {'start': None, 'usage': 0}",
+    "_python_stub11": "",
+    "_python_stub12": "def probe():",
+    "_python_stub13": "    \"\"\"Send a 1-token chat probe; capture meta-billed-units.\"\"\"",
+    "_python_stub14": "    req = urllib.request.Request(",
+    "_python_stub15": "        'https://api.cohere.com/v1/chat',",
+    "_python_stub16": "        data=json.dumps({",
+    "_python_stub17": "            'model': 'command-r',",
+    "_python_stub18": "            'message': 'x',",
+    "_python_stub19": "            'max_tokens': 1,",
+    "_python_stub20": "        }).encode(),",
+    "_python_stub21": "        headers={'Authorization': f'Bearer {COHERE_KEY}',",
+    "_python_stub22": "                   'content-type': 'application/json'})",
+    "_python_stub23": "    r = urllib.request.urlopen(req)",
+    "_python_stub24": "    billed = float(r.headers.get('meta-billed-units', 0))",
+    "_python_stub25": "    now = int(time.time())",
+    "_python_stub26": "    if state['start'] is None:",
+    "_python_stub27": "        state['start'] = now",
+    "_python_stub28": "    state['usage'] += billed",
+    "_python_stub29": "",
+    "_python_stub30": "    # Compute reset = next month start",
+    "_python_stub31": "    today = time.gmtime(now)",
+    "_python_stub32": "    if today.tm_mon == 12:",
+    "_python_stub33": "        reset_epoch = time.mktime((today.tm_year + 1, 1, 1, 0, 0, 0, 0, 0, 0))",
+    "_python_stub34": "    else:",
+    "_python_stub35": "        reset_epoch = time.mktime((today.tm_year, today.tm_mon + 1, 1, 0, 0, 0, 0, 0, 0))",
+    "_python_stub36": "    remains_ms = max(0, int((reset_epoch - now) * 1000))",
+    "_python_stub37": "    return {",
+    "_python_stub38": "        'month_total_count':       MONTHLY_CAP,",
+    "_python_stub39": "        'month_usage_count':       int(state['usage']),",
+    "_python_stub40": "        'month_remaining_percent': int((MONTHLY_CAP - state['usage']) / MONTHLY_CAP * 100),",
+    "_python_stub41": "        'month_start_time':        state['start'],",
+    "_python_stub42": "        'month_remains_time':      remains_ms,",
+    "_python_stub43": "    }",
+    "_python_stub44": "",
+    "_python_stub45": "class Q(http.server.BaseHTTPRequestHandler):",
+    "_python_stub46": "    def do_GET(self):",
+    "_python_stub47": "        body = json.dumps(probe()).encode()",
+    "_python_stub48": "        self.send_response(200)",
+    "_python_stub49": "        self.send_header('content-type', 'application/json')",
+    "_python_stub50": "        self.send_header('content-length', str(len(body)))",
+    "_python_stub51": "        self.end_headers()",
+    "_python_stub52": "        self.wfile.write(body)",
+    "_python_stub53": "    def log_message(self, *a): pass",
+    "_python_stub54": "",
+    "_python_stub55": "http.server.HTTPServer(('127.0.0.1', 8088), Q).serve_forever()",
+
+    "_note2": "The above is a sketch — a real proxy needs to handle Cohere's",
+    "_note3": "trial-tier trial-end errors, per-key tier limits, and rate-limit",
+    "_note4": "exhaustion (when the probe itself fails). Run it on the same host",
+    "_note5": "as the tray and point this config's `endpoint` at it."
+  }
+}

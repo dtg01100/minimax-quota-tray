@@ -1,6 +1,6 @@
 [package]
 name = "llm-quota-tray"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Provider-agnostic tray indicator for LLM API quota — supports any quota API via a config-only port"
 license = "MIT"

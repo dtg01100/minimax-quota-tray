@@ -1,32 +1,20 @@
-//! Parse the Coding Plan / Token Plan JSON payload into the internal
-//! window shape used by the burn-rate and menu code.
+//! Parse the provider's JSON payload into the internal window shape
+//! used by the burn-rate and menu code.
 //!
-//! Live shape (verified 2026-08-18):
-//!   {
-//!     "model_remains": [{
-//!       "model_name": "general",
-//!       "current_interval_total_count":    <i64>,   // 0 on Coding Plan
-//!       "current_interval_usage_count":    <i64>,   // 0 on Coding Plan
-//!       "current_interval_remaining_percent": <i64>,
-//!       "start_time":    <seconds-since-epoch>,
-//!       "remains_time":  <seconds-since-epoch>,   // absolute reset time
-//!       "current_interval_status": <i64>,
-//!       "current_weekly_total_count":    <i64>,   // 0 on Coding Plan
-//!       "current_weekly_usage_count":    <i64>,   // 0 on Coding Plan
-//!       "current_weekly_remaining_percent": <i64>,
-//!       "weekly_start_time":   <seconds-since-epoch>,
-//!       "weekly_remains_time": <seconds-since-epoch>,
-//!       "current_weekly_status": <i64>
-//!     }]
-//!   }
+//! All provider-specific details (JSON field names, unit conversions,
+//! error envelopes) live in `crate::provider` — this module is purely
+//! the data-driven reader. To port to a different API, edit
+//! `src/provider.rs`, not this file.
 //!
-//! Token Plan may use a different shape — fields are read defensively
-//! via `Option::or_default` so missing keys degrade to zeros.
+//! For the MiniMax live shape (verified 2026-08-18) see the doc on
+//! `provider::MINIMAX`. Token Plan uses the same shape, just a
+//! different endpoint path.
 
 use anyhow::Result;
 use serde_json::Value;
 
 use crate::burn::Window;
+use crate::provider::{PlanShape, WindowShape, MINIMAX};
 
 fn num(v: &Value, key: &str) -> i64 {
     v.get(key)
@@ -38,52 +26,75 @@ fn pct(v: &Value, key: &str) -> i64 {
     num(v, key).clamp(0, 100)
 }
 
-/// Parse one window's worth of fields out of the API JSON entry.
+/// Parse one window's worth of fields out of the API JSON entry,
+/// using the `WindowShape` data to find the right field names and
+/// apply the right unit conversions.
 ///
-/// `now_ms` is the current epoch ms — needed because the API's
-/// `remains_time` is a **duration** in ms (time until reset), not an
-/// absolute epoch. We add `now_ms + remains_time_ms` to produce the
-/// `reset_at` field, matching the gjs `parseWindow()` which does
-/// `resetAt: nowFn() + resetMs`. Treating `remains_time` as
-/// seconds-since-epoch and multiplying by 1000 (the previous Rust
-/// behavior) gave absurd reset_at values ~144 days from epoch for
-/// a 5h window — the "resets in 4h" line in the menu became
-/// "resets in 144d 5h", which is why the reset countdown was broken.
+/// `now_ms` is the current epoch ms — needed when the provider
+/// returns the reset as a DURATION (time-until-reset, default), in
+/// which case the parser computes `reset_at = now_ms + raw_reset`.
+/// Providers that return an absolute epoch instead set
+/// `reset_is_absolute_epoch: true` and the parser uses the raw value
+/// (after `reset_unit_ms` scaling).
+fn parse_one_window(entry: &Value, w: &WindowShape, now_ms: i64) -> Window {
+    let total = num(entry, &format!("{}_total_count", w.field_prefix));
+    let used = num(entry, &format!("{}_usage_count", w.field_prefix));
+    let remaining_pct = pct(entry, &format!("{}_remaining_percent", w.field_prefix));
+    let start_field = w.start_field.unwrap_or("start_time");
+    let reset_field = w.reset_field.unwrap_or("remains_time");
+    let start_at = num(entry, start_field) * w.start_unit_ms;
+    let raw_reset = num(entry, reset_field) * w.reset_unit_ms;
+    let reset_at = if w.reset_is_absolute_epoch {
+        raw_reset
+    } else {
+        now_ms + raw_reset
+    };
+    Window { id: w.id, total, used, remaining_pct, start_at, reset_at }
+}
+
+/// Look up the first entry in `payload` according to `shape`. For an
+/// array-typed `entries_path` (the MiniMax case: `/model_remains`),
+/// returns the element at index 0. For `/` (single-object response),
+/// returns the payload itself.
+fn first_entry<'a>(payload: &'a Value, shape: &PlanShape) -> Option<&'a Value> {
+    if shape.entries_path == "/" {
+        Some(payload)
+    } else {
+        payload
+            .pointer(shape.entries_path)
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+    }
+}
+
+/// Parse one payload against a `PlanShape` description, returning all
+/// windows the shape defines.
 ///
-/// The `start_time` field IS in seconds-since-epoch, so we multiply
-/// by 1000 (a one-time conversion that the gjs version skips because
-/// it doesn't need cross-window consistency for the burn projection).
-pub fn parse_interval_v2(v: &Value, prefix: &str, id: &'static str, now_ms: i64) -> Window {
-    let total = num(v, &format!("{prefix}_total_count"));
-    let used = num(v, &format!("{prefix}_usage_count"));
-    let remaining_pct = pct(v, &format!("{prefix}_remaining_percent"));
-    let start_at = num(v, &start_key(prefix)) * 1000; // sec → ms
-    let remains_ms = num(v, &reset_key(prefix));       // already ms
-    let reset_at = now_ms + remains_ms;
-    Window { id, total, used, remaining_pct, start_at, reset_at }
+/// Returns an error if the entry can't be located (missing array,
+/// empty array, etc.). Field-level missing values degrade to zeros
+/// (the parser is defensive — providers sometimes drop optional
+/// fields).
+pub fn parse_plan(payload: &Value, shape: &PlanShape, now_ms: i64) -> Result<Vec<Window>> {
+    let entry = first_entry(payload, shape)
+        .ok_or_else(|| anyhow::anyhow!(
+            "payload missing entry at {}", shape.entries_path))?;
+    Ok(shape.windows.iter()
+        .map(|w| parse_one_window(entry, w, now_ms))
+        .collect())
 }
 
-fn start_key(prefix: &str) -> String {
-    if prefix == "current_weekly" { "weekly_start_time".to_string() }
-    else { "start_time".to_string() }
-}
-
-fn reset_key(prefix: &str) -> String {
-    if prefix == "current_weekly" { "weekly_remains_time".to_string() }
-    else { "remains_time".to_string() }
-}
-
-/// Parse the Coding Plan payload (5h + weekly on the same entry).
-/// `now_ms` is the current epoch ms; see `parse_interval_v2` for why.
+/// Convenience wrapper for the MiniMax shape — returns the
+/// `(five_h, weekly)` pair that `main.rs` and the existing tests
+/// destructure. New code should call `parse_plan(&MINIMAX, ...)`
+/// directly; this wrapper exists so the test suite and the fetch
+/// pipeline keep their original 2-tuple signature.
 pub fn parse_coding_plan(payload: &Value, now_ms: i64) -> Result<(Window, Window)> {
-    let entry = payload
-        .get("model_remains")
-        .and_then(|m| m.as_array())
-        .and_then(|a| a.first())
-        .ok_or_else(|| anyhow::anyhow!("payload missing model_remains[0]"))?;
-    let five_h = parse_interval_v2(entry, "current_interval", "5h", now_ms);
-    let weekly = parse_interval_v2(entry, "current_weekly", "weekly", now_ms);
-    Ok((five_h, weekly))
+    let windows = parse_plan(payload, &MINIMAX, now_ms)?;
+    if windows.len() != 2 {
+        return Err(anyhow::anyhow!(
+            "MiniMax parser expects 2 windows, got {}", windows.len()));
+    }
+    Ok((windows[0], windows[1]))
 }
 
 #[cfg(test)]

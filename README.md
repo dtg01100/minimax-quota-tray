@@ -319,16 +319,34 @@ shelled out; reads use the crate directly.
 
 ## Porting to another provider
 
-The tray infrastructure (AppIndicator, keyring, adaptive polling, stale-on-error
-fallback, offline detection) is provider-agnostic. Only the HTTP/JSON surface
-is MiniMax-specific. This section maps every provider-specific touchpoint so
-you can fork this into a tray for any quota-aware API.
+The tray infrastructure (AppIndicator, keyring, adaptive polling,
+stale-on-error fallback, offline detection) is provider-agnostic.
+Only the HTTP/JSON surface is MiniMax-specific, and **all of it lives
+in a single file: [`src/provider.rs`](src/provider.rs)**. To port
+this tray at a different API, edit that file (and the
+`config.example.json` defaults) — the rest of the codebase reads
+from the constants there and needs no changes for typical ports.
+
+### What's in `src/provider.rs`
+
+The file is organized top-down as four sections:
+
+| Section | What it controls |
+| --- | --- |
+| `auth_header(api_key)` | How the API key is sent (`Authorization: Bearer …`, `x-goog-api-key`, `x-api-key`, etc.) |
+| `USER_AGENT_PREFIX` | User-Agent string prefix (version is appended automatically) |
+| `MINIMAX: PlanShape` | JSON shape: entry path, window fields, unit conversions, error envelope |
+| `DEFAULT_PLANS` | Plan table that ships in `Config::default()` and `config.example.json` |
+
+The `PlanShape` value is a data struct (not code) — it lists the
+JSON pointers, field-name prefixes, and unit multipliers the parser
+uses to extract each window. A porter replacing this constant with
+their own provider shape gets full parser support without editing
+`src/parse.rs` or `src/fetch.rs`.
 
 ### What's already configurable (no code change)
 
-You can repoint the tray at any HTTPS endpoint that returns JSON, as long as
-the shape matches what the parser expects (see below). Everything else is
-config-driven:
+Everything else is config-driven via `config.json`:
 
 - `plans.<id>.endpoint` — full URL to GET
 - `plans.<id>.dashboard_url` — opened by the **Open dashboard** menu item
@@ -336,131 +354,124 @@ config-driven:
 - `thresholds`, `refresh_seconds`, `refresh_min_seconds`,
   `refresh_max_backoff_seconds`
 
-You can rename or add plan IDs freely in `config.json`; the `plan` field picks
-the active one.
+You can rename or add plan IDs freely; the `plan` field picks the
+active one.
 
-### What requires code changes
+### What the UI consumes
 
-All provider-specific code lives in two short sections of
-`src/fetch.rs` (HTTP shape) and `src/parse.rs` (JSON → window
-mapping). Everything else (tray UI, keyring, scheduler, network
-monitor) stays as-is.
-
-#### 1. Auth header — `src/fetch.rs::fetch_windows_blocking()` (around line 33)
+The `Window` struct (in `src/burn.rs`) is the abstract shape every
+provider maps into:
 
 ```rust
-let resp = client
-    .get(endpoint)
-    .bearer_auth(api_key)
-    .send()
-    .context("HTTP request")?;
-```
-
-Common alternatives:
-
-| Provider            | Header                              |
-| ------------------- | ----------------------------------- |
-| OpenAI / Anthropic  | `Authorization: Bearer <key>`       |
-| Google Gemini       | `x-goog-api-key: <key>`             |
-| Mistral             | `Authorization: Bearer <key>`       |
-| Custom (header)     | `x-api-key: <key>`                  |
-| Custom (query)      | append `?key=<key>` to the endpoint |
-
-If you need more than one header per request, append more
-`request_headers.append(...)` calls. If the provider uses cookies/session
-auth, skip the keyring entirely and load the token from a file or env var in
-`loadApiKey()`.
-
-#### 2. Response parser — `src/parse.rs::parse_coding_plan()` and friends
-
-This is the only piece tightly coupled to MiniMax's JSON shape. The MiniMax
-`/remains` endpoint returns:
-
-```json
-{
-  "model_remains": [
-    {
-      "model_name": "general",
-      "current_interval_total_count": 500,
-      "current_interval_usage_count": 25,
-      "current_interval_remaining_percent": 95,
-      "remains_time": 16320000,
-      "current_interval_status": 1,
-      "current_weekly_total_count": 5000,
-      "current_weekly_usage_count": 0,
-      "current_weekly_remaining_percent": 100,
-      "weekly_remains_time": 561600000,
-      "current_weekly_status": 1
-    }
-  ]
+pub struct Window {
+    pub id: &'static str,    // unique within the windows vec
+    pub total: i64,
+    pub used: i64,
+    pub remaining_pct: i64,  // 0..100; drives chip + bar
+    pub reset_at: i64,       // absolute ms; drives "resets in X"
+    pub start_at: i64,       // optional; epoch start for burn projection
 }
 ```
 
-`parseWindow()` reads the `current_interval_*` / `current_weekly_*` fields and
-produces the array of "windows" the UI consumes:
+Rules for the provider→Window mapping (the `WindowShape` constants
+in `src/provider.rs` encode these):
 
-```js
-{
-  id: '5h',                // unique within the windows array; used to look up by .id
-  label: '5h',             // (currently unused by the UI; keep it descriptive)
-  total: 500,              // for sanity / future display
-  used: 25,
-  remaining_pct: 95,       // 0..100; drives chip + bar
-  resetAt: <ms epoch>,     // absolute time; drives "resets in X" countdown
-  startAt: <ms epoch>,     // optional; epoch start, drives the burn projection
-  throttled: false,        // optional; flips the ⚠ Throttled menu line.
-                       // Derived from remaining_pct (window exhausted), NOT from a status field.
-}
+- **Return 1–2 windows.** The UI is laid out for a short-window +
+  long-window pair. `main.rs` hardcodes two windows (`five_h` and
+  `weekly`); the parser returns whatever the `PlanShape` defines
+  but `main.rs` reads only the first two. To support a different
+  number, edit `main.rs::do_refresh` (not a porting concern — it's
+  structural).
+- **`id` is the window's UI label.** The first window drives the
+  chip percentage; convention is to put the rolling short-interval
+  window first (the one most likely to need urgent attention).
+- **`remaining_pct` is the source of truth.** If your provider
+  returns `used`/`total`, the parser computes
+  `100 - (100 * used / total)` here.
+- **`reset_at` is an absolute ms-since-epoch.** If your provider
+  gives a duration ("resets in 3h 20m"), set `reset_unit_ms: 1` and
+  leave `reset_is_absolute_epoch: false` — the parser computes
+  `reset_at = now_ms + raw_reset`. If your provider returns an
+  absolute epoch instead, set `reset_is_absolute_epoch: true` and
+  the parser uses the value directly.
+- **`start_at` is optional** (only used by the burn-rate
+  projection). Omit it (`0`) if your provider doesn't return an
+  epoch start; the projection then uses the recent slope alone.
+
+### Worked example: porting to a hypothetical `/v1/usage` endpoint
+
+Suppose Provider X exposes:
+
+```text
+GET https://api.provider.com/v1/usage
+x-api-key: <key>
+→ { "daily":   { "limit": 1000,  "used": 120,  "reset_in_ms": 7200000 },
+    "monthly": { "limit": 30000, "used": 4500, "reset_in_ms": 2592000000 } }
 ```
 
-`startAt` is only needed for the burn-rate projection (it floors the rate
-with the whole-epoch average and detects rollover). Omit it (0) if your
-provider doesn't return an epoch start; the projection then uses the recent
-slope alone and the used-drop rollover check.
+1. **Edit `src/provider.rs`:**
 
-To port, rewrite these two functions to map your provider's payload into the
-same window shape. Rules:
+   ```rust
+   // Change auth header from Bearer to x-api-key:
+   pub fn auth_header(api_key: &str) -> (&'static str, String) {
+       ("x-api-key", api_key.to_string())
+   }
 
-- **Always return 1–2 windows** (the UI is laid out for a short-window +
-  long-window pair). To run with a single window, return an array with one
-  entry; the menu and burn-rate row render automatically for each window
-  the parser returns. The chip's primary window is matched by `id === '5h'`
-  in `setChip()`.
-- **`id` must be `'5h'` for the chip** — `setChip()` looks up
-  `windows.find((w) => w.id === '5h')` to pick the percentage shown in the
-  top-bar label. Rename consistently in `parseWindow()` and `setChip()`.
-- **`remaining_pct` is the source of truth.** If your provider returns
-  `used`/`total` instead, compute `100 * (1 - used/total)` here.
-- **`resetAt` is an absolute ms-since-epoch.** If your provider gives a
-  duration ("resets in 3h 20m"), do `Date.now() + durationMs` here.
-- **`throttled` is optional** — derived from `remaining_pct <= 0` (window
-  exhausted). The tray deliberately ignores any `*_status` field from the
-  provider response: the official MiniMax-AI/cli documents that enum as
-  `1=normal / 2=exhausted / 3=unlimited`, so reading `status===1` would
-  falsely flag every healthy window as throttled. If your provider returns a
-  similar status enum, ignore it and rely on `remaining_pct`.
+   // Add a new PlanShape (or replace MINIMAX):
+   pub const PROVIDER_X: PlanShape = PlanShape {
+       // Provider X returns the entry as the root object.
+       entries_path: "/",
+       windows: &[
+           WindowShape {
+               id: "daily",
+               field_prefix: "daily",
+               start_field: None,           // no start time returned
+               reset_field: Some("reset_in_ms"),
+               start_unit_ms: 1,            // unused (start_field missing → 0)
+               reset_unit_ms: 1,            // already ms
+               reset_is_absolute_epoch: false,
+           },
+           WindowShape {
+               id: "monthly",
+               field_prefix: "monthly",
+               start_field: None,
+               reset_field: Some("reset_in_ms"),
+               start_unit_ms: 1,
+               reset_unit_ms: 1,
+               reset_is_absolute_epoch: false,
+           },
+       ],
+       error_envelope: None,  // Provider X uses HTTP status codes
+   };
 
-The UI has **no hardcoded window labels or IDs** — `updateMenu()` reads each
-window's `label` field and the chip uses `windows[0]` (the first window in
-the array). Return any number of windows (1, 2, 3…) in any order; the menu
-will show one label+bar row per window. Put the window you want shown in the
-top-bar chip first (the convention here is the rolling short-interval
-window, since that's the one most likely to need urgent attention).
+   // Replace the default plans table:
+   pub const DEFAULT_PLANS: &[DefaultPlan] = &[
+       DefaultPlan {
+           id: "primary",
+           endpoint: "https://api.provider.com/v1/usage",
+           dashboard_url: "https://provider.com/dashboard",
+           label: "Provider X",
+       },
+   ];
+   ```
 
-#### 3. Multiple plans in one payload — `parsePayload()`
+2. **Edit `src/parse.rs` and `src/fetch.rs` to pass the new shape:**
 
-If your provider returns several "plans" or "tiers" in one response (as
-MiniMax does with `model_remains` keyed by `model_name`), pick the entry
-yourself:
+   ```rust
+   // In src/fetch.rs — pass PROVIDER_X instead of MINIMAX:
+   parse_plan(&body, &crate::provider::PROVIDER_X, now_ms)
+       .context("parsing payload")
+   ```
 
-```js
-const entry = entries.find((e) => e.model_name === 'general') || entries[0];
-```
+   `src/parse.rs::parse_coding_plan` is a thin wrapper around
+   `parse_plan(&MINIMAX, …)` that asserts a 2-tuple. If your new
+   shape also returns 2 windows, you can keep using
+   `parse_coding_plan` (just rename and re-target); otherwise call
+   `parse_plan` directly and adapt `main.rs` to handle `Vec<Window>`.
 
-Replace `'general'` with whatever tag identifies the bucket you want to
-display. To support choosing between buckets at runtime, expose them as
-separate `plans.<id>` entries in `config.json` (different endpoints) — the
-existing `plan` selector already does this.
+3. **Update `config.example.json`** to match the new defaults.
+
+The UI, scheduler, keyring, and tray code don't change.
 
 ### Optional: rename the binary + service + keyring entry
 
@@ -484,53 +495,6 @@ Pick a single provider-specific token (e.g. `openai-quota`) and use
 it consistently across all six — that's what keeps multiple forks from
 stomping on each other's keyring entries.
 
-### Worked example: porting to a hypothetical `/v1/usage` endpoint
-
-Suppose Provider X exposes:
-
-```
-GET https://api.provider.com/v1/usage
-Authorization: Bearer <key>
-→ { "daily": { "limit": 1000, "used": 120, "reset_in_ms": 7200000 },
-    "monthly": { "limit": 30000, "used": 4500, "reset_in_ms": 2592000000 } }
-```
-
-`config.json`:
-
-```json
-{
-  "plan": "primary",
-  "plans": {
-    "primary": {
-      "endpoint": "https://api.provider.com/v1/usage",
-      "dashboard_url": "https://provider.com/dashboard",
-      "label": "Provider X"
-    }
-  }
-}
-```
-
-`fetch_windows_blocking()`: already uses Bearer — no change if Provider X is the same.
-
-`parse_coding_plan()` rewrite — drop-in for the parser. The shape
-the UI consumes is the same; map your provider's payload into a
-`Vec<Window>` and the rest of the code is unchanged. The fields
-the UI needs:
-
-```rust
-pub struct Window {
-    pub id: &'static str,    // unique within the windows vec
-    pub total: i64,
-    pub used: i64,
-    pub remaining_pct: i64,  // 0..100; drives chip + bar
-    pub reset_at: i64,       // absolute ms; drives "resets in X"
-    pub start_at: i64,       // optional; epoch start for burn projection
-}
-```
-
-Always return 1–2 windows. The UI is laid out for a short-window +
-long-window pair. To run with a single window, return one entry —
-the menu and burn-rate row render automatically for each window.
 
 ## License
 

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::burn::BurnConfig;
+use crate::provider::DEFAULT_PLANS;
 
 const CONFIG_DIR_NAME: &str = ".config/minimax-quota";
 const CONFIG_FILENAME: &str = "config.json";
@@ -51,31 +52,36 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        // Defaults must match the live API surface that
-        // `config.example.json` ships with — if a user runs the binary
-        // before `install.sh` has copied the example file, the binary
-        // writes THIS default to ~/.config/minimax-quota/config.json
-        // (see load_or_init). Wrong endpoints here = silent "no data"
-        // until the user fixes the config manually.
+        // Defaults come from `crate::provider::DEFAULT_PLANS` — the
+        // single source of truth for what plans ship with the binary.
+        // If a user runs the binary before `install.sh` has copied the
+        // example file, this default gets written to
+        // ~/.config/minimax-quota/config.json (see `load_or_init`).
+        // Wrong endpoints here = silent "no data" until the user fixes
+        // the config manually, so keep `provider.rs` in sync with the
+        // live API surface.
+        //
+        // Note: `config.example.json` ships the same table; if you
+        // edit one, edit the other.
         let mut plans = std::collections::HashMap::new();
-        plans.insert(
-            "coding_plan".to_string(),
-            PlanConfig {
-                endpoint: "https://api.minimax.io/v1/api/openplatform/coding_plan/remains".to_string(),
-                dashboard_url: "https://platform.minimax.io/console/plan".to_string(),
-                label: "Coding Plan".to_string(),
-            },
-        );
-        plans.insert(
-            "token_plan".to_string(),
-            PlanConfig {
-                endpoint: "https://api.minimax.io/v1/token_plan/remains".to_string(),
-                dashboard_url: "https://platform.minimax.io/console/plan".to_string(),
-                label: "Token Plan".to_string(),
-            },
-        );
+        for p in DEFAULT_PLANS {
+            plans.insert(
+                p.id.to_string(),
+                PlanConfig {
+                    endpoint: p.endpoint.to_string(),
+                    dashboard_url: p.dashboard_url.to_string(),
+                    label: p.label.to_string(),
+                },
+            );
+        }
+        // First entry in DEFAULT_PLANS is the default active plan.
+        // Falls back to `"coding_plan"` if DEFAULT_PLANS is empty
+        // (which shouldn't happen — see provider.rs).
+        let default_plan = DEFAULT_PLANS.first()
+            .map(|p| p.id.to_string())
+            .unwrap_or_else(|| "coding_plan".to_string());
         Self {
-            plan: "coding_plan".to_string(),
+            plan: default_plan,
             refresh_seconds: 120,
             refresh_min_seconds: default_refresh_min_seconds(),
             refresh_max_backoff_seconds: 600,

@@ -1,8 +1,12 @@
-//! HTTPS fetch of the MiniMax quota endpoint + parse into Window shape.
+//! HTTPS fetch of the quota endpoint + parse into Window shape.
 //! Reqwest with rustls-tls (pure Rust TLS, no OpenSSL/GnuTLS).
 //!
-//! The HTTP call is blocking (reqwest blocking) and intended to be wrapped
-//! in `tokio::task::spawn_blocking` from the polling loop.
+//! Provider-specific bits (auth header, User-Agent, error envelope)
+//! live in `crate::provider`; this module is the data-driven HTTP
+//! driver. To port to a different API, edit `src/provider.rs`.
+//!
+//! The HTTP call is blocking (reqwest blocking) and intended to be
+//! wrapped in `tokio::task::spawn_blocking` from the polling loop.
 
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
@@ -10,19 +14,16 @@ use serde_json::Value;
 
 use crate::burn::Window;
 use crate::parse::parse_coding_plan;
+use crate::provider::{self, MINIMAX};
 
 // Re-export so callers can refer to `fetch::Client` without importing reqwest.
 pub use reqwest::blocking::Client as HttpClient;
 
-const USER_AGENT: &str = concat!(
-    "minimax-quota-tray/",
-    env!("CARGO_PKG_VERSION"),
-);
-
 /// Build a shared blocking reqwest client. TLS via rustls.
 pub fn build_client() -> Result<Client> {
+    let user_agent = format!("{}/{}", provider::USER_AGENT_PREFIX, env!("CARGO_PKG_VERSION"));
     Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(user_agent)
         .timeout(std::time::Duration::from_secs(15))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
@@ -37,9 +38,10 @@ pub fn fetch_windows_blocking(
     endpoint: &str,
     api_key: &str,
 ) -> Result<(Window, Window)> {
+    let (auth_name, auth_value) = provider::auth_header(api_key);
     let resp = client
         .get(endpoint)
-        .bearer_auth(api_key)
+        .header(auth_name, auth_value)
         .send()
         .context("HTTP request")?;
 
@@ -57,7 +59,7 @@ pub fn fetch_windows_blocking(
 
     let body: Value = resp.json().context("decoding JSON body")?;
 
-    if let Some(msg) = base_resp_error(&body) {
+    if let Some(msg) = envelope_error(&body, MINIMAX.error_envelope.as_ref()) {
         return Err(anyhow::anyhow!("{msg}"));
     }
 
@@ -152,21 +154,27 @@ fn is_cred_char(b: u8) -> bool {
     matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'+' | b'/' | b'=')
 }
 
-/// MiniMax returns API errors as HTTP 200 with a `base_resp` envelope
-/// (e.g. invalid/expired API key -> {"base_resp":{"status_code":1004,
-/// "status_msg":"login fail: ..."}}). Returns a human-readable error
-/// string when the envelope carries a non-zero status code; otherwise
-/// `None`. Surfacing the real message beats the generic "payload missing
-/// model_remains[0]" parse error the tray would otherwise show — e.g. a
-/// placeholder key in the keyring now reports the actual API rejection
-/// instead of a confusing parse failure.
-fn base_resp_error(body: &Value) -> Option<String> {
-    let code = body.pointer("/base_resp/status_code").and_then(|c| c.as_i64())?;
-    if code == 0 {
+/// Generic provider-error-envelope reader. Reads the integer status
+/// code at `envelope.code_path`; if it's not in `envelope.success_codes`,
+/// returns the message at `envelope.message_path` formatted as
+/// `"API error {code}: {msg}"`.
+///
+/// Some providers (MiniMax) return HTTP 200 with an error envelope in
+/// the body (`{"base_resp": {"status_code": 1004, "status_msg":
+/// "login fail: ..."}}`). Surfacing the real message beats the
+/// generic "payload missing model_remains[0]" parse error the tray
+/// would otherwise show — e.g. a placeholder key in the keyring now
+/// reports the actual API rejection instead of a confusing parse
+/// failure. Providers that use standard HTTP status codes only should
+/// set `error_envelope: None` in their `PlanShape`.
+fn envelope_error(body: &Value, envelope: Option<&crate::provider::ErrorEnvelope>) -> Option<String> {
+    let env = envelope?;
+    let code = body.pointer(env.code_path).and_then(|c| c.as_i64())?;
+    if env.success_codes.contains(&code) {
         return None;
     }
     let msg = body
-        .pointer("/base_resp/status_msg")
+        .pointer(env.message_path)
         .and_then(|m| m.as_str())
         .unwrap_or("unknown error");
     Some(format!("API error {code}: {msg}"))
@@ -260,19 +268,31 @@ mod tests {
         let v = json!({
             "base_resp": {"status_code": 1004, "status_msg": "login fail: bad key"}
         });
-        let err = super::base_resp_error(&v);
+        let err = super::envelope_error(&v, crate::provider::MINIMAX.error_envelope.as_ref());
         assert_eq!(err.as_deref(), Some("API error 1004: login fail: bad key"));
     }
 
     #[test]
     fn base_resp_zero_code_is_not_an_error() {
         let v = json!({"base_resp": {"status_code": 0, "status_msg": "ok"}});
-        assert_eq!(super::base_resp_error(&v), None);
+        let err = super::envelope_error(&v, crate::provider::MINIMAX.error_envelope.as_ref());
+        assert_eq!(err, None);
     }
 
     #[test]
     fn missing_base_resp_is_not_an_error() {
         let v = json!({"model_remains": []});
-        assert_eq!(super::base_resp_error(&v), None);
+        let err = super::envelope_error(&v, crate::provider::MINIMAX.error_envelope.as_ref());
+        assert_eq!(err, None);
+    }
+
+    #[test]
+    fn no_envelope_returns_none_for_any_body() {
+        // Providers without an error envelope (set error_envelope: None)
+        // should never trigger envelope_error — HTTP status is the only
+        // signal. Sanity: pass None envelope with a base_resp body.
+        let v = json!({"base_resp": {"status_code": 1004, "status_msg": "x"}});
+        let err = super::envelope_error(&v, None);
+        assert_eq!(err, None);
     }
 }

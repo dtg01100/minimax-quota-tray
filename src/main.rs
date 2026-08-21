@@ -36,6 +36,7 @@ mod menu;
 mod network;
 mod notify;
 mod parse;
+mod provider;
 mod scheduler;
 mod sni;
 mod util;

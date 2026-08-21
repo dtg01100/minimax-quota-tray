@@ -26,6 +26,8 @@ can be tuned per-instance.
 | `groq.json` | Groq | ⚠️ no public quota endpoint — needs header-to-JSON sidecar |
 | `google-gemini.json` | Google AI Studio / Gemini | ⚠️ no public quota endpoint — needs sidecar |
 | `cohere.json` | Cohere | ⚠️ no public quota endpoint — needs sidecar |
+| `openrouter-prototype.json` | OpenRouter (credit-balance variant) | ✅ prototype — uses new `count_unit: "cents"` so the burn row shows $/h instead of tok/h |
+| `openrouter-inference.json` | OpenRouter (per-model inference cost) | ✅ prototype — uses new `pricing_endpoint` + `pricing_model_path` so the burn row shows both `tok/h` and `· $/h` for the model's cached price |
 
 The **shape fit** column tells you whether the provider's natural
 JSON response can be parsed without modification or whether you

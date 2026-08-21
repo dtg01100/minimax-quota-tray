@@ -6,7 +6,90 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added (slice 2: dynamic per-model pricing lookup)
+
+- **`src/pricing.rs`** — new module. `ModelPricing`,
+  `PriceTable`, `fetch_pricing_blocking()` (parses OpenRouter's
+  `/api/v1/models` shape), and `cost_per_hour()` (returns the
+  `$X/h` fragment for a model+rate, or `None` when sub-tenth-cent
+  / model unknown / no table).
+- **`Config::pricing_endpoint`** — URL of the price-list endpoint.
+  OpenRouter's `/api/v1/models` is fully public and works
+  unchanged. `#[serde(default)]` so existing configs parse.
+- **`Config::pricing_refresh_polls`** — optional cadence (in
+  successful polls) for re-fetching the table. `None` = fetch
+  once at startup.
+- **`WindowShape::pricing_model_path`** — JSON pointer to the
+  model id field in the API response entry. Parser reads it onto
+  `Window.model`; renderer looks the model up in the price table.
+- **`Window::model`** — the model id (parser-populated when the
+  path is set). `#[serde(default)]`.
+- **`AppState::price_table` + `polls_since_pricing_refresh`** —
+  cached table + refresh counter. Startup fetches happen in
+  `main::run()`; periodic refresh in `do_refresh()` (best-effort,
+  failures keep the previous table).
+- **`util::burn_row_label`** — `cost_fragment: Option<&str>`
+  parameter. When `Some`, the rate portion is suffixed with
+  ` · $X/h`. `None` preserves the legacy one-rate label.
+- **`OpenRouter inference prototype`** —
+  `examples/providers/openrouter-inference.json` — a Python sidecar
+  probes `/api/v1/chat/completions` every N seconds, captures the
+  model id from the response, and emits parser-shaped JSON. The
+  tray fetches `/api/v1/models` on startup, finds the model's
+  per-token prices, and the burn row reads
+  `· on pace to have ~95% left at reset (40 tok/h · $0.4/h)`.
+
+### Notes (slice 2)
+- The pricing lookup is **independent** of the parser's token
+  math. It only ADDS a `$X/h` fragment next to the existing
+  `tok/h` or `%/h` rate; nothing about the rate itself changes.
+- Sub-tenth-cent rates are hidden (`cost_per_hour` returns
+  `None`). Keeps the row clean for cheap-model / low-volume
+  workloads where the dollar rate would be meaningless noise.
+- `prompt_share` is hardcoded to 0.5 in `build_menu_state` —
+  a balanced chat workload is a sensible default. Full split
+  pricing would need the parser to expose prompt vs completion
+  token counts separately; deferred to a future slice.
+- All 184 unit tests pass (was 164; +20 new for slice 2).
+
+### Added (slice 1: currency-aware burn rows)
+- **Currency-aware burn rows** — `WindowShape.count_unit` and
+  `WindowShape.currency` (both `Option<String>`, both
+  `#[serde(default)]`). When `count_unit` is `"cents"` or
+  `"milliunits"`, the burn-row label re-renders from `40 tok/h` to
+  `$0.4/h` (or `$5/h`, `$123/h` depending on tier). pct-only windows
+  are unaffected — the rate stays in `%/h`. Default is `"tokens"`
+  for all existing configs, no behavior change.
+- **`util::fmt_cost`** — cost formatter matching `fmt_rate`'s tier
+  system (`$0.005` → `$0.0050` style; 4/3/2-decimal tiers under
+  $100, integer at $100+). Trailing zeros stripped, mirroring
+  `fmt_rate`'s gjs parity.
+- **`util::burn_row_label`** — signature extended with
+  `count_unit: Option<&str>` and `currency: Option<&str>` (both
+  backward-compatible: defaults preserve legacy `tok/h` output).
+- **`Window`** — two new fields (`count_unit`, `currency`),
+  `#[serde(default)]` so deserialization of older snapshots is
+  tolerant.
+- **OpenRouter prototype** —
+  `examples/providers/openrouter-prototype.json` demonstrates the
+  end-to-end flow: a small Python sidecar polls
+  `https://openrouter.ai/api/v1/auth/key` (which returns USD floats
+  and a `is_free_tier` boolean), scales to integer cents, and emits
+  the tray's parser-shaped JSON. Run as
+  `llm-quota-tray --instance=openrouter-prototype` alongside the
+  default instance. The existing `examples/providers/openrouter.json`
+  (token-usage probe) is unchanged.
+
+### Notes (slice 1)
+- This is a **prototype slice**, not a finished feature. The
+  `currency` field is display-only metadata in v1 — `fmt_cost`
+  always renders `$`. Extending to other currencies is a one-line
+  change when there's a second currency to motivate it.
+- No new fetches were added. The prototype uses the existing
+  adapter/proxy pattern (same as `examples/providers/cohere.json`),
+  which keeps the binary free of provider-specific fetch logic.
+- No changes to the default MiniMax instance behavior; existing
+  configs parse unchanged.
 
 ## [0.3.0] - 2026-08-21
 

@@ -27,6 +27,23 @@ fn pct(v: &Value, key: &str) -> i64 {
     num(v, key).clamp(0, 100)
 }
 
+/// Read an optional string field at a JSON-pointer-relative path
+/// from the entry. Used by `pricing_model_path` to pluck a model
+/// id out of the API response. Returns `None` for missing /
+/// non-string values (defensive: the parser never errors on
+/// optional fields).
+///
+/// Path is a relative JSON pointer (e.g. `"/model_name"` or
+/// `"/data/0/model"`). Unlike the existing `start_field` /
+/// `reset_field` overrides (which take a plain key), model paths
+/// can traverse into nested objects/arrays because providers
+/// nest their model tags inconsistently.
+fn model_id_at(entry: &Value, path: &str) -> Option<String> {
+    entry.pointer(path)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Parse one window's worth of fields out of the API JSON entry,
 /// using the `WindowShape` data to find the right field names and
 /// apply the right unit conversions.
@@ -50,7 +67,26 @@ fn parse_one_window(entry: &Value, w: &WindowShape, now_ms: i64) -> Window {
     } else {
         now_ms + raw_reset
     };
-    Window { id: w.id.clone(), total, used, remaining_pct, start_at, reset_at }
+    // Read the model id from the entry if `pricing_model_path` is
+    // configured. None when unset or when the field is missing
+    // (defensive — never errors).
+    let model = w.pricing_model_path.as_deref()
+        .and_then(|p| model_id_at(entry, p));
+    Window {
+        id: w.id.clone(),
+        total,
+        used,
+        remaining_pct,
+        start_at,
+        reset_at,
+        // Prototype fields: carried on Window so the renderer doesn't
+        // need a side-table lookup of `WindowShape`. Both default to
+        // None, which means "tokens" / "no currency symbol" — same
+        // legacy behavior as before this change.
+        count_unit: w.count_unit.clone(),
+        currency: w.currency.clone(),
+        model,
+    }
 }
 
 /// Look up the first entry in `payload` according to `shape`. For an
@@ -256,6 +292,176 @@ mod tests {
         assert_eq!(five_h.remaining_pct, 80);
         assert_eq!(weekly.total, 0);
         assert_eq!(weekly.remaining_pct, 90);
+    }
+
+    /// OpenRouter prototype: confirm the new optional WindowShape
+    /// fields (`count_unit`, `currency`) deserialize and round-trip
+    /// through the parser into Window. Locks in that an OpenRouter
+    /// config can drop `"count_unit": "cents"` in and have it land
+    /// on the Window the renderer reads.
+    #[test]
+    fn parses_count_unit_and_currency() {
+        let shape: PlanShape = serde_json::from_value(json!({
+            "entries_path": "/data",
+            "windows": [{
+                "id": "credits",
+                "field_prefix": "credit",
+                "start_unit_ms": 1000,
+                "reset_unit_ms": 1,
+                "reset_is_absolute_epoch": false,
+                "count_unit": "cents",
+                "currency": "USD"
+            }],
+            "error_envelope": null
+        })).expect("shape with count_unit + currency should deserialize");
+
+        // Now feed it a payload that looks like OpenRouter's auth/key
+        // response after an adapter has scaled USD floats to cents.
+        // We don't need real auth/key semantics here — we just need to
+        // verify the two new fields survive the parse.
+        let v = json!({
+            "data": [{
+                "credit_total_count": 1000,    // $10.00 cap
+                "credit_usage_count": 250,     // $2.50 used
+                "credit_remaining_percent": 75,
+                "credit_start_time": 1700000000,
+                "credit_remains_time": 2592000000_i64  // 30d
+            }]
+        });
+        let mut windows = parse_plan(&v, &shape, 1_700_001_000_000).unwrap();
+        assert_eq!(windows.len(), 1);
+        let w = windows.pop().unwrap();
+        assert_eq!(w.id, "credits");
+        assert_eq!(w.used, 250);
+        assert_eq!(w.total, 1000);
+        assert_eq!(w.remaining_pct, 75);
+        // The new fields made it through parse_one_window intact.
+        assert_eq!(w.count_unit.as_deref(), Some("cents"));
+        assert_eq!(w.currency.as_deref(), Some("USD"));
+    }
+
+    /// OpenRouter inference prototype: the parser reads the model id
+    /// via `pricing_model_path` and lands it on `Window.model` for
+    /// the renderer. This is what lets the burn row show a cost
+    /// fragment when the cached price table knows the model.
+    #[test]
+    fn parses_model_id_through_pricing_model_path() {
+        // OpenRouter's inference response wraps usage in `usage` and
+        // names the model at the top level. Two windows read the
+        // same entry but with different model paths (some providers
+        // nest the model id per-window — same shape works).
+        let shape: PlanShape = serde_json::from_value(json!({
+            "entries_path": "/",
+            "windows": [{
+                "id": "session",
+                "field_prefix": "session",
+                "start_unit_ms": 1000,
+                "reset_unit_ms": 1,
+                "reset_is_absolute_epoch": false,
+                "pricing_model_path": "/model"
+            }]
+        })).unwrap();
+
+        let v = json!({
+            "model": "openai/gpt-4o",
+            "session_total_count": 0,
+            "session_usage_count": 1234,
+            "session_remaining_percent": 95,
+            "start_time": 0,
+            "remains_time": 86_400_000
+        });
+        let mut windows = parse_plan(&v, &shape, 0).unwrap();
+        let w = windows.pop().unwrap();
+        assert_eq!(w.model.as_deref(), Some("openai/gpt-4o"));
+        assert_eq!(w.used, 1234);
+    }
+
+    /// Deep nested model path (JSON pointer) — e.g. providers that
+    /// return `data[0].model`.
+    #[test]
+    fn parses_model_id_via_nested_pointer() {
+        let shape: PlanShape = serde_json::from_value(json!({
+            "entries_path": "/data",
+            "windows": [{
+                "id": "day",
+                "field_prefix": "day",
+                "start_unit_ms": 1000,
+                "reset_unit_ms": 1,
+                "reset_is_absolute_epoch": false,
+                "pricing_model_path": "/model"
+            }]
+        })).unwrap();
+        let v = json!({
+            "data": [{
+                "model": "deepseek/deepseek-v4-flash",
+                "day_total_count": 0,
+                "day_usage_count": 500,
+                "day_remaining_percent": 99,
+                "start_time": 0,
+                "remains_time": 86_400_000
+            }]
+        });
+        let mut windows = parse_plan(&v, &shape, 0).unwrap();
+        let w = windows.pop().unwrap();
+        assert_eq!(w.model.as_deref(), Some("deepseek/deepseek-v4-flash"));
+    }
+
+    /// Missing model field is fine — the parser doesn't error, the
+    /// Window just has `model = None` and the renderer omits the
+    /// cost fragment.
+    #[test]
+    fn missing_model_field_yields_none() {
+        let shape: PlanShape = serde_json::from_value(json!({
+            "entries_path": "/",
+            "windows": [{
+                "id": "x",
+                "field_prefix": "x",
+                "start_unit_ms": 1,
+                "reset_unit_ms": 1,
+                "reset_is_absolute_epoch": false,
+                "pricing_model_path": "/model"
+            }]
+        })).unwrap();
+        let v = json!({
+            // No `model` key
+            "x_total_count": 0,
+            "x_usage_count": 100,
+            "x_remaining_percent": 90,
+            "start_time": 0,
+            "remains_time": 1
+        });
+        let mut windows = parse_plan(&v, &shape, 0).unwrap();
+        let w = windows.pop().unwrap();
+        assert!(w.model.is_none());
+    }
+
+    /// Backward-compat: a legacy config without count_unit / currency
+    /// still parses, and the resulting Window has both fields as None.
+    #[test]
+    fn legacy_shape_omits_count_unit() {
+        let shape: PlanShape = serde_json::from_value(json!({
+            "entries_path": "/model_remains",
+            "windows": [{
+                "id": "5h",
+                "field_prefix": "current_interval",
+                "start_unit_ms": 1000,
+                "reset_unit_ms": 1,
+                "reset_is_absolute_epoch": false
+            }]
+        })).unwrap();
+        let v = json!({
+            "model_remains": [{
+                "current_interval_total_count": 1000,
+                "current_interval_usage_count": 200,
+                "current_interval_remaining_percent": 80,
+                "start_time": 0,
+                "remains_time": 1000
+            }]
+        });
+        let mut windows = parse_plan(&v, &shape, 0).unwrap();
+        let w = windows.pop().unwrap();
+        assert!(w.count_unit.is_none(), "legacy config ⇒ None");
+        assert!(w.currency.is_none(), "legacy config ⇒ None");
     }
 
     #[test]

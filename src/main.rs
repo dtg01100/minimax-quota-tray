@@ -37,6 +37,7 @@ mod menu;
 mod network;
 mod notify;
 mod parse;
+mod pricing;
 mod provider;
 mod scheduler;
 mod sni;
@@ -107,6 +108,18 @@ struct AppState {
     /// orchestrator via the mpsc channel).
     #[allow(dead_code)]
     pending_force_refresh: bool,
+
+    /// Cached per-model price table (see `pricing.rs`). Populated
+    /// at startup when `Config::pricing_endpoint` is `Some`;
+    /// re-fetched every `Config::pricing_refresh_polls` polls
+    /// (default: once at startup). `None` when no pricing endpoint
+    /// is configured.
+    price_table: Option<pricing::PriceTable>,
+    /// Successful polls since the last pricing refresh. Used to gate
+    /// the periodic re-fetch without a background timer thread —
+    /// `do_refresh` increments this and triggers a refresh when it
+    /// crosses the configured threshold.
+    polls_since_pricing_refresh: u64,
 }
 
 #[tokio::main]
@@ -159,8 +172,42 @@ async fn run() -> Result<()> {
 
     let http_client = fetch::build_client(&cfg.user_agent)
         .context("build HTTP client")?;
+
+    // Startup pricing fetch (best-effort). When the config sets
+    // `pricing_endpoint`, we hit it once before the refresh loop
+    // starts so the very first menu render can show a cost fragment.
+    // Failures are logged and result in `price_table = None` —
+    // equivalent to "no pricing configured". A sidecar / network
+    // outage at startup shouldn't prevent the tray from running.
+    let initial_price_table = match cfg.pricing_endpoint.as_deref() {
+        Some(url) => {
+            log::info!("fetching pricing endpoint: {url}");
+            match tokio::task::spawn_blocking({
+                let client = http_client.clone();
+                let url = url.to_string();
+                move || pricing::fetch_pricing_blocking(&client, &url)
+            }).await {
+                Ok(Ok(table)) => {
+                    log::info!("loaded {} model prices", table.len());
+                    Some(table)
+                }
+                Ok(Err(e)) => {
+                    log::warn!("pricing fetch failed: {e:#} -- continuing without cost fragments");
+                    None
+                }
+                Err(e) => {
+                    log::warn!("pricing fetch task panicked: {e} -- continuing without cost fragments");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
     let state = Arc::new(Mutex::new(AppState {
         http_client: Some(http_client),
+        price_table: initial_price_table,
+        polls_since_pricing_refresh: 0,
         ..Default::default()
     }));
     let tray = Arc::new(
@@ -416,6 +463,46 @@ async fn do_refresh(
             s.fail_streak = 0;
             s.last_good = Some(windows.clone());
             s.last_good_at = now_ms();
+
+            // Periodic pricing refresh: gated on
+            // `cfg.pricing_refresh_polls`. `None` ⇒ fetch only once
+            // at startup (the table is already populated then).
+            // Failures keep the previous table — best-effort, no
+            // backoff or alerting. Cheap because the endpoint is
+            // usually unauthenticated (OpenRouter's /api/v1/models
+            // returns the full table on every call).
+            if let (Some(url), Some(interval)) = (
+                cfg.pricing_endpoint.as_deref(),
+                cfg.pricing_refresh_polls,
+            ) {
+                s.polls_since_pricing_refresh += 1;
+                if s.polls_since_pricing_refresh >= interval.max(1) {
+                    s.polls_since_pricing_refresh = 0;
+                    if let Some(client) = s.http_client.clone() {
+                        let url = url.to_string();
+                        let new_table = tokio::task::spawn_blocking(
+                            move || pricing::fetch_pricing_blocking(&client, &url)
+                        ).await;
+                        match new_table {
+                            Ok(Ok(table)) => {
+                                log::debug!(
+                                    "pricing refresh: {} models",
+                                    table.len());
+                                s.price_table = Some(table);
+                            }
+                            Ok(Err(e)) => {
+                                log::warn!(
+                                    "pricing refresh failed: {e:#} -- keeping previous table");
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "pricing refresh task panicked: {e} -- keeping previous table");
+                            }
+                        }
+                    }
+                }
+            }
+
             // Record a sample for each window, keyed by window.id so
             // the burn-rate projection looks up the right slice.
             for w in &windows {
@@ -460,6 +547,7 @@ async fn do_refresh(
                 &pair_refs,
                 None, false, now_ms() - s.last_good_at,
                 pct <= 0,
+                s.price_table.as_ref(),
             );
 
             let bucket = icon::bucket_for(pct, false,
@@ -723,6 +811,7 @@ async fn render_error_with_stale(
         Some(err),
         true, age_ms,
         throttled,
+        None,
     );
     let _ = tray.apply_menu(|m| install_menu_into(m, menu_state)).await;
 }
@@ -753,6 +842,13 @@ async fn render_out_of_menu(tray: &Arc<Tray>, cfg: &Config, offline: bool) {
 /// Build a fresh MenuState for the given window data. Returns a
 /// pre-built MenuState; caller is responsible for installing it
 /// into the tray's menu.
+///
+/// `price_table` is the cached per-model price table (or `None`
+/// when no pricing endpoint is configured). When non-empty and a
+/// window's parser-read model id is present in the table, a
+/// `· $X/h` cost fragment is appended to the burn row. Sub-tenth-
+/// cent rates are hidden so cheap-model / low-volume workloads
+/// don't show noise.
 fn build_menu_state(
     plan_label: &str,
     windows: &[(Window, Option<&BurnResult>)],
@@ -760,6 +856,7 @@ fn build_menu_state(
     stale: bool,
     age_ms: i64,
     throttled: bool,
+    price_table: Option<&pricing::PriceTable>,
 ) -> MenuInner {
     let mut m = MenuInner::new();
     m.set_header(&format!("Plan: {plan_label}"));
@@ -780,7 +877,24 @@ fn build_menu_state(
             label, w.remaining_pct, resets_in_ms, stale,
         ) + &stale_suffix);
         bar_strs.push(util::bar_markup(w.remaining_pct));
-        burns.push(burn_opt.map(|b| util::burn_row_label(b)));
+        // Compute the cost fragment for this window, if any. We do
+        // this in build_menu_state (not in burn_row_label) so the
+        // price table doesn't need to thread through util.rs's
+        // formatter signature. The 0.5 default split matches a
+        // balanced chat workload; v2 could read prompt/completion
+        // tokens separately when the parser exposes them.
+        let cost_fragment = burn_opt.and_then(|b| pricing::cost_per_hour(
+            price_table?,
+            w.model.as_deref(),
+            b.rate_per_hour,
+            0.5,
+        ));
+        burns.push(burn_opt.map(|b| util::burn_row_label(
+            b,
+            w.count_unit.as_deref(),
+            w.currency.as_deref(),
+            cost_fragment.as_deref(),
+        )));
     }
     m.rebuild_window_rows(&labels, &bar_strs, &burns);
 
@@ -992,6 +1106,9 @@ mod tests {
             remaining_pct: pct,
             start_at: start,
             reset_at: end,
+            count_unit: None,
+            currency: None,
+            model: None,
         }
     }
 
@@ -1018,6 +1135,7 @@ mod tests {
             "Coding Plan",
             &[(five_h, burn_5h), (weekly, burn_weekly)],
             None, false, 0, false,
+            None,
         );
         assert_eq!(m.item(menu::HEADER_ID).unwrap().label, "Plan: Coding Plan");
         // Window rows present
@@ -1043,6 +1161,7 @@ mod tests {
             "Token Plan",
             &[(five_h, burn_5h_ref), (weekly, burn_weekly_ref)],
             None, false, 0, false,
+            None,
         );
         // Burn row 0 visible (exhaust warning)
         assert!(m.item(menu::burn_id(0)).unwrap().visible);
@@ -1063,6 +1182,7 @@ mod tests {
             "Coding Plan",
             &[(five_h, None), (weekly, None)],
             None, false, 0, true,
+            None,
         );
         assert!(m.item(menu::THROTTLED_ID).unwrap().visible);
         assert_eq!(m.item(menu::THROTTLED_ID).unwrap().label, "  ⚠ Throttled");
@@ -1080,6 +1200,7 @@ mod tests {
             Some("API error 1004"),
             true, 3 * 60_000,
             false,
+            None,
         );
         // Error row visible with both stale note and (cached data)
         let err = m.item(menu::ERROR_ID).unwrap().label.clone();

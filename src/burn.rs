@@ -38,6 +38,12 @@ pub struct Sample {
 /// id from `WindowShape::id` and produces a `Window` with the same
 /// owned string. The burn-rate history key in `AppState` is also
 /// `String` for the same reason.
+///
+/// `count_unit` and `currency` mirror the corresponding `WindowShape`
+/// fields verbatim. They're carried on `Window` (rather than looked
+/// up from config at render time) so `build_menu_state` has
+/// everything it needs without a side-table. Default `None` for both
+/// preserves legacy behavior: tok/h label, no currency symbol.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Window {
     /// Stable label, e.g. "5h", "weekly", "daily". Used as the
@@ -48,6 +54,27 @@ pub struct Window {
     pub remaining_pct: i64,
     pub start_at: i64,
     pub reset_at: i64,
+    /// Copy of `WindowShape::count_unit`. `None` ⇒ treat as `"tokens"`.
+    /// `Some("cents")` ⇒ the `used` field is in smallest currency
+    /// units (e.g. cents); the burn row renders as `$/h`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_unit: Option<String>,
+    /// Copy of `WindowShape::currency`. `None` or `""` ⇒ no currency
+    /// symbol in the burn row. `Some("USD")` ⇒ prefix the rate with
+    /// `$` (currently we render `$` regardless of code; v1 prototype).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// Model id from the API response entry (set by the parser when
+    /// `WindowShape::pricing_model_path` is configured). Used by
+    /// `build_menu_state` to look up per-token pricing in the
+    /// cached price table and append a `· $X/h` cost fragment.
+    ///
+    /// `None` means "the API didn't tag this entry with a model",
+    /// which is the common case for quota-only endpoints (Coding
+    /// Plan, OpenRouter auth/key, Together credit, etc.) and
+    /// preserves legacy behavior with no cost fragment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Outcome of a burn-rate projection.
@@ -312,6 +339,9 @@ mod tests {
     fn returns_none_when_disabled() {
         let w = Window { id: "5h".to_string(), total: 1000, used: 500,
                          remaining_pct: 50, start_at: NOW - 3_600_000,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          reset_at: NOW + 3_600_000 };
         let cfg = BurnConfig { enabled: false, ..BurnConfig::default() };
         let s = pct_samples(&[50, 49], w.start_at, w.reset_at);
@@ -322,6 +352,9 @@ mod tests {
     fn returns_none_with_one_sample() {
         let w = Window { id: "5h".to_string(), total: 1000, used: 500,
                          remaining_pct: 50, start_at: NOW - 3_600_000,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          reset_at: NOW + 3_600_000 };
         let s = vec![sample(-60_000, 500, 50, w.start_at, w.reset_at)];
         assert!(burn(Some(&w), &s).is_none());
@@ -330,6 +363,9 @@ mod tests {
     #[test]
     fn returns_none_until_min_history_ms_elapses() {
         let w = Window { id: "5h".to_string(), total: 1000, used: 500, remaining_pct: 50,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: NOW - 30_000, reset_at: NOW + 3_600_000 };
         let s = [
             sample(-30_000, 500, 50, w.start_at, w.reset_at),
@@ -342,6 +378,9 @@ mod tests {
     #[test]
     fn returns_none_when_window_already_past_reset() {
         let w = Window { id: "5h".to_string(), total: 1000, used: 500, remaining_pct: 50,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: NOW - 7_200_000, reset_at: NOW - 1000 };
         let s = pct_samples(&[50, 40], w.start_at, w.reset_at);
         assert!(burn(Some(&w), &s).is_none());
@@ -353,6 +392,9 @@ mod tests {
     fn steep_token_burn_warns_when_exhaust_before_reset() {
         // 200 tokens / 2 min → 6000/h on 1000 total → exhausts in ~10 min, 1h left
         let w = Window { id: "5h".to_string(), total: 1000, used: 0, remaining_pct: 100,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: NOW - 4 * 3_600_000, reset_at: NOW + 3_600_000 };
         let s: Vec<Sample> = (0..6).map(|i| sample(
             -((5 - i) as i64) * 2 * 60_000,
@@ -371,6 +413,9 @@ mod tests {
     fn low_token_burn_does_not_warn() {
         // 2 tok / 2 min → 60/h on 10_000 total → won't exhaust in 1h
         let w = Window { id: "5h".to_string(), total: 10_000, used: 0, remaining_pct: 100,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: NOW - 4 * 3_600_000, reset_at: NOW + 3_600_000 };
         let s: Vec<Sample> = (0..6).map(|i| sample(
             -((5 - i) as i64) * 2 * 60_000,
@@ -383,6 +428,9 @@ mod tests {
     #[test]
     fn idle_token_plan_still_gets_row_with_zero_rate() {
         let w = Window { id: "5h".to_string(), total: 10_000, used: 1000, remaining_pct: 90,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: 0, reset_at: NOW + 3 * 3_600_000 };
         let s: Vec<Sample> = (0..3).map(|i| sample(
             -((2 - i) as i64) * 60_000, 1000, 90, w.start_at, w.reset_at)).collect();
@@ -394,6 +442,9 @@ mod tests {
     #[test]
     fn use_epoch_average_false_drops_the_floor() {
         let w = Window { id: "5h".to_string(), total: 10_000, used: 2000, remaining_pct: 80,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: NOW - 7_200_000, reset_at: NOW + 3_600_000 };
         let s: Vec<Sample> = (0..3).map(|i| sample(
             -((2 - i) as i64) * 60_000, 2000, 80, w.start_at, w.reset_at)).collect();
@@ -414,6 +465,9 @@ mod tests {
     #[test]
     fn live_coding_plan_shape_pct_drops_each_poll() {
         let w = Window { id: "5h".to_string(), total: 0, used: 0, remaining_pct: 76,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: NOW - 30 * 60_000, reset_at: NOW + 4 * 3_600_000 };
         let s = pct_samples(&[80, 79, 78, 77, 76], w.start_at, w.reset_at);
         let result = burn(Some(&w), &s).unwrap();
@@ -426,6 +480,9 @@ mod tests {
     #[test]
     fn idle_coding_plan_unit_is_pct_not_token() {
         let w = Window { id: "5h".to_string(), total: 0, used: 0, remaining_pct: 100,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: 0, reset_at: NOW + 5 * 3_600_000 };
         let s: Vec<Sample> = (0..3).map(|i| sample(
             -((2 - i) as i64) * 60_000, 0, 100, w.start_at, w.reset_at)).collect();
@@ -439,6 +496,9 @@ mod tests {
     #[test]
     fn new_epoch_uses_fresh_history() {
         let w = Window { id: "5h".to_string(), total: 1000, used: 0, remaining_pct: 100,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: NOW - 60_000, reset_at: NOW + 5 * 3_600_000 };
         let s = [
             sample(-60_000, 0,   100, w.start_at, w.reset_at),
@@ -455,6 +515,9 @@ mod tests {
     fn pct_only_weekly_with_flat_data_is_suppressed() {
         let w = Window { id: "weekly".to_string(), total: 0, used: 0, remaining_pct: 90,
                          start_at: NOW - 2 * 86_400_000,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          reset_at: NOW + 5 * 86_400_000 };
         let s: Vec<Sample> = (0..5).map(|i| sample(
             -((4 - i) as i64) * 2 * 60_000, 0, 90, w.start_at, w.reset_at)).collect();
@@ -467,6 +530,9 @@ mod tests {
     #[test]
     fn pct_only_5h_active_ticks_is_shown() {
         let w = Window { id: "5h".to_string(), total: 0, used: 0, remaining_pct: 76,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: NOW - 30 * 60_000, reset_at: NOW + 4 * 3_600_000 };
         let s = pct_samples(&[80, 79, 78, 77, 76], w.start_at, w.reset_at);
         let result = row(Some(&w), &s).unwrap();
@@ -477,6 +543,9 @@ mod tests {
     #[test]
     fn pct_only_5h_idle_is_suppressed() {
         let w = Window { id: "5h".to_string(), total: 0, used: 0, remaining_pct: 100,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: NOW - 30 * 60_000, reset_at: NOW + 5 * 3_600_000 };
         let s: Vec<Sample> = (0..3).map(|i| sample(
             -((2 - i) as i64) * 60_000, 0, 100, w.start_at, w.reset_at)).collect();
@@ -486,6 +555,9 @@ mod tests {
     #[test]
     fn token_plan_idle_still_shows_row() {
         let w = Window { id: "5h".to_string(), total: 10_000, used: 1000, remaining_pct: 90,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: NOW - 3_600_000, reset_at: NOW + 3 * 3_600_000 };
         let s: Vec<Sample> = (0..3).map(|i| sample(
             -((2 - i) as i64) * 60_000, 1000, 90, w.start_at, w.reset_at)).collect();
@@ -497,6 +569,9 @@ mod tests {
     #[test]
     fn rate_is_independent_of_unrelated_history() {
         let w = Window { id: "5h".to_string(), total: 0, used: 0, remaining_pct: 80,
+                         count_unit: None,
+                         currency: None,
+                         model: None,
                          start_at: NOW - 30 * 60_000, reset_at: NOW + 4 * 3_600_000 };
         let five_h = pct_samples(&[80, 79, 78, 77, 76], w.start_at, w.reset_at);
         let weekly = pct_samples(&[90, 90, 90, 90, 90],

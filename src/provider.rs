@@ -273,6 +273,56 @@ pub struct WindowShape {
     /// timestamp (after applying `reset_unit_ms`) instead of adding
     /// it to `now_ms`.
     pub reset_is_absolute_epoch: bool,
+
+    /// Unit of the `{prefix}_total_count` / `{prefix}_usage_count`
+    /// integers. Drives the burn-row label suffix and the projected
+    /// dollar rate. Defaults to `"tokens"` (legacy behavior).
+    ///
+    /// Supported values:
+    /// - `"tokens"` — integers are token counts. Burn row says
+    ///   `40 tok/h`. Default when this field is absent.
+    /// - `"cents"` — integers are the smallest currency unit (cents
+    ///   for USD, fen for CNY). Burn row says `$0.40/h` (or with the
+    ///   `currency` field, `CNY 0.40/h`). Used by Together, DeepSeek,
+    ///   OpenRouter (auth/key returns USD floats — scale to cents in
+    ///   the adapter, then set this flag).
+    /// - `"milliunits"` — integers are thousandths of a billing unit
+    ///   (OpenAI-billed-units style). Burn row scales by 1/1000.
+    ///   Rarely needed; included for completeness.
+    ///
+    /// New providers that report usage as a currency value (not as a
+    /// token count) should set `count_unit: "cents"` AND scale the
+    /// value in their adapter (e.g. `$25.00 → 2500 cents`). The tray
+    /// never does the float→int conversion itself — the existing
+    /// `num()` parser helper truncates floats to int and would lose
+    /// sub-dollar precision otherwise.
+    #[serde(default)]
+    pub count_unit: Option<String>,
+
+    /// Currency code for the burn-row label when `count_unit` is
+    /// `"cents"` or `"milliunits"`. ISO-4217 lowercase ("usd",
+    /// "eur", "cny") or display form ("USD", "¥"). Defaults to `""`
+    /// (no currency symbol — burn row just shows the number with
+    /// the existing rate formatter).
+    ///
+    /// For v1 of the OpenRouter prototype this is display-only.
+    /// Values are not converted between currencies.
+    #[serde(default)]
+    pub currency: Option<String>,
+
+    /// JSON pointer to a field in the API response entry holding
+    /// the model id (e.g. `"/model_name"` for OpenRouter inference
+    /// usage, or `"/data/0/model"` for nested shapes). When set,
+    /// the parser reads the model id and the renderer can append a
+    /// `· $X/h` cost fragment using the cached price table from
+    /// `Config::pricing_endpoint`.
+    ///
+    /// Defaults to `None` (no model lookup). Token plans that don't
+    /// tag entries by model — or any provider without a
+    /// `pricing_endpoint` configured — leave this unset and the
+    /// burn row stays as it is today.
+    #[serde(default)]
+    pub pricing_model_path: Option<String>,
 }
 
 /// Where to find the entry array in the JSON payload, and which
@@ -317,6 +367,9 @@ pub fn default_shape() -> PlanShape {
             start_unit_ms: 1000,
             reset_unit_ms: 1,
             reset_is_absolute_epoch: false,
+            count_unit: None,
+            currency: None,
+            pricing_model_path: None,
         }],
         error_envelope: None,
     }

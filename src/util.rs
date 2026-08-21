@@ -88,6 +88,52 @@ pub fn bar_markup(fraction_pct: i64) -> String {
             "\u{2591}".repeat(empty as usize))
 }
 
+/// Compact cost-per-hour label for currency-denominated windows
+/// (`WindowShape::count_unit == "cents"` or `"milliunits"`).
+///
+/// The `rate_per_hour` arriving here is in the same units as the
+/// window's `used` integer — so when the upstream adapter scales a
+/// USD float to integer cents (e.g. `$25.00 → 2500`), the rate is
+/// also cents-per-hour. We convert cents→dollars for display here.
+///
+/// Format rules (mirroring `fmt_rate`'s tier system):
+/// - < $0.01/h → `"$0.0042"` (4 decimals — typical for tiny OpenRouter
+///   mini-models)
+/// - < $1/h   → `"$0.40"`     (3 decimals)
+/// - < $100/h → `"$5.23"`     (2 decimals — most common range)
+/// - ≥ $100/h → `"$123"`      (integer dollars)
+///
+/// Trailing zeros are stripped at every tier (mirroring `fmt_rate`'s
+/// `"$1.0k"` → `"$1k"` rule) so the row reads cleanly: `$0.4`, `$5`,
+/// `$0.005` — never `$0.400` or `$5.00`.
+///
+/// Non-finite or negative rates return `"$0"`. The currency symbol
+/// is hardcoded to `$` in the v1 prototype — the `currency` field on
+/// the window is preserved on `Window` for future i18n but not yet
+/// threaded through here. (Reasoning: most currency-in-quota APIs
+/// today report in USD; extending this is a one-line change when a
+/// second currency shows up.)
+pub fn fmt_cost(cents_per_hour: f64) -> String {
+    if !cents_per_hour.is_finite() || cents_per_hour <= 0.0 {
+        return "$0".to_string();
+    }
+    let usd = cents_per_hour / 100.0;
+    let trim = |s: String| -> String {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else { s }
+    };
+    if usd < 0.01 {
+        trim(format!("${usd:.4}"))
+    } else if usd < 1.0 {
+        trim(format!("${usd:.3}"))
+    } else if usd < 100.0 {
+        trim(format!("${usd:.2}"))
+    } else {
+        format!("${}", usd.round() as i64)
+    }
+}
+
 /// Burn-row label: the per-window informational line under the bar.
 ///
 /// gjs parity: matches `burnRowLabel()`. Two variants:
@@ -98,11 +144,37 @@ pub fn bar_markup(fraction_pct: i64) -> String {
 ///
 /// The pct-only variant uses "/h" not "tok/h" (Coding Plan).
 /// `projected_pct_left` rounds to the nearest integer for display.
-pub fn burn_row_label(burn: &crate::burn::BurnResult) -> String {
+///
+/// Currency-aware: when the window's `count_unit` is `"cents"` (or
+/// `"milliunits"`), the rate is rendered with `fmt_cost` instead of
+/// the token formatter — so the row reads `(40 $/h)` for Together /
+/// DeepSeek / OpenRouter-style windows. The `currency` field is
+/// currently display-only metadata (see `fmt_cost` notes); passing it
+/// here is forward-compatible with i18n but doesn't affect output yet.
+///
+/// Pricing fragment: when `cost_fragment` is `Some(s)`, it's appended
+/// to the rate portion of the label with a ` · ` separator — e.g.
+/// `(40 tok/h · $0.4/h)`. The caller (build_menu_state) is
+/// responsible for computing the fragment from the cached price
+/// table; this function is a pure formatter. `None` preserves the
+/// legacy one-rate label.
+pub fn burn_row_label(
+    burn: &crate::burn::BurnResult,
+    count_unit: Option<&str>,
+    _currency: Option<&str>,
+    cost_fragment: Option<&str>,
+) -> String {
+    let is_currency = matches!(count_unit, Some("cents") | Some("milliunits"));
     let rate_unit = if burn.unit == "pct" {
         format!("{}/h", fmt_rate(burn.rate_per_hour))
+    } else if is_currency {
+        format!("{}/h", fmt_cost(burn.rate_per_hour))
     } else {
         format!("{} tok/h", fmt_rate(burn.rate_per_hour))
+    };
+    let rate_unit = match cost_fragment {
+        Some(extra) => format!("{rate_unit} · {extra}"),
+        None => rate_unit,
     };
     if burn.exhaust_before_reset {
         format!("  ⚠ {rate_unit} → exhausts ~{} before reset",
@@ -197,6 +269,141 @@ mod tests {
         assert_eq!(fmt_rate(f64::NAN), "0");
         assert_eq!(fmt_rate(f64::INFINITY), "0");
         assert_eq!(fmt_rate(-1.0), "0");
+    }
+
+    // ---- fmt_cost (OpenRouter prototype: $/h from cents/h) ----
+
+    /// Helper for the burn_row_label tests below. Builds a
+    /// token-mode BurnResult with a fixed rate + pct.
+    fn burn_for_test(rate_per_hour: f64, projected_pct_left: f64,
+                     exhaust_before_reset: bool, unit: &'static str) -> crate::burn::BurnResult {
+        crate::burn::BurnResult {
+            rate_per_hour,
+            mode: unit,
+            unit,
+            exhaust_ms: if exhaust_before_reset { 60.0 * 60_000.0 } else { f64::INFINITY },
+            remaining_ms: 5 * 60 * 60_000,
+            exhaust_before_reset,
+            projected_pct_left,
+        }
+    }
+
+    #[test]
+    fn fmt_cost_units() {
+        // Cents/h → $/h, with tier boundaries matching fmt_rate's
+        // style. Trailing zeros are stripped at every tier (mirrors
+        // `fmt_rate`'s gjs parity rule: `"$1.0k"` → `"$1k"`).
+        assert_eq!(fmt_cost(0.0),       "$0");
+        assert_eq!(fmt_cost(0.5),       "$0.005");   // < $0.01 → 4dp
+        assert_eq!(fmt_cost(1.0),       "$0.01");    // exactly $0.01
+        assert_eq!(fmt_cost(50.0),      "$0.5");     // < $1 → 3dp
+        assert_eq!(fmt_cost(99.0),      "$0.99");
+        assert_eq!(fmt_cost(100.0),     "$1");       // ≥ $1 → 2dp, both zeros stripped
+        assert_eq!(fmt_cost(523.0),     "$5.23");    // typical PAYG burn
+        assert_eq!(fmt_cost(9999.0),    "$99.99");
+        assert_eq!(fmt_cost(10_000.0),  "$100");     // ≥ $100 → integer
+        assert_eq!(fmt_cost(12_345.0),  "$123");
+        assert_eq!(fmt_cost(999_500.0), "$9995");
+    }
+
+    #[test]
+    fn fmt_cost_handles_nonfinite() {
+        assert_eq!(fmt_cost(f64::NAN), "$0");
+        assert_eq!(fmt_cost(f64::INFINITY), "$0");
+        assert_eq!(fmt_cost(-1.0), "$0");
+        assert_eq!(fmt_cost(f64::NEG_INFINITY), "$0");
+    }
+
+    // ---- burn_row_label (count_unit / currency / cost_fragment) ----
+
+    #[test]
+    fn burn_row_label_default_uses_tok_h() {
+        // Legacy: no count_unit → "tok/h" suffix (matches gjs parity).
+        let b = burn_for_test(40.0, 48.0, false, "token");
+        assert_eq!(burn_row_label(&b, None, None, None),
+                   "  · on pace to have ~48% left at reset (40 tok/h)");
+    }
+
+    #[test]
+    fn burn_row_label_cents_uses_dollar_h() {
+        // OpenRouter / Together / DeepSeek prototype: count_unit="cents".
+        // The same rate (40/h) now reads as "$0.4/h".
+        let b = burn_for_test(40.0, 48.0, false, "token");
+        assert_eq!(burn_row_label(&b, Some("cents"), Some("USD"), None),
+                   "  · on pace to have ~48% left at reset ($0.4/h)");
+    }
+
+    #[test]
+    fn burn_row_label_milliunits_also_uses_dollar_h() {
+        // OpenAI-billed-units style (rare; included for completeness).
+        // 1000 milliunits/h with our fmt_cost (which treats input as
+        // cents/h) renders "$10/h" after trailing-zero strip.
+        let b = burn_for_test(1000.0, 50.0, false, "token");
+        assert_eq!(burn_row_label(&b, Some("milliunits"), None, None),
+                   "  · on pace to have ~50% left at reset ($10/h)");
+    }
+
+    #[test]
+    fn burn_row_label_cents_warn_variant() {
+        let b = burn_for_test(500.0, 0.0, true, "token");
+        assert_eq!(burn_row_label(&b, Some("cents"), Some("USD"), None),
+                   "  ⚠ $5/h → exhausts ~1h before reset");
+    }
+
+    #[test]
+    fn burn_row_label_cents_zero_rate_still_renders() {
+        // Idle (rate=0) should not emit garbage — fmt_cost returns "$0".
+        let b = burn_for_test(0.0, 100.0, false, "token");
+        assert_eq!(burn_row_label(&b, Some("cents"), Some("USD"), None),
+                   "  · on pace to have ~100% left at reset ($0/h)");
+    }
+
+    #[test]
+    fn burn_row_label_pct_mode_unchanged_by_count_unit() {
+        // pct-mode (Coding Plan) ignores count_unit — the rate is always
+        // in %/h, never $/h. Lock this in so the OpenRouter change
+        // doesn't accidentally promote a pct window to currency.
+        let b = burn_for_test(15.0, 62.0, false, "pct");
+        assert_eq!(burn_row_label(&b, Some("cents"), Some("USD"), None),
+                   "  · on pace to have ~62% left at reset (15/h)");
+    }
+
+    #[test]
+    fn burn_row_label_appends_cost_fragment() {
+        // When cost_fragment is Some, append it to the rate portion
+        // with a " · " separator. Sanity-checks the OpenRouter
+        // pricing-lookup wiring end-to-end through this function.
+        let b = burn_for_test(100_000.0, 50.0, false, "token");
+        assert_eq!(burn_row_label(&b, None, None, Some("$0.4/h")),
+                   "  · on pace to have ~50% left at reset (100k tok/h · $0.4/h)");
+    }
+
+    #[test]
+    fn burn_row_label_cost_fragment_works_in_warn_variant() {
+        let b = burn_for_test(500_000.0, 0.0, true, "token");
+        assert_eq!(burn_row_label(&b, None, None, Some("$5/h")),
+                   "  ⚠ 500k tok/h · $5/h → exhausts ~1h before reset");
+    }
+
+    #[test]
+    fn burn_row_label_cost_fragment_works_in_currency_mode() {
+        // Currency-mode (Together/DeepSeek): row is already in $/h,
+        // but caller may still pass a cost_fragment (e.g. price-table
+        // lookup found the model). Verify the " · " append is
+        // harmless rather than erroring.
+        let b = burn_for_test(40.0, 48.0, false, "token");
+        assert_eq!(burn_row_label(&b, Some("cents"), Some("USD"), Some("$0.0001/h")),
+                   "  · on pace to have ~48% left at reset ($0.4/h · $0.0001/h)");
+    }
+
+    #[test]
+    fn burn_row_label_pct_mode_with_cost_fragment() {
+        // pct-mode is opaque to count_unit; cost_fragment is currently
+        // appended regardless of mode (callers should gate upstream).
+        // Lock in current behavior so any future change is intentional.
+        let b = burn_for_test(15.0, 62.0, false, "pct");
+        assert_eq!(burn_row_label(&b, None, None, Some("$0.4/h")),
+                   "  · on pace to have ~62% left at reset (15/h · $0.4/h)");
     }
 
     #[test]

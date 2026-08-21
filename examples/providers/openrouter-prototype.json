@@ -1,0 +1,186 @@
+{
+  "_comment1": "OpenRouter prototype instance. Tracks dollar-based credit usage",
+  "_comment2": "via /api/v1/auth/key. Runs alongside the default MiniMax",
+  "_comment3": "instance without interfering:",
+  "_comment4": "  llm-quota-tray --instance=openrouter-prototype",
+  "_comment5": "",
+  "_comment6": "SHAPE FIT: requires an adapter — /api/v1/auth/key returns USD",
+  "_comment7": "floats ({ usage, limit }) and a boolean is_free_tier, not the",
+  "_comment8": "tray's integer count contract. The adapter below wraps the call",
+  "_comment9": "and scales USD to cents so the existing parser contract holds.",
+  "_comment10": "",
+  "_comment11": "When is_free_tier is true, the adapter sets a synthetic 30d",
+  "_comment12": "remains_time. When false, the adapter sets a synthetic 1d",
+  "_comment13": "remains_time (OpenRouter's pay-as-you-go doesn't roll over).",
+  "_comment14": "",
+  "_comment15": "DIFFERENCE FROM examples/providers/openrouter.json: that one",
+  "_comment16": "tracks token usage via an inference probe; this one tracks",
+  "_comment17": "credit spend via the auth/key endpoint and uses the new",
+  "_comment18": "count_unit + currency fields so the burn row shows $/h",
+  "_comment19": "instead of tok/h.",
+  "_comment20": "",
+  "_comment21": "NEW fields used here (added in this prototype):",
+  "_comment22": "  shape.windows[].count_unit: \"cents\"  -- the integers in",
+  "_comment23": "    credit_total_count / credit_usage_count represent cents",
+  "_comment24": "    of USD, not tokens. Tells the burn-row label to render",
+  "_comment25": "    $(X)/h instead of (X tok/h).",
+  "_comment26": "  shape.windows[].currency: \"USD\" -- display code for the",
+  "_comment27": "    burn row. Currently hardcoded to $ in fmt_cost; reserved",
+  "_comment28": "    for future i18n.",
+  "_comment29": "",
+  "_comment30": "Both fields are Option<String> with #[serde(default)] on the",
+  "_comment31": "WindowShape struct; omitting them on other providers' configs",
+  "_comment32": "is a no-op (parses to None, behaves as the legacy tok/h).",
+
+  "endpoint": "http://127.0.0.1:8088/openrouter/quota",
+  "dashboard_url": "https://openrouter.ai/credits",
+  "label": "OpenRouter",
+
+  "shape": {
+    "entries_path": "/data",
+    "windows": [{
+      "id": "credits",
+      "field_prefix": "credit",
+      "start_unit_ms": 1000,
+      "reset_unit_ms": 1,
+      "reset_is_absolute_epoch": false,
+      "count_unit": "cents",
+      "currency": "USD",
+      "_win_comment1": "credit_total_count and credit_usage_count are cents-of-USD",
+      "_win_comment2": "scaled by the adapter (data.usage * 100, data.limit * 100).",
+      "_win_comment3": "credit_remaining_percent is computed by the adapter.",
+      "_win_comment4": "credit_remains_time is a duration in ms (adapter-synthesized",
+      "_win_comment5": "since auth/key doesn't return a reset timestamp)."
+    }],
+    "error_envelope": null
+  },
+
+  "ring_colors": {
+    "inner": {
+      "_inner_comment": "OpenRouter brand-aligned purples.",
+      "normal":   "#7c3aed",
+      "warning":  "#fbbf24",
+      "throttled": "#dc2626"
+    },
+    "outer": "#4f46e5"
+  },
+
+  "auth": {
+    "type": "bearer",
+    "_auth_comment": "Bearer auth is used by the SIDE PROXY when it makes the upstream",
+    "_auth_comment2": "request to OpenRouter. The tray itself doesn't reach OpenRouter",
+    "_auth_comment3": "directly -- it reads the proxy's adapter-shaped JSON."
+  },
+
+  "user_agent": "llm-quota-tray",
+
+  "refresh_seconds": 60,
+  "refresh_min_seconds": 30,
+  "refresh_max_backoff_seconds": 600,
+  "_refresh_comment": "60s -- credit balance changes faster than minute-level quota, but",
+
+  "thresholds": {
+    "yellow": 60,
+    "red": 85
+  },
+
+  "burn_warning": {
+    "enabled": true,
+    "min_history_ms": 600000,
+    "lookback_ms": 3600000,
+    "use_epoch_average": true,
+    "_burn_comment": "For credit-balance windows, the burn rate is in cents/hour",
+    "_burn_comment2": "and the row renders as '$0.40/h' or '⚠ $5/h → exhausts ~1h'.",
+    "_burn_comment3": "idle ($0/h) still shows the row -- token-plan idle behavior,",
+    "_burn_comment4": "not pct-only suppression."
+  },
+
+  "_adapter_example": {
+    "_note": "Required: a small sidecar that polls /api/v1/auth/key and",
+    "_note2": "emits the parser-shaped JSON. Runs on 127.0.0.1:8088.",
+    "_note3": "Replace sk-or-v1-... with your actual OpenRouter API key.",
+
+    "_python_stub": "#!/usr/bin/env python3",
+    "_python_stub2": "\"\"\"Minimal OpenRouter credit-balance proxy.",
+
+    "_python_stub3": "Polls /api/v1/auth/key every N seconds, scales USD floats",
+    "_python_stub4": "to integer cents, and emits the tray's parser-shaped JSON.",
+    "_python_stub5": "\"\"\"",
+
+    "_python_stub6": "import http.server, json, os, time, urllib.request",
+
+    "_python_stub7": "OR_KEY       = os.environ['OPENROUTER_API_KEY']",
+    "_python_stub8": "POLL_EVERY   = int(os.environ.get('OPENROUTER_POLL_EVERY', '60'))  # seconds",
+    "_python_stub9": "FREE_TIER_CAP_USD = float(os.environ.get('OPENROUTER_FREE_CAP', '10'))",
+
+    "_python_stub10": "state = {'last_poll': 0, 'cached': None}",
+
+    "_python_stub11": "def fetch_credits():",
+    "_python_stub12": "    \"\"\"GET /api/v1/auth/key and return the tray-shaped dict.\"\"\"",
+    "_python_stub13": "    req = urllib.request.Request(",
+    "_python_stub14": "        'https://openrouter.ai/api/v1/auth/key',",
+    "_python_stub15": "        headers={'Authorization': f'Bearer {OR_KEY}'})",
+    "_python_stub16": "    with urllib.request.urlopen(req) as r:",
+    "_python_stub17": "        body = json.load(r)",
+    "_python_stub18": "    d = body['data']",
+    "_python_stub19": "    usage_usd = float(d.get('usage') or 0)",
+    "_python_stub20": "    is_free = bool(d.get('is_free_tier'))",
+    "_python_stub21": "    limit_usd = float(d['limit']) if d.get('limit') is not None else (FREE_TIER_CAP_USD if is_free else 0)",
+
+    "_python_stub22": "    # Scale to cents; the tray's parser contract requires integers.",
+    "_python_stub23": "    used_cents = int(usage_usd * 100)",
+    "_python_stub24": "    total_cents = int(limit_usd * 100) if limit_usd > 0 else 0",
+    "_python_stub25": "    if total_cents > 0:",
+    "_python_stub26": "        remaining_pct = max(0, min(100, int((1 - usage_usd / limit_usd) * 100)))",
+    "_python_stub27": "    else:",
+    "_python_stub28": "        remaining_pct = 100  # no cap -- pay-as-you-go",
+
+    "_python_stub29": "    # Synthetic reset windows: free-tier credits roll over on signup",
+    "_python_stub30": "    # anniversary (use 30d placeholder); pay-as-you-go doesn't roll",
+    "_python_stub31": "    # over so show 1d.",
+    "_python_stub32": "    now_ms = int(time.time() * 1000)",
+    "_python_stub33": "    reset_ms = 30 * 86_400_000 if is_free else 86_400_000",
+
+    "_python_stub34": "    return {",
+    "_python_stub35": "        'data': [{",
+    "_python_stub36": "            'credit_total_count':       total_cents,",
+    "_python_stub37": "            'credit_usage_count':       used_cents,",
+    "_python_stub38": "            'credit_remaining_percent': remaining_pct,",
+    "_python_stub39": "            'credit_start_time':        now_ms // 1000,",
+    "_python_stub40": "            'credit_remains_time':      reset_ms,",
+    "_python_stub41": "        }],",
+    "_python_stub42": "    }",
+
+    "_python_stub43": "class Q(http.server.BaseHTTPRequestHandler):",
+    "_python_stub44": "    def do_GET(self):",
+    "_python_stub45": "        now = time.time()",
+    "_python_stub46": "        if state['cached'] is None or (now - state['last_poll']) >= POLL_EVERY:",
+    "_python_stub47": "            try:",
+    "_python_stub48": "                state['cached'] = fetch_credits()",
+    "_python_stub49": "                state['last_poll'] = now",
+    "_python_stub50": "            except Exception as e:",
+    "_python_stub51": "                # Surface the error in the response so the tray's",
+    "_python_stub52": "                # error_envelope reader picks it up; if not configured,",
+    "_python_stub53": "                # just pass through what we have cached.",
+    "_python_stub54": "                body = json.dumps({'error': {'message': str(e)}}).encode()",
+    "_python_stub55": "                self.send_response(502)",
+    "_python_stub56": "                self.send_header('content-type', 'application/json')",
+    "_python_stub57": "                self.send_header('content-length', str(len(body)))",
+    "_python_stub58": "                self.end_headers()",
+    "_python_stub59": "                self.wfile.write(body)",
+    "_python_stub60": "                return",
+    "_python_stub61": "        body = json.dumps(state['cached']).encode()",
+    "_python_stub62": "        self.send_response(200)",
+    "_python_stub63": "        self.send_header('content-type', 'application/json')",
+    "_python_stub64": "        self.send_header('content-length', str(len(body)))",
+    "_python_stub65": "        self.end_headers()",
+    "_python_stub66": "        self.wfile.write(body)",
+    "_python_stub67": "    def log_message(self, *a): pass",
+
+    "_python_stub68": "http.server.HTTPServer(('127.0.0.1', 8088), Q).serve_forever()",
+
+    "_note3": "",
+    "_note4": "Run with: OPENROUTER_API_KEY=sk-or-v1-... python3 proxy.py",
+    "_note5": "Point this config's `endpoint` at http://127.0.0.1:8088/openrouter/quota"
+  }
+}

@@ -196,6 +196,9 @@ mod tests {
                 start_unit_ms: 1,
                 reset_unit_ms: 1,
                 reset_is_absolute_epoch: false,
+                count_unit: None,
+                currency: None,
+                pricing_model_path: None,
             }],
             error_envelope: Some(env),
         }

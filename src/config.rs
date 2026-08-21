@@ -65,6 +65,33 @@ pub struct Config {
 
     #[serde(default)]
     pub burn_warning: BurnConfig,
+
+    /// Optional URL to a per-model pricing endpoint (OpenRouter uses
+    /// `https://openrouter.ai/api/v1/models`, fully public). When set,
+    /// the tray fetches the table at startup and re-fetches every
+    /// `pricing_refresh_polls` polls (default: once at startup).
+    ///
+    /// The expected wire shape is `{ "data": [ { "id": "...",
+    /// "pricing": { "prompt": "...", "completion": "...",
+    /// "input_cache_read": "..." } }, ... ] }` — see `src/pricing.rs`.
+    /// Any provider exposing the same shape (or a thin adapter that
+    /// projects onto it) works without further config.
+    ///
+    /// When unset, no pricing fetch happens and no `· $X/h` cost
+    /// fragment is appended to burn rows — same behavior as before
+    /// this field was added.
+    #[serde(default)]
+    pub pricing_endpoint: Option<String>,
+
+    /// How often (in successful polls) to re-fetch the pricing
+    /// endpoint. `None` means "fetch once at startup, never refresh".
+    /// Set to e.g. `Some(60)` to re-fetch hourly at the default
+    /// 60s poll cadence.
+    ///
+    /// Refresh failures are best-effort: a failed re-fetch keeps
+    /// the previous table in place and just logs a warning.
+    #[serde(default)]
+    pub pricing_refresh_polls: Option<u64>,
 }
 
 fn default_user_agent() -> String {
@@ -100,6 +127,8 @@ impl Default for Config {
             refresh_max_backoff_seconds: 600,
             thresholds: Thresholds { yellow: 60, red: 85 },
             burn_warning: BurnConfig::default(),
+            pricing_endpoint: None,
+            pricing_refresh_polls: None,
         }
     }
 }

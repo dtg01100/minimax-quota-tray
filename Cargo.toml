@@ -28,9 +28,11 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Keyring — Secret Service (freedesktop, not GNOME-specific).
-secret-service = { version = "3", features = ["rt-tokio-crypto-rust"] }
-
+# Keyring — GNOME Keyring / KWallet via the `secret-tool(1)` CLI
+# (libsecret-tools). We shell out to `secret-tool store` /
+# `secret-tool lookup` instead of linking the `secret-service` Rust
+# crate, which panics on tokio-runtime-context conflict (see
+# src/keyring.rs for the rationale).
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"

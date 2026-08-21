@@ -1,89 +1,125 @@
-//! GNOME Keyring wrapper. Stores the API key as a Secret Service item,
+//! GNOME Keyring wrapper. Stores the API key as a Secret Service item
+//! via the `secret-tool(1)` CLI (shipped with libsecret-tools),
 //! schema `{ application: <instance> }`. The `application` attribute
 //! is per-instance (see `crate::instance::keyring_application`) so
 //! two concurrent instances don't clobber each other's API key.
 //!
 //! Falls back to a per-machine file at
-//! `~/.config/<instance>/key` (mode 0600) when the keyring daemon
-//! isn't running — the gjs code used the same fallback.
+//! `~/.config/<instance>/key` (mode 0600) when neither `secret-tool`
+//! nor a Secret Service daemon is reachable — same fallback the gjs
+//! implementation used.
+//!
+//! ## Why subprocess and not the `secret-service` Rust crate
+//!
+//! Earlier versions of this module used `secret-service = "3"` with
+//! the `rt-tokio-crypto-rust` feature. The crate's sync API
+//! internally calls `zbus::utils::block_on(...)`, which panics with
+//! `"Cannot start a runtime from within a runtime"` when invoked
+//! from inside a tokio worker thread. The daemon's main runtime is
+//! `rt-multi-thread`; every keyring read from `do_refresh()` and
+//! every write from the menu's "Set API Key…" entry ran on a worker
+//! thread. The panic propagated back through the `spawn_blocking`
+//! `JoinHandle`, killed the daemon, and systemd restarted it 5s
+//! later with no key written — the user-visible "key doesn't stick"
+//! bug. Subprocess invocation sidesteps the runtime-context conflict
+//! entirely; the per-call cost (~20–50ms) is well below the
+//! `refresh_seconds` cadence.
 
 use anyhow::{Context, Result};
-use secret_service::blocking::SecretService;
-use secret_service::EncryptionType;
-use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::process::{Command, Stdio};
 
-/// One SecretService handle per process — opening the daemon connection
-/// is slow (~50ms), so we cache it.
-static SERVICE: OnceLock<Result<SecretService<'static>, String>> = OnceLock::new();
-
-fn service() -> Option<&'static SecretService<'static>> {
-    let r = SERVICE.get_or_init(|| {
-        SecretService::connect(EncryptionType::Dh).map_err(|e| format!("{e:?}"))
-    });
-    r.as_ref().ok()
+/// Subprocess wrapper around `secret-tool lookup`. Returns the
+/// stored secret on success, `None` on any failure (binary missing,
+/// daemon unreachable, no matching entry, etc.). Silent because we
+/// have two more fallbacks (file + env var) and the caller already
+/// deals with `None`.
+fn secret_tool_lookup() -> Option<String> {
+    let app = crate::instance::keyring_application();
+    let output = Command::new("secret-tool")
+        .args(["lookup", "application", &app])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(output.stdout).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
-/// Build the search attributes for the active instance. The Secret
-/// Service `search_items` API takes `HashMap<&str, &str>`, so we
-/// leak the application attribute to `&'static` — this is one
-/// Box::leak per process and the string lives for the binary's
-/// entire lifetime, which is fine for an instance-name-derived
-/// value.
-fn attrs() -> HashMap<&'static str, &'static str> {
-    let app: &'static str = Box::leak(crate::instance::keyring_application().into_boxed_str());
-    let mut m: HashMap<&'static str, &'static str> = HashMap::new();
-    m.insert("application", app);
-    m
+/// Subprocess wrapper around `secret-tool store`. Writes the secret
+/// via stdin so it never appears in process arguments, argv, or
+/// `/proc/<pid>/cmdline`.
+fn secret_tool_store(value: &str) -> Result<()> {
+    let app = crate::instance::keyring_application();
+    let label = format!("{} API Key", crate::instance::config_dir_basename());
+    let mut child = Command::new("secret-tool")
+        .args(["store", "--label", &label, "application", &app])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning secret-tool store")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(value.as_bytes())
+            .context("writing secret to secret-tool stdin")?;
+        // Drop stdin to close the pipe and signal EOF; secret-tool
+        // otherwise blocks reading.
+        drop(stdin);
+    }
+    let status = child.wait().context("waiting for secret-tool store")?;
+    if !status.success() {
+        anyhow::bail!("secret-tool store exited with {status}");
+    }
+    Ok(())
 }
 
-/// Label shown in the keyring GUI. Namespaced by instance so two
-/// instances' entries are distinguishable when the user opens
-/// Seahorse / KeePassXC / etc.
-fn label() -> String {
-    format!("{} API Key", crate::instance::config_dir_basename())
+/// Subprocess wrapper around `secret-tool clear`. Best-effort — a
+/// non-zero exit (no matching entry) is treated as success.
+fn secret_tool_clear() -> Result<()> {
+    let app = crate::instance::keyring_application();
+    let status = Command::new("secret-tool")
+        .args(["clear", "application", &app])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("spawning secret-tool clear")?;
+    if !status.success() {
+        log::debug!("secret-tool clear returned {status} (no entries to clear?)");
+    }
+    Ok(())
 }
 
-/// Look up the API key. Priority order matches the gjs `loadApiKey()`:
+/// Look up the API key. Priority order:
 ///
-///   1. Secret Service (GNOME Keyring / KWallet via libsecret).
-///   2. Legacy plaintext file at `$HOME/.config/.config/llm-quota-tray/key`
-///      (auto-migrated to the keyring on first run by the gjs code;
-///      here we just read it as a fallback if the keyring daemon is
-///      unreachable).
+///   1. Secret Service via `secret-tool` (GNOME Keyring / KWallet via libsecret).
+///   2. Legacy plaintext file at `$HOME/.config/.config/<instance>/key`.
 ///   3. `LLM_API_KEY` env var. Useful for systemd unit overrides
 ///      where the user prefers not to store a key in the keyring.
 ///
 /// Returns `None` if all three are missing/empty. Callers should treat
-/// `None` as "no API key configured" and surface that in the UI
-/// (matches gjs `printerr` + "No API key" chip state).
+/// `None` as "no API key configured" and surface that in the UI.
 pub fn get() -> Option<String> {
-    // 1. Secret Service
-    if let Some(svc) = service() {
-        let attrs = attrs();
-        if let Ok(collection) = svc.get_default_collection() {
-            if let Ok(items) = collection.search_items(attrs.clone()) {
-                if let Some(item) = items.into_iter().next() {
-                    if let Ok(bytes) = item.get_secret() {
-                        if let Some(k) = secret_to_key(&bytes) {
-                            return Some(k);
-                        }
-                    }
-                }
-            }
-        }
+    if let Some(k) = secret_tool_lookup() {
+        return Some(k);
     }
-    // 2. Legacy file (created by older install scripts; install.sh
-    // now uses Secret Service directly, so this is a fallback).
     let path = legacy_key_path();
     if let Ok(bytes) = std::fs::read(&path) {
         if let Some(k) = secret_to_key(&bytes) {
             return Some(k);
         }
     }
-    // 3. Env var. Trim + reject — matches the gjs handling that
-    // treats an all-whitespace env value as absent.
     if let Ok(raw) = std::env::var("LLM_API_KEY") {
         if let Some(k) = secret_to_key(raw.as_bytes()) {
             return Some(k);
@@ -104,33 +140,26 @@ fn secret_to_key(bytes: &[u8]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Write the API key. Tries `secret-tool store` first; on any failure
+/// (binary missing, daemon unreachable, libsecret locked) falls back
+/// to the legacy plaintext file at `~/.config/.config/<instance>/key`.
 pub fn set(value: &str) -> Result<()> {
-    if let Some(svc) = service() {
-        let collection = svc
-            .get_default_collection()
-            .context("opening default keyring collection")?;
-        let attrs = attrs();
-        // Replace any existing item first so we don't accumulate duplicates.
-        if let Ok(items) = collection.search_items(attrs.clone()) {
-            for item in items {
-                let _ = item.delete();
+    match secret_tool_store(value) {
+        Ok(()) => {
+            log::debug!("API key stored via secret-tool");
+            // Best-effort: clear any stale legacy file so we don't
+            // leak a plaintext copy after the user migrates to the
+            // keyring.
+            let path = legacy_key_path();
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
             }
+            return Ok(());
         }
-        collection
-            .unlock()
-            .context("unlocking keyring for write")?;
-        collection
-            .create_item(
-                &label(),
-                attrs,
-                value.as_bytes(),
-                true, // replace_existing
-                "text/plain",
-            )
-            .context("creating keyring item")?;
-        return Ok(());
+        Err(e) => {
+            log::debug!("secret-tool store failed ({e:#}); using file fallback");
+        }
     }
-    // Keyring unavailable — fall back to file. install.sh creates 0700 perms.
     let path = legacy_key_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -140,22 +169,13 @@ pub fn set(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove the stored API key from the keyring (and the legacy file
-/// fallback). Used by `gjs` menu's clear flow; exposed here for
-/// parity but not currently wired into the Rust menu. Calling it is
-/// safe; the function is best-effort.
+/// Remove the stored API key. Best-effort — both `secret-tool` and
+/// the file fallback are cleared. Used by the gjs menu's clear flow;
+/// exposed here for parity but not currently wired into the Rust
+/// menu. Safe to call when no key is set.
 #[allow(dead_code)]
 pub fn clear() -> Result<()> {
-    if let Some(svc) = service() {
-        let attrs = attrs();
-        if let Ok(collection) = svc.get_default_collection() {
-            if let Ok(items) = collection.search_items(attrs) {
-                for item in items {
-                    let _ = item.delete();
-                }
-            }
-        }
-    }
+    let _ = secret_tool_clear();
     let path = legacy_key_path();
     if path.exists() {
         std::fs::remove_file(&path)
@@ -245,17 +265,14 @@ mod tests {
 
     #[test]
     fn env_var_fallback_used_when_keyring_and_file_unavailable() {
-        // We can't easily isolate the keyring daemon in unit tests,
-        // so this test is gated on the keyring being unavailable
-        // (which is the case in CI / containers — see the
-        // `service()` cache).
-        //
-        // To force the env-var path we set LLM_API_KEY and
-        // rely on the keyring/legacy-file lookups failing in the
-        // test container.
+        // We can't easily isolate `secret-tool` (or its daemon) in
+        // unit tests, so this test is gated on both the keyring and
+        // the legacy file being unreachable — typical in CI / minimal
+        // containers. To force the env-var path we set LLM_API_KEY
+        // and rely on the keyring/legacy-file lookups failing.
         with_env(Some("sk-env-test-key"), || {
             let result = get();
-            // In an environment with a working keyring this might
+            // In an environment where secret-tool succeeds this might
             // short-circuit before the env check, so we only assert
             // what we can guarantee: if we got a value, it's non-empty.
             if let Some(k) = result {
@@ -267,8 +284,8 @@ mod tests {
     #[test]
     fn env_var_with_trailing_newline_trimmed() {
         with_env(Some("sk-env-key\n"), || {
-            // The actual return depends on whether the keyring is
-            // available; what we can guarantee is that *if* the env
+            // The actual return depends on whether secret-tool
+            // succeeds; what we can guarantee is that *if* the env
             // path is taken, the trailing newline is stripped.
             // We exercise secret_to_key directly to lock the behavior.
             let trimmed = secret_to_key(b"sk-env-key\n");
@@ -284,19 +301,25 @@ mod tests {
         assert!(path.ends_with(".config/.config/llm-quota-tray/key"));
     }
 
+    /// Exercises the file-fallback branch of `set()` + `clear()` by
+    /// forcing `secret-tool` to be unfindable (empty PATH so the
+    /// subprocess spawn fails with ENOENT). This isolates the file
+    /// fallback from the keyring branch so we can verify the
+    /// legacy plaintext path still round-trips.
     #[test]
-    #[ignore = "depends on whether a Secret Service daemon is reachable; covered in integration tests"]
+    #[ignore = "mutates HOME and PATH; covered in integration tests"]
     fn file_fallback_roundtrip() {
-        // Sets HOME to a temp dir and exercises the legacy file fallback
-        // path. Skipped by default because the headless test runner may have
-        // SecretService::connect() succeed (returning a service handle) but
-        // the daemon isn't actually running, so operations on it fail. Run
-        // with `cargo test -- --ignored` to exercise the file path explicitly.
         let tmp = std::env::temp_dir().join("llm-quota-keyring-test");
         let _ = std::fs::remove_dir_all(&tmp);
+
+        // Force the subprocess path to be unfindable so `set()` falls
+        // through to the legacy file write.
+        let saved_path = std::env::var("PATH").ok();
+        std::env::set_var("PATH", "");
         std::env::set_var("HOME", &tmp);
 
-        assert_eq!(legacy_key_path().exists(), false);
+        assert!(!legacy_key_path().exists(),
+                "precondition: legacy file should not exist yet");
 
         set("test-key-12345").unwrap();
         assert_eq!(
@@ -305,8 +328,14 @@ mod tests {
         );
 
         clear().unwrap();
-        assert!(!legacy_key_path().exists());
+        assert!(!legacy_key_path().exists(),
+                "clear() should remove the legacy file");
 
+        // Restore env so other tests aren't affected.
+        match saved_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

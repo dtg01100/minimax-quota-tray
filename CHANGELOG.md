@@ -6,6 +6,113 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (slice 4: freedesktop.org integration)
+
+- **`packaging/llm-quota-tray.desktop`** — Desktop Entry
+  (Type=Application, Exec=`llm-quota-tray %u`, Icon=llm-quota-tray,
+  Categories=Network, StartupNotify=true, StartupWMClass). Passes
+  `desktop-file-validate`. Provides the shell-launchable identity
+  that the tray has been missing — visible in `gnome-software`,
+  KDE Discover, the autostart dialog, and the file manager's
+  "Open With" menus.
+- **`packaging/io.github.dtg01100.llm-quota-tray.metainfo.xml`** —
+  AppStream metadata (summary, description, URLs, MIT license,
+  Categories, developer, OARS content rating, `launchable` link
+  to the `.desktop` file). Passes `appstreamcli validate`. No
+  `<screenshots>` / `<releases>` blocks — keeping the CHANGELOG
+  as the single source of truth for release notes.
+- **`packaging/icons/hicolor/scalable/apps/llm-quota-tray.svg`** —
+  256×256 SVG app icon. A solid circle in the inner-status
+  "throttled" color (`#e01b24`), matching the static chip dot
+  (`icon::write_static_svgs`) so the desktop icon and the red
+  chip look like the same shape at any size.
+- **`src/activation.rs`** — new module. Reads the XDG Activation
+  token from `--token=<token>` CLI flag or `$XDG_ACTIVATION_TOKEN`
+  env var (in that order), stores it in a `OnceLock`, and
+  exposes it via `activation::get()`. The two portal call sites
+  (`portal_openuri::open`, `notify::send`) now accept an
+  `Option<&str>` activation token and forward it as the
+  `activation_token` vardict key. The direct-Notifications
+  fallback ignores the token (the spec field doesn't exist).
+  9 new unit tests cover CLI parsing (`--token=`, `--token <v>`,
+  empty, absent, mixed with other flags), precedence
+  (CLI > env), and the resolve() helper.
+- **`install.sh`** — now copies the three metadata files into
+  `$XDG_DATA_HOME/{applications,appdata,icons/hicolor/scalable/apps}`
+  (respecting `XDG_DATA_HOME` per the XDG Base Directory Spec),
+  and runs `update-desktop-database` + `gtk-update-icon-cache`
+  best-effort so the new entries become visible to the desktop
+  shell immediately.
+- **`docs/freedesktop-integration.md`** — documents the
+  integration contract: which freedesktop specs are targeted
+  (Desktop Entry, AppStream, Icon Theme, XDG Activation, Desktop
+  Portal), what each metadata file does, the multi-instance model
+  the `.desktop` represents, and what's deliberately **not**
+  done (DBusActivatable, Actions, IconThemePath, GSettings) —
+  each documented as a future-work item with the trigger that
+  would justify adding it.
+
+### Notes (slice 4)
+- **Lightweight charter preserved.** The activation-token plumbing
+  adds ~130 lines to the codebase (one new module + two
+  parameter-list changes). Binary size unchanged (4.4 MB). No new
+  runtime dependencies, no new D-Bus interfaces, no new crates.
+  The three metadata files total 3,195 bytes on disk — well
+  under any meaningful footprint threshold.
+- **Multi-instance semantics.** One canonical `.desktop` file for
+  the default instance; named instances follow the existing
+  systemd-service-template pattern (copy the service unit, add
+  `--instance=<name>`). No per-instance `.desktop` files are
+  generated automatically — matches the Firefox multi-profile
+  / Docker multi-container convention.
+- All 197 unit tests pass (was 188; +9 new for activation
+  parsing/resolution).
+
+### Added (slice 3: freedesktop-portal migration)
+
+- **`src/portal_openuri.rs`** — new module. `open(uri)` calls
+  `org.freedesktop.portal.OpenURI.OpenURI(parent_window, uri, options)`
+  via the session bus. Spec at
+  <https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.OpenURI.html>.
+- **`src/notify.rs`** — `send()` now tries the
+  `org.freedesktop.portal.Notification.AddNotification(id, vardict)`
+  portal first. The portal `id` argument replaces the previous
+  `x-canonical-private-synchronous` libnotify-server hint: it's
+  canonical, documented, and honored by every portal backend.
+  `Urgency::to_priority()` maps the libnotify-shaped urgency
+  (`Low` / `Normal` / `Critical`) to the portal's `priority`
+  vardict (`low` / `normal` / `urgent`).
+- Both portal paths have a direct D-Bus fallback
+  (`xdg-open(1)` for `OpenURI`, raw `org.freedesktop.Notifications.Notify`
+  for the notifications) so the tray still works on hosts without
+  `xdg-desktop-portal` running (headless CI, minimal WMs).
+
+### Removed
+
+- **`prompt_with_secret_tool` (main.rs)** — the third fallback in
+  the `Set API Key…` interactive flow. It spawned `sh -c` with
+  the user-controlled instance name interpolated into a shell
+  string; the in-source SAFETY comment already flagged this as a
+  footgun. The remaining fallbacks (`zenity`, `kdialog`) cover the
+  GUI cases; the documented terminal escape hatch
+  (`secret-tool store --label=<label> application <app>`) is
+  preserved in the final error message. `libsecret-tools` is no
+  longer a runtime dependency for `--set-key`.
+
+### Notes (slice 3)
+- **Scope deliberately limited.** SNI (StatusNotifierItem) and
+  Secret Service have no portal above them — SNI is itself a
+  freedesktop protocol, and `org.freedesktop.portal.Secret` is an
+  opaque per-app master-secret API (not a keyring replacement).
+  `keyring.rs`, `sni.rs`, and `lock.rs` are unchanged. `network.rs`
+  is unchanged: the `NetworkMonitor` portal is a thin wrapper over
+  NM with no capability win for a non-sandboxed tray.
+- **Two new unit tests** (`portal_openuri::tests`): the spec-pinned
+  constants and a compile-time signature pin so a future arg-tuple
+  drift surfaces as a build failure, not a runtime panic at the
+  portal boundary.
+- All 188 unit tests pass (was 184; +4 new for the portal paths).
+
 ### Added (slice 2: dynamic per-model pricing lookup)
 
 - **`src/pricing.rs`** — new module. `ModelPricing`,

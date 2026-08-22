@@ -26,6 +26,7 @@
 //!   transitions upward only (normal→warning→throttled). Uses
 //!   `_last_bucket` to dedupe.
 
+mod activation;
 mod burn;
 mod config;
 mod fetch;
@@ -37,6 +38,7 @@ mod menu;
 mod network;
 mod notify;
 mod parse;
+mod portal_openuri;
 mod pricing;
 mod provider;
 mod scheduler;
@@ -135,6 +137,14 @@ async fn main() -> anyhow::Result<()> {
     // themselves correctly.
     let instance_name = instance::init();
     log::info!("instance: {instance_name:?} (empty = default)");
+    // XDG Activation token (--token=<token> CLI flag or
+    // $XDG_ACTIVATION_TOKEN env var). The desktop shell provides
+    // this when launching us via the .desktop file (StartupNotify
+    // =true). We forward it to the portals (OpenURI, Notification)
+    // so the resulting dialogs/notifications animate from the
+    // originating click. Resolution is one-shot; safe to skip
+    // before --set-key (the one-shot flow never reaches a portal).
+    activation::init();
 
     // `--set-key` is a one-shot helper: prompt for the API key,
     // write it to the keyring via `keyring::set`, then exit. We do
@@ -647,7 +657,7 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
                         &format!("{plan_label} — throttled", plan_label = cfg.label),
                         "Quota exhausted. The menu shows when it resets.",
                         notify::Urgency::Critical,
-                        None,
+                        crate::activation::get(),
                     )
                     .await;
                 } else if new_rank == BucketRank::Warning {
@@ -656,7 +666,7 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
                         &format!("{plan_label} — running low", plan_label = cfg.label),
                         &format!("Remaining dropped below {}%.", 100 - cfg.thresholds.yellow),
                         notify::Urgency::Normal,
-                        None,
+                        crate::activation::get(),
                     )
                     .await;
                 }
@@ -1019,11 +1029,30 @@ fn record_sample(history: &mut Vec<Sample>, w: &Window) {
     }
 }
 
-/// Open a URL via xdg-open (portable across GNOME/KDE/XFCE).
+/// Open a URL via the freedesktop OpenURI portal (preferred) with
+/// a `xdg-open(1)` subprocess as the fallback for hosts without a
+/// portal daemon (headless CI, minimal WMs).
+///
+/// Portal-first ordering matches the pattern used elsewhere in the
+/// codebase: try the spec-defined D-Bus path, fall back to a
+/// subprocess only when the spec path is unreachable. On any
+/// modern GNOME/KDE/XFCE session the portal path wins and the
+/// `xdg-open` binary is never spawned.
 async fn open_url(url: &str) {
     if url.is_empty() {
         log::warn!("open_url: empty URL");
         return;
+    }
+    match portal_openuri::open(url, crate::activation::get()).await {
+        Ok(()) => {
+            log::debug!("opened dashboard via OpenURI portal: {url}");
+            return;
+        }
+        Err(e) => {
+            log::debug!(
+                "OpenURI portal unavailable ({e:#}); falling back to xdg-open"
+            );
+        }
     }
     // tokio::process::Command for non-blocking spawn.
     let result = tokio::process::Command::new("xdg-open")
@@ -1033,13 +1062,19 @@ async fn open_url(url: &str) {
         .stderr(Stdio::null())
         .spawn();
     match result {
-        Ok(_) => log::debug!("opened dashboard: {url}"),
+        Ok(_) => log::debug!("opened dashboard via xdg-open: {url}"),
         Err(e) => log::warn!("xdg-open failed: {e}"),
     }
 }
 
 /// Prompt for a new API key. Tries zenity (GNOME) first, then
-/// kdialog (KDE), then secret-tool's `--prompt` (libsecret).
+/// kdialog (KDE). The earlier third fallback (`secret-tool` over
+/// a `sh -c` pipeline) was removed: it injected user-controlled
+/// instance-name strings into a shell command, a footgun
+/// documented at length in the prior version of this file. The
+/// terminal escape hatch (`secret-tool store --label=<label>
+/// application <app>`) is preserved in the error message below
+/// for users with neither zenity nor kdialog installed.
 ///
 /// Returns:
 ///   - `Ok(Some(key))` on success — key has been written to keyring.
@@ -1065,14 +1100,8 @@ async fn set_api_key_interactive() -> Result<Option<String>> {
         keyring::set(&k).await?;
         return Ok(Some(k));
     }
-    // Fall back to secret-tool --prompt (libsecret's stdin prompt;
-    // available wherever libsecret-tools is installed).
-    if let Some(k) = prompt_with_secret_tool(&label, &app).await? {
-        keyring::set(&k).await?;
-        return Ok(Some(k));
-    }
     Err(anyhow::anyhow!(
-        "no GUI prompt tool available (tried zenity, kdialog, secret-tool). \
+        "no GUI prompt tool available (tried zenity, kdialog). \
          From a terminal: `secret-tool store --label='{label}' application {app}`"
     ))
 }
@@ -1117,42 +1146,6 @@ async fn prompt_with_kdialog(label: &str, app: &str) -> Result<Option<String>> {
     match output {
         Ok(o) if o.status.success() => {
             Ok(Some(String::from_utf8_lossy(&o.stdout).trim().to_string()))
-        }
-        Ok(_) => Ok(None),
-        Err(_) => Ok(None),
-    }
-}
-
-async fn prompt_with_secret_tool(label: &str, app: &str) -> Result<Option<String>> {
-    // secret-tool doesn't have a built-in prompt flag — fall back to
-    // reading from stdin via a small shell pipeline. This works when
-    // libsecret-tools is installed but no GUI prompt is available.
-    // Both `--label` and `application` come from the instance config so
-    // the prompt and the stored Secret Service entry agree on the key.
-    //
-    // SAFETY: the `{label}` / `{app}` strings originate from the
-    // instance namespace (`crate::instance::keyring_application()`,
-    // `crate::instance::config_dir_basename()`), which the user controls
-    // via `--instance=<name>`. We're injecting them into a `sh -c` string
-    // — if a user names their instance something containing a shell
-    // metacharacter (`;`, `$`, backtick), the embedded command could
-    // execute arbitrary code at the user's own prompt. This is no worse
-    // than `xdg-open <url>` (also a subprocess we already spawn with
-    // user-controlled input), but worth noting.
-    let prompt = format!(
-        r#"read -r -p "{label} (input hidden): " -s key && echo "$key" && echo "$key" | secret-tool store --label='{label}' application {app}"#
-    );
-    let output = tokio::process::Command::new("sh")
-        .args(["-c", &prompt])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await;
-    match output {
-        Ok(o) if o.status.success() => {
-            let key = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            Ok(Some(key))
         }
         Ok(_) => Ok(None),
         Err(_) => Ok(None),

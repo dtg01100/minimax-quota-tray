@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  App icon for the desktop shell (autostart UI, gnome-software,
+  KDE Discover, file manager thumbnails).
+
+  Visual contract: a solid filled circle in the inner-status color
+  the tray chip uses for the "throttled" bucket. Matches the static
+  throttled dot (icon::write_static_svgs / "throttled" SVG) so the
+  app icon and the chip in red look the same shape at any size.
+
+  The actual chip is rasterized at runtime via tiny-skia (icon.rs)
+  and animates through Normal/Warning/Throttled palette colors;
+  this file is the static fallback the desktop shell shows outside
+  the tray.
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="256" height="256" viewBox="0 0 256 256">
+  <!-- Solid circle, r=104 centered at 128,128 — leaves a 24px margin
+       on every side for the panel's icon-padding convention. -->
+  <circle cx="128" cy="128" r="104" fill="#e01b24"/>
+</svg>

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.dtg01100.llm-quota-tray</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>LLM Quota Tray</name>
+  <summary>Provider-agnostic tray indicator for LLM API quota</summary>
+  <description>
+    <p>
+      A status-notifier tray icon that polls an LLM-provider quota API on a
+      configurable cadence and shows the current remaining quota as a chip
+      and a per-window breakdown in its menu. The shipped example targets
+      the MiniMax API (Coding Plan + Token Plan); every provider-specific
+      field (endpoint, JSON shape, auth style, ring colors, label) lives
+      in a per-instance JSON config, so the binary itself is fully generic.
+    </p>
+    <p>
+      Multiple concurrent instances are supported via --instance=&lt;name&gt;
+      (different config dirs, lock files, keyring namespaces, and tray
+      chips). Click the chip to see per-window reset countdowns, the
+      burn-rate projection, and the action menu (Refresh / Open dashboard
+      / Set API Key… / Quit).
+    </p>
+  </description>
+  <categories>
+    <category>Network</category>
+    <category>Monitor</category>
+    <category>Utility</category>
+  </categories>
+  <keywords>
+    <keyword>LLM</keyword>
+    <keyword>API</keyword>
+    <keyword>Quota</keyword>
+    <keyword>Tray</keyword>
+    <keyword>Indicator</keyword>
+    <keyword>Status</keyword>
+  </keywords>
+  <url type="homepage">https://github.com/dtg01100/llm-quota-tray</url>
+  <url type="bugtracker">https://github.com/dtg01100/llm-quota-tray/issues</url>
+  <developer id="io.github.dtg01100">
+    <name>David Lafreniere</name>
+  </developer>
+  <content_rating type="oars-1.1" />
+  <launchable type="desktop-id">llm-quota-tray.desktop</launchable>
+</component>

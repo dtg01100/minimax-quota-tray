@@ -24,20 +24,33 @@
 //! directly is straightforward: it integrates with the existing
 //! tokio runtime and skips the fork/exec.
 //!
-//! ## Spec version
+//! ## Spec versions — dual implementation with auto-detection
 //!
-//! Implements the **original** Secret Service API as actually shipped
-//! by `gnome-keyring-daemon` (and the dominant body of deployed
-//! daemons): `OpenSession` (not `CreateSession`), `GetSecrets` (not
-//! `GetSecret`), `ReadAlias` for the default collection, `Delete`
-//! on the item object, `SetSecret` for replacement.
+//! Two wire formats are in the wild:
 //!
-//! The newer freedesktop spec rev (which renames `OpenSession` →
-//! `CreateSession` and changes the `Secret` struct shape) is not yet
-//! implemented in the widely-shipped daemons — running our code
-//! against a current `gnome-keyring-daemon` would fail with
-//! `UnknownMethod`. We pin to the original wire format until that
-//! changes.
+//! - **Original spec** (what `gnome-keyring-daemon` and the bulk of
+//!   deployed daemons ship today):
+//!   `OpenSession(s,v) → (v,o)`, `GetSecrets(ao,o) → a{o(...)}`,
+//!   `Collection.CreateItem(a{sv}, (oayays), b) → (o,o)`,
+//!   `Secret` shape `(ObjectPath, Byte[], Byte[], String)`.
+//!   Attributes are set via `Properties.Set` after creation.
+//!
+//! - **New spec** (freedesktop.org spec rev 0.2, ~2020):
+//!   `CreateSession(Algorithm{String}) → o`,
+//!   `GetSecret(o) → Secret`, `Secret` shape `(ObjectPath, String,
+//!   Byte[], String)`, `Collection.CreateItem(a{sv}, a{ss}, Secret,
+//!   "replace") → (o,o)`.
+//!
+//! The daemon doesn't advertise a "version" property — the only
+//! way to know which it supports is to introspect it. We call
+//! `org.freedesktop.DBus.Introspectable.Introspect()` once per
+//! process (cached) and grep for `CreateSession`:
+//!
+//! - If `CreateSession` is in the XML → daemon is new-spec.
+//! - Otherwise → daemon is original-spec (the dominant case).
+//!
+//! Both code paths are kept around so we don't break older
+//! daemons when newer-spec code lands.
 //!
 //! ## Fallback chain
 //!
@@ -61,6 +74,16 @@ use zbus::{Connection, Proxy};
 /// Well-known bus name for the Secret Service.
 const SS_BUS: &str = "org.freedesktop.secrets";
 
+/// Well-known service object path.
+const SS_SERVICE_PATH: &str = "/org/freedesktop/secrets";
+
+/// Standard alias for the user's default collection. Read via
+/// `ReadAlias("default")` to get the actual collection path.
+/// ("session" is another common alias — sometimes the default
+/// collection is unlocked for the entire session rather than
+/// persisted; both should work via ReadAlias.)
+const DEFAULT_ALIAS: &str = "default";
+
 /// Interface names per the Secret Service spec.
 const SERVICE_IFACE: &str = "org.freedesktop.Secret.Service";
 const COLLECTION_IFACE: &str = "org.freedesktop.Secret.Collection";
@@ -68,37 +91,52 @@ const ITEM_IFACE: &str = "org.freedesktop.Secret.Item";
 const PROMPT_IFACE: &str = "org.freedesktop.Secret.Prompt";
 const SESSION_IFACE: &str = "org.freedesktop.Secret.Session";
 
-/// Wire signature of the `Secret` struct: `(ObjectPath session,
-/// Array<Byte> parameters, Variant value, Array<Byte> content_type)`.
-/// The inner Variant is the secret bytes (or any D-Bus type the
-/// caller wants to store); we wrap our bytes as `Value::Array`
-/// (signature `ay`). Pinned by the `secret_signature_matches_spec`
-/// test below — if a refactor changes the wire shape, that test
-/// fails before production does.
-#[allow(dead_code)]
-const SECRET_SIGNATURE: &str = "(oayays)";
+/// Which Secret Service wire format the daemon speaks.
+///
+/// Detected via `Introspect()` once per process and cached. The
+/// choice is locked in for the process lifetime — if a daemon
+/// upgrades mid-session, we won't notice (the new connection
+/// uses the cached value). Edge case, not worth the complexity
+/// of re-probing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonApi {
+    /// New spec (rev 0.2): `CreateSession(Algorithm{String}) → o`,
+    /// `GetSecret(o) → Secret`, secret shape `(osays)`,
+    /// `CreateItem(a{sv}, a{ss}, Secret, "replace")`.
+    New,
+    /// Original spec: `OpenSession(s,v) → (v,o)`,
+    /// `GetSecrets(ao,o) → a{o(...)}`, secret shape `(oayays)`,
+    /// `CreateItem(a{sv}, Secret, b)`, attributes via
+    /// `Properties.Set` after creation.
+    Original,
+}
+
+impl DaemonApi {
+    /// Human-readable label for log messages.
+    fn label(self) -> &'static str {
+        match self {
+            DaemonApi::New => "new (rev 0.2)",
+            DaemonApi::Original => "original",
+        }
+    }
+}
+
+/// Which API the daemon speaks, detected lazily on first use.
+static DAEMON_API: OnceCell<DaemonApi> = OnceCell::const_new();
 
 /// Per-instance `application` attribute used to namespace items
-/// in the Secret Service collection. Same convention as the old
-/// `secret-tool` flow: every Secret Service item carries an
-/// `application = <keyring_application>` attribute, so this tray's
-/// items don't collide with other apps or other instances.
+/// in the Secret Service collection.
 fn attributes() -> HashMap<String, String> {
     let app = crate::instance::keyring_application();
     HashMap::from([("application".to_string(), app)])
 }
 
-/// Item Label — what shows up in `seahorse` (GNOME's keyring UI)
-/// and `ksecretserviceviewer` (KDE's equivalent). Derived from
-/// the instance basename so a user running multiple instances sees
-/// e.g. `llm-quota-tray API Key`, `llm-quota-tray-codex API Key`.
+/// Item Label — what shows up in `seahorse` and `ksecretserviceviewer`.
 fn label() -> String {
     format!("{} API Key", crate::instance::config_dir_basename())
 }
 
-/// Session-bus connection, opened lazily on first use. Reused
-/// across calls so the D-Bus handshake (and any `XAUTHORITY` cookie
-/// processing) runs at most once per process.
+/// Session-bus connection, opened lazily on first use.
 static SESSION_BUS: OnceCell<Connection> = OnceCell::const_new();
 
 async fn session_bus() -> Result<&'static Connection> {
@@ -109,8 +147,7 @@ async fn session_bus() -> Result<&'static Connection> {
 }
 
 /// Build a proxy bound to a given object path + interface on the
-/// Secret Service bus. The `path` may be the well-known `/.../secrets`
-/// service path, a collection path, or an item path.
+/// Secret Service bus.
 async fn ss_proxy<'a>(
     conn: &'a Connection,
     path: &'a str,
@@ -119,18 +156,46 @@ async fn ss_proxy<'a>(
     Proxy::new(conn, SS_BUS, path, iface).await
 }
 
+/// Detect which spec the daemon implements by looking at its
+/// introspection XML for the presence of `CreateSession`.
+async fn detect_api(conn: &Connection) -> DaemonApi {
+    let svc = match ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await {
+        Ok(p) => p,
+        Err(_) => return DaemonApi::Original, // safe default
+    };
+    let xml = match svc.introspect().await {
+        Ok(s) => s,
+        Err(_) => return DaemonApi::Original, // safe default
+    };
+    if xml.contains("CreateSession") && xml.contains("GetSecret") {
+        DaemonApi::New
+    } else {
+        DaemonApi::Original
+    }
+}
+
+/// Cached detector — opens the session bus once, runs `detect_api`,
+/// caches the answer.
+async fn daemon_api() -> DaemonApi {
+    let conn = match session_bus().await {
+        Ok(c) => c,
+        Err(_) => return DaemonApi::Original,
+    };
+    *DAEMON_API
+        .get_or_init(|| async { detect_api(conn).await })
+        .await
+}
+
 // ---------------------------------------------------------------------------
-// Public API (matches the old secret-tool-based surface)
+// Public API
 // ---------------------------------------------------------------------------
 
 /// Look up the API key. Priority:
-///   1. Secret Service via session D-Bus (libsecret-backed
-///      providers, GNOME Keyring, KWallet).
+///   1. Secret Service via session D-Bus.
 ///   2. `LLM_API_KEY` env var (systemd escape hatch).
 ///
 /// Returns `None` if both miss. Failures from (1) are logged at
-/// debug level and treated as a miss (the daemon stays alive even
-/// if the keyring is locked or the daemon is missing).
+/// debug level and treated as a miss.
 pub async fn get() -> Option<String> {
     if let Some(s) = dbus_get().await {
         return secret_to_key(s.as_bytes());
@@ -141,143 +206,148 @@ pub async fn get() -> Option<String> {
     None
 }
 
-/// Store the API key in Secret Service. Errors if the service is
-/// unreachable — the caller's UI should surface that.
-///
-/// We use `replace = true` on `CreateItem`: if a prior item with the
-/// same `application` attribute exists in the target collection, it
-/// is silently replaced; otherwise a fresh one is created.
+/// Store the API key in Secret Service.
 pub async fn set(value: &str) -> Result<()> {
-    dbus_set(value.as_bytes()).await
+    let conn = session_bus().await?;
+    let api = daemon_api().await;
+    log::debug!("Secret Service: using {} API", api.label());
+    match api {
+        DaemonApi::New => dbus_set_new(conn, value.as_bytes()).await,
+        DaemonApi::Original => dbus_set_original(conn, value.as_bytes()).await,
+    }
 }
 
-/// Remove the API key from Secret Service. Best-effort — if no
-/// item matches the `application` attribute, silently return Ok
-/// (matches the behavior of the old `secret_tool_clear` wrapper).
+/// Remove the API key from Secret Service. Best-effort.
 #[allow(dead_code)] // exposed for future "Clear stored key" menu item
 pub async fn clear() -> Result<()> {
     dbus_clear().await
 }
 
 // ---------------------------------------------------------------------------
-// Secret Service D-Bus plumbing
+// Dispatcher (get): try detected API once; if it fails, fall back
 // ---------------------------------------------------------------------------
 
-/// Search for our item via the `application` attribute, then read
-/// its secret via `GetSecrets`. Returns `Ok(None)` when no item
-/// matches (or if the daemon is unreachable, which is logged at
-/// debug and surfaced as `Ok(None)` to callers).
 async fn dbus_get() -> Option<String> {
     let conn = session_bus().await.ok()?;
-    match dbus_get_inner(conn).await {
+    let api = daemon_api().await;
+
+    // Try the detected API first. If it fails with UnknownMethod /
+    // signature mismatch (the daemon upgrade-mid-session case, or a
+    // daemon that lies in its introspection), fall back to the
+    // other API. The fallback is bounded — we don't loop.
+    let result = match api {
+        DaemonApi::New => dbus_get_new(conn).await,
+        DaemonApi::Original => dbus_get_original(conn).await,
+    };
+    match result {
         Ok(s) => s,
         Err(e) => {
-            log::debug!("Secret Service lookup failed: {e:#}");
-            None
+            log::debug!(
+                "Secret Service lookup via {} API failed: {e:#}",
+                api.label()
+            );
+            // Try the other API once before giving up.
+            let fallback_result = match api {
+                DaemonApi::New => dbus_get_original(conn).await,
+                DaemonApi::Original => dbus_get_new(conn).await,
+            };
+            match fallback_result {
+                Ok(s) => s,
+                Err(e2) => {
+                    log::debug!("Secret Service fallback also failed: {e2:#}");
+                    None
+                }
+            }
         }
     }
 }
 
-async fn dbus_get_inner(conn: &Connection) -> Result<Option<String>> {
-    // 1. Open a plain session. The wire is `OpenSession(s algorithm,
-    //    v input)` returning `(v output, o session)`. For "plain",
-    //    both input and output are empty Variants. The session path
-    //    is what we pass to GetSecrets so the daemon knows we're
-    //    authorized to read the secrets.
-    let session = open_session(conn, "plain").await?;
+// ---------------------------------------------------------------------------
+// New spec implementation
+// ---------------------------------------------------------------------------
 
-    // 2. Search for items with our `application` attribute.
-    let svc = ss_proxy(conn, "/org/freedesktop/secrets", SERVICE_IFACE).await?;
+async fn dbus_get_new(conn: &Connection) -> Result<Option<String>> {
+    let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
+
+    // 1. CreateSession(Algorithm{String}) → ObjectPath
+    //    (single-field struct wire signature `(s)`).
+    let session: OwnedObjectPath = svc
+        .call("CreateSession", &Algorithm("plain".into()))
+        .await
+        .context("CreateSession")?;
+
+    // 2. SearchItems({application=...}) → (items, locked)
     let attrs = attributes();
-    let (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = svc
+    let (items, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = svc
         .call("SearchItems", &attrs)
         .await
         .context("SearchItems")?;
-
-    if unlocked.is_empty() && locked.is_empty() {
+    if items.is_empty() && locked.is_empty() {
         return Ok(None);
     }
 
-    // 3. If any items are locked, unlock them. The default "login"
-    //    collection is normally unlocked at session login, but be
-    //    defensive. Unlock returns a prompt path; we wait if non-"/".
-    //    We need `locked` again below for GetSecrets, so clone first.
+    // 3. Unlock locked items if any.
     if !locked.is_empty() {
         let to_unlock = locked.clone();
-        let (_unlocked_after, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
+        let (unlocked, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
             svc.call("Unlock", &(to_unlock,)).await.context("Unlock")?;
         if prompt.as_str() != "/" {
-            let ok = wait_for_prompt(conn, &prompt)
-                .await
-                .context("Unlock prompt")?;
+            let ok = wait_for_prompt(conn, &prompt).await?;
             if !ok {
-                anyhow::bail!("Unlock prompt dismissed by user");
+                anyhow::bail!("Unlock prompt dismissed");
             }
+        }
+        if unlocked.is_empty() {
+            anyhow::bail!("Unlock returned no unlocked items");
         }
     }
 
-    // 4. Call GetSecrets with the full item list (unlocked + locked).
-    //    Returns a dict from item path to Secret wire tuple
-    //    `(session, params, value, ct)`. We take the first match.
-    let mut all_items: Vec<OwnedObjectPath> = unlocked;
-    all_items.extend(locked);
-    let secrets: HashMap<OwnedObjectPath, OwnedSecret> = svc
-        .call("GetSecrets", &(all_items, session.clone()))
+    // 4. GetSecret(item) → Secret struct (osays)
+    //    `(session: ObjectPath, parameters: String, value: Array<Byte>,
+    //    content_type: String)`
+    let item = items
+        .first()
+        .cloned()
+        .or_else(|| locked.first().cloned())
+        .context("no item to read")?;
+    // GetSecret discards the session reply — we already have a
+    // session for the read; the Secret's session field is just
+    // metadata.
+    let _ = session;
+
+    let secret: NewSecret = svc
+        .call("GetSecret", &(item.clone(),))
         .await
-        .context("GetSecrets")?;
+        .context("GetSecret")?;
 
-    let (_item, secret) = secrets.into_iter().next().context("no secret returned")?;
-
-    // 5. Pull the secret bytes straight out of the tuple. The wire
-    // shape is `(ObjectPath, Array<Byte>, Array<Byte>, String)`,
-    // so `secret.2` is the secret as a `Vec<u8>`. UTF-8 decode
-    // straight to a `String` (API keys are ASCII by convention).
+    // `secret.2` is the value bytes per the new-spec shape
+    // `(ObjectPath, String, Array<Byte>, String)`.
     Ok(Some(
         String::from_utf8(secret.2).context("non-UTF8 secret")?,
     ))
 }
 
-/// Open a Secret Service session. The algorithm is a plain string
-/// ("plain" or "dh:..."); input/output are Variants that carry
-/// algorithm-specific parameters (empty for "plain").
-async fn open_session(conn: &Connection, algorithm: &str) -> Result<OwnedObjectPath> {
-    let svc = ss_proxy(conn, "/org/freedesktop/secrets", SERVICE_IFACE).await?;
-    // For "plain", the input Variant is empty. Convention is to
-    // send `Value::Str("")` — both gnome-keyring and libsecret
-    // accept that as the "no algorithm parameters" sentinel.
-    let input = Value::Str("".into());
-    let (_output, session): (OwnedValue, OwnedObjectPath) = svc
-        .call("OpenSession", &(algorithm, input))
+async fn dbus_set_new(conn: &Connection, value: &[u8]) -> Result<()> {
+    let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
+
+    // 1. CreateSession.
+    let session: OwnedObjectPath = svc
+        .call("CreateSession", &Algorithm("plain".into()))
         .await
-        .context("OpenSession")?;
-    Ok(session)
-}
-
-/// Store the secret. Uses the "plain" session algorithm and the
-/// default collection (looked up via `ReadAlias("default")`).
-/// `replace = true`: existing items with the same application
-/// attribute in the collection are overwritten.
-async fn dbus_set(value: &[u8]) -> Result<()> {
-    let conn = session_bus().await?;
-
-    // 1. Plain session.
-    let session = open_session(conn, "plain").await?;
-    let session_ref = session.as_ref();
+        .context("CreateSession")?;
 
     // 2. Default collection via ReadAlias.
-    let svc = ss_proxy(conn, "/org/freedesktop/secrets", SERVICE_IFACE).await?;
     let collection: OwnedObjectPath = svc
-        .call("ReadAlias", &("default",))
+        .call("ReadAlias", &(DEFAULT_ALIAS,))
         .await
         .context("ReadAlias(\"default\")")?;
     if collection.as_str() == "/" {
         anyhow::bail!("no default collection; user has no Secret Service collection set up");
     }
 
-    // 3. Build CreateItem arguments:
-    //    properties : { Label, Type }
-    //    secret     : (session, [], Value::Array(bytes), b"text/plain")
-    //    replace    : true
+    // 3. CreateItem(properties, attributes, secret, replace_if_exists).
+    //    New spec passes attributes as a parameter; replace is a
+    //    String enum ("always" / "never" / "replace").
     let mut properties: HashMap<&'static str, Value<'_>> = HashMap::new();
     properties.insert(
         "org.freedesktop.Secret.Item.Label",
@@ -288,33 +358,133 @@ async fn dbus_set(value: &[u8]) -> Result<()> {
         Value::Str("org.freedesktop.Secret.Generic".into()),
     );
 
-    // Build the Secret wire tuple. Session is borrowed from the
-    // owned ObjectPath; the bytes are copied in. See the
-    // `make_secret_struct` doc comment for why we use a tuple
-    // instead of a derived struct.
-    let session_path = zbus::zvariant::ObjectPath::from_str_unchecked(session_ref.as_str());
-    let secret = make_secret_struct(&session_path, value);
+    let attrs = attributes();
+    let secret = NewSecret(
+        session,
+        String::new(),            // parameters (vestigial; empty for plain)
+        value.to_vec(),           // value
+        "text/plain".to_string(), // content_type
+    );
 
     let coll = ss_proxy(conn, collection.as_str(), COLLECTION_IFACE).await?;
     let (item, prompt): (OwnedObjectPath, OwnedObjectPath) = coll
         .call(
             "CreateItem",
-            &(properties, secret, true), // replace = true
+            &(properties, attrs, secret, "replace".to_string()),
         )
         .await
         .context("CreateItem")?;
     if prompt.as_str() != "/" {
-        let ok = wait_for_prompt(conn, &prompt)
-            .await
-            .context("CreateItem prompt")?;
+        let ok = wait_for_prompt(conn, &prompt).await?;
+        if !ok {
+            anyhow::bail!("CreateItem prompt dismissed");
+        }
+    }
+    // Item is now created with attributes already set — no
+    // Properties.Set follow-up needed (unlike the original API).
+    let _ = item;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Original spec implementation
+// ---------------------------------------------------------------------------
+
+async fn dbus_get_original(conn: &Connection) -> Result<Option<String>> {
+    let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
+
+    // 1. OpenSession(s, v) → (v, o)
+    let session = open_session_original(conn, "plain").await?;
+
+    // 2. SearchItems.
+    let attrs = attributes();
+    let (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = svc
+        .call("SearchItems", &attrs)
+        .await
+        .context("SearchItems")?;
+    if unlocked.is_empty() && locked.is_empty() {
+        return Ok(None);
+    }
+
+    // 3. Unlock.
+    if !locked.is_empty() {
+        let to_unlock = locked.clone();
+        let (_unlocked_after, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
+            svc.call("Unlock", &(to_unlock,)).await.context("Unlock")?;
+        if prompt.as_str() != "/" {
+            let ok = wait_for_prompt(conn, &prompt).await?;
+            if !ok {
+                anyhow::bail!("Unlock prompt dismissed by user");
+            }
+        }
+    }
+
+    // 4. GetSecrets(ao, o) → a{o(oayays)} (dict of item → Secret tuple).
+    let mut all_items: Vec<OwnedObjectPath> = unlocked;
+    all_items.extend(locked);
+    let secrets: HashMap<OwnedObjectPath, OriginalSecret> = svc
+        .call("GetSecrets", &(all_items, session.clone()))
+        .await
+        .context("GetSecrets")?;
+
+    let (_item, secret) = secrets.into_iter().next().context("no secret returned")?;
+
+    // `secret.2` is the value bytes per the original-spec shape
+    // `(ObjectPath, Byte[], Byte[], String)`.
+    Ok(Some(
+        String::from_utf8(secret.2).context("non-UTF8 secret")?,
+    ))
+}
+
+async fn dbus_set_original(conn: &Connection, value: &[u8]) -> Result<()> {
+    // 1. OpenSession.
+    let session = open_session_original(conn, "plain").await?;
+    let session_path = zbus::zvariant::ObjectPath::from_str_unchecked(session.as_str());
+
+    // 2. Default collection.
+    let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
+    let collection: OwnedObjectPath = svc
+        .call("ReadAlias", &(DEFAULT_ALIAS,))
+        .await
+        .context("ReadAlias(\"default\")")?;
+    if collection.as_str() == "/" {
+        anyhow::bail!("no default collection");
+    }
+
+    // 3. CreateItem(properties, secret, replace=true). No attributes
+    //    arg in the original spec — set them via Properties.Set after.
+    let mut properties: HashMap<&'static str, Value<'_>> = HashMap::new();
+    properties.insert(
+        "org.freedesktop.Secret.Item.Label",
+        Value::Str(label().into()),
+    );
+    properties.insert(
+        "org.freedesktop.Secret.Item.Type",
+        Value::Str("org.freedesktop.Secret.Generic".into()),
+    );
+
+    let secret = OriginalSecret(
+        OwnedObjectPath::from(session_path),
+        Vec::new(),               // parameters (empty for plain)
+        value.to_vec(),           // value (the secret bytes)
+        "text/plain".to_string(), // content_type
+    );
+
+    let coll = ss_proxy(conn, collection.as_str(), COLLECTION_IFACE).await?;
+    let (item, prompt): (OwnedObjectPath, OwnedObjectPath) = coll
+        .call("CreateItem", &(properties, secret, true))
+        .await
+        .context("CreateItem")?;
+    if prompt.as_str() != "/" {
+        let ok = wait_for_prompt(conn, &prompt).await?;
         if !ok {
             anyhow::bail!("CreateItem prompt dismissed");
         }
     }
 
-    // 4. Set the `Attributes` property on the new item so future
-    //    SearchItems({application=...}) calls match it. Attributes
-    //    live on the Item (not at creation time).
+    // 4. Set Attributes via Properties.Set (original-spec quirk:
+    //    attributes aren't a CreateItem parameter, so we set them
+    //    after the item exists).
     let item_proxy = ss_proxy(conn, item.as_str(), ITEM_IFACE).await?;
     let attrs = attributes();
     item_proxy
@@ -325,12 +495,24 @@ async fn dbus_set(value: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Delete all items matching our `application` attribute. Best-effort:
-/// no error if the collection is missing or no items match.
+async fn open_session_original(conn: &Connection, algorithm: &str) -> Result<OwnedObjectPath> {
+    let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
+    let input = Value::Str("".into());
+    let (_output, session): (OwnedValue, OwnedObjectPath) = svc
+        .call("OpenSession", &(algorithm, input))
+        .await
+        .context("OpenSession")?;
+    Ok(session)
+}
+
+// ---------------------------------------------------------------------------
+// Clear (shared — both APIs use the same wire shape here)
+// ---------------------------------------------------------------------------
+
 #[allow(dead_code)] // see `clear()`
 async fn dbus_clear() -> Result<()> {
     let conn = session_bus().await?;
-    let svc = ss_proxy(conn, "/org/freedesktop/secrets", SERVICE_IFACE).await?;
+    let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
 
     let attrs = attributes();
     let (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = svc
@@ -345,39 +527,61 @@ async fn dbus_clear() -> Result<()> {
             .await
             .context("Item.Delete")?;
         if prompt.as_str() != "/" {
-            // Spec says best-effort: don't wait for the prompt.
-            // The deletion still completes; the prompt is for
-            // things like "this item is in a locked collection".
             log::debug!("Delete returned prompt {}; skipping wait", prompt);
         }
     }
     Ok(())
 }
 
-/// Wait for a `org.freedesktop.Secret.Prompt` to emit `Completed`.
-/// Returns `true` on success, `false` if the user dismissed.
+// ---------------------------------------------------------------------------
+// Wire types — both Secret shapes
+// ---------------------------------------------------------------------------
+
+/// Wire shape of the `Algorithm` struct from the new spec:
+/// `struct Algorithm { String variant; }`. Single-field tuple
+/// struct serializes to D-Bus `(s)`. Pin via the
+/// `algorithm_signature` test below.
+#[derive(Debug, serde::Serialize, zbus::zvariant::Type)]
+#[zvariant(signature = "(s)")]
+pub struct Algorithm(pub String);
+
+/// Wire shape of `Secret` per the new spec rev 0.2:
+/// `(Object_Path session, String parameters, Array<Byte> value,
+/// String content_type)` → signature `(osays)`.
 ///
-/// The `Completed(Boolean dismissed)` signal carries one arg;
-/// `dismissed = true` means the user cancelled, `false` means
-/// the prompt succeeded.
+/// `OwnedObjectPath` is used for the session field rather than
+/// `ObjectPath<'static>` because we hold onto this struct across
+/// multiple awaits; borrowing from a `String` only works if the
+/// source outlives the struct, which is awkward to express when
+/// the source is a freshly-constructed D-Bus reply.
+#[derive(Debug, Serialize, Deserialize, Type)]
+pub struct NewSecret(pub OwnedObjectPath, pub String, pub Vec<u8>, pub String);
+
+/// Wire shape of `Secret` per the original spec (what
+/// `gnome-keyring-daemon` implements):
+/// `(Object_Path session, Array<Byte> parameters, Array<Byte> value,
+/// String content_type)` → signature `(oayays)`.
+#[derive(Debug, Serialize, Deserialize, Type)]
+pub struct OriginalSecret(pub OwnedObjectPath, pub Vec<u8>, pub Vec<u8>, pub String);
+
+// Bring Serialize + Deserialize + Type into scope for the
+// derives above (both used for both incoming and outgoing
+// Secret values).
+use serde::{Deserialize, Serialize};
+use zbus::zvariant::Type;
+
+// ---------------------------------------------------------------------------
+// Prompt wait (shared)
+// ---------------------------------------------------------------------------
+
 async fn wait_for_prompt(conn: &Connection, prompt: &OwnedObjectPath) -> Result<bool> {
-    // The prompt path was returned by the Service on the same
-    // connection we already have — so we proxy against that.
     let proxy = ss_proxy(conn, prompt.as_str(), PROMPT_IFACE)
         .await
         .context("proxy for prompt")?;
-
     let mut stream = proxy
         .receive_signal("Completed")
         .await
         .context("subscribe to Completed")?;
-
-    // The `Completed` signal is guaranteed to fire exactly once per
-    // prompt. Some daemons emit it immediately, others after a
-    // round-trip, but always exactly once — so we read the next
-    // item and return. Using `next().await` here is the right shape;
-    // clippy's `never_loop` lint is a false positive (the function
-    // may legitimately return early on a synchronous emission).
     #[allow(clippy::never_loop)]
     while let Some(signal) = stream.next().await {
         let body = signal.body();
@@ -388,58 +592,11 @@ async fn wait_for_prompt(conn: &Connection, prompt: &OwnedObjectPath) -> Result<
 }
 
 // ---------------------------------------------------------------------------
-// Secret wire format (struct signature `(oayays)`)
-// ---------------------------------------------------------------------------
-
-/// Wire shape of the `Secret` struct per the canonical Secret
-/// Service API (matches `gnome-keyring-daemon`'s introspection
-/// — `(oayays)` = `(ObjectPath, Byte[], Byte[], String)`):
-///
-/// ```text
-/// struct Secret {
-///     Object_Path session;        // session used to decrypt (path)
-///     Array<Byte> parameters;     // algorithm parameters (empty for plain)
-///     Array<Byte> value;          // the secret bytes
-///     String      content_type;   // MIME type, e.g. "text/plain"
-/// }
-/// ```
-///
-/// `parameters` is empty when `algorithm == "plain"`. `value` is
-/// the raw secret bytes (text secrets are stored as their UTF-8
-/// bytes; structured data could use any D-Bus type, but the
-/// wire format locks value to `ay` for compatibility with all
-/// current daemons). `content_type` is `"text/plain"` or similar.
-///
-/// We deliberately don't define a Rust struct + `#[zvariant::Type]`
-/// derive here — the `(oayays)` shape is straightforward enough
-/// to use a tuple alias. Pinned by the
-/// `secret_signature_matches_spec` test below.
-fn make_secret_struct(
-    session: &zbus::zvariant::ObjectPath<'_>,
-    value: &[u8],
-) -> (OwnedObjectPath, Vec<u8>, Vec<u8>, String) {
-    (
-        OwnedObjectPath::from(session.clone()),
-        Vec::new(),               // parameters (empty for plain)
-        value.to_vec(),           // value (the secret bytes)
-        "text/plain".to_string(), // content_type
-    )
-}
-
-/// Owned variant of the Secret wire tuple — used by `GetSecrets`
-/// deserialization (the deserializer produces `OwnedObjectPath`,
-/// `Vec<u8>`, `Vec<u8>`, `String`).
-type OwnedSecret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert the raw secret bytes into a usable API key. Some
-/// keyring tools persist a trailing newline; passing that
-/// straight into the `Authorization` header makes reqwest fail
-/// with "failed to parse header value". Trim both ends and drop
-/// empty secrets.
+/// Trim trailing whitespace / empty secrets. See `set_api_key_interactive`
+/// for why the trimming matters (reqwest's header parser is strict).
 pub fn secret_to_key(bytes: &[u8]) -> Option<String> {
     String::from_utf8(bytes.to_vec())
         .ok()
@@ -447,16 +604,8 @@ pub fn secret_to_key(bytes: &[u8]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// (formerly extracted bytes from a `Value`-shaped secret; the
-/// canonical `(oayays)` wire shape stores the secret directly as
-/// `Vec<u8>`, so no extraction is needed)
-fn _unused_marker() {}
-
-/// Close a session object explicitly. Spec says sessions can be
-/// implicitly closed when the connection drops, but being
-/// explicit is nice. Currently unused (we don't track session
-/// paths across calls — they're cheap to recreate) but exposed
-/// for completeness and tests.
+/// Close a session object explicitly. Currently unused but exposed
+/// for tests and completeness.
 #[allow(dead_code)]
 pub async fn close_session(session: OwnedObjectPath) -> Result<()> {
     let conn = session_bus().await?;
@@ -466,7 +615,7 @@ pub async fn close_session(session: OwnedObjectPath) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// SECRET_SIGNATURE sanity-checked by the static_assertion-style test below.
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -474,9 +623,6 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Tests in this module mutate the global `LLM_API_KEY` env
-    /// var. Serialize them so cargo's parallel runner doesn't have
-    /// two tests stomp on each other's env state.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_env<F: FnOnce()>(env_value: Option<&str>, body: F) {
@@ -495,11 +641,6 @@ mod tests {
 
     #[test]
     fn secret_with_trailing_newline_is_trimmed() {
-        // Regression: `secret-tool store` via a shell pipe persists
-        // the key with a trailing \n. Untrimmed, that byte lands in
-        // the Authorization header and reqwest bails with
-        // "failed to parse header value". Test the trimming helper
-        // directly so a refactor can't break the contract.
         let key = secret_to_key(b"sk-abc123\n").unwrap();
         assert_eq!(key, "sk-abc123");
     }
@@ -519,32 +660,19 @@ mod tests {
 
     #[test]
     fn secret_non_utf8_returns_none() {
-        // Invalid UTF-8 bytes should fail rather than panic.
         assert!(secret_to_key(&[0xff, 0xfe, 0xfd]).is_none());
     }
 
     #[test]
-    fn env_var_fallback_used_when_keyring_and_file_unavailable() {
-        // Without a Secret Service daemon, the env var is the
-        // documented fallback. With a daemon reachable (a real
-        // desktop session, CI, etc.), `get()` consults the daemon
-        // first and may return whatever key is stored there.
-        //
-        // The point of this test isn't to lock down the exact value
-        // returned — that's environment-dependent. It's to verify
-        // that `get()` returns *some* value (env var OR daemon) and
-        // doesn't panic when both code paths are reachable. If the
-        // daemon has an item with our `application` attribute,
-        // that's what comes back; otherwise the env var does.
+    fn env_var_fallback_does_not_panic_with_daemon_reachable() {
+        // With a daemon reachable, `get()` consults it first and may
+        // return whatever key is stored there. Without one, it falls
+        // through to the env var. Either way, no panic — and the
+        // function returns *some* value when both paths are reachable.
         with_env(Some("sk-from-env"), || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let got = rt.block_on(super::get());
-            // Sanity: at least one of the two paths produced a value,
-            // and trimming didn't strip the prefix off the env var.
-            assert!(
-                got.is_some(),
-                "either the daemon should have a stored key OR the env var should be consulted"
-            );
+            assert!(got.is_some());
         });
     }
 
@@ -558,10 +686,6 @@ mod tests {
 
     #[test]
     fn attributes_use_instance_application() {
-        // The application attribute must be namespaced by instance —
-        // verify the helper produces the right value (even though
-        // `keyring_application()` reads global state, this test
-        // pins the attribute keys we use in the D-Bus calls).
         let attrs = attributes();
         assert!(attrs.contains_key("application"));
         assert!(attrs["application"].starts_with("llm-quota-tray"));
@@ -575,41 +699,39 @@ mod tests {
     }
 
     #[test]
-    fn secret_signature_matches_spec() {
-        // The wire format is `(oayays)`. Verify via the zvariant
-        // Type trait — a regression to the new-spec `(osays)` shape
-        // would fail every D-Bus call against a real
-        // gnome-keyring-daemon.
-        use zbus::zvariant::Type;
-        assert_eq!(
-            format!("{}", OwnedSecret::SIGNATURE),
-            "(oayays)",
-            "OwnedSecret tuple must match the original gnome-keyring wire format",
-        );
-        // SECRET_SIGNATURE const must agree with the derived one.
-        assert_eq!(SECRET_SIGNATURE, "(oayays)");
+    fn algorithm_signature_is_single_field_struct() {
+        // The new-spec wire format for Algorithm is
+        // `struct Algorithm { String variant; }` → D-Bus signature
+        // `(s)`. Pinned because the original-spec OpenSession uses
+        // a bare `s` for the algorithm, and the daemon distinguishes
+        // them at the wire level.
+        assert_eq!(format!("{}", Algorithm::SIGNATURE), "(s)");
+    }
+
+    #[test]
+    fn original_secret_signature_matches_oayays() {
+        // The original-spec Secret shape is
+        // `(ObjectPath, Byte[], Byte[], String)`.
+        assert_eq!(format!("{}", OriginalSecret::SIGNATURE), "(oayays)");
+    }
+
+    #[test]
+    fn new_secret_signature_matches_osays() {
+        // The new-spec Secret shape is
+        // `(ObjectPath, String, Byte[], String)`.
+        assert_eq!(format!("{}", NewSecret::SIGNATURE), "(osays)");
     }
 
     #[test]
     #[ignore = "requires a real session D-Bus with Secret Service daemon"]
-    fn end_to_end_set_get_clear() {
-        // Live D-Bus round trip: write a known key, read it back,
-        // delete it. Requires a session D-Bus with an active
-        // Secret Service daemon (gnome-keyring-daemon or
-        // equivalent). Run with `cargo test -- --ignored`.
+    fn end_to_end_new_spec_roundtrip() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let probe = format!("sk-e2e-{}", std::process::id());
-            // 1. Set
+            let probe = format!("sk-new-api-{}", std::process::id());
             super::set(&probe).await.expect("set");
-            // 2. Read back via the same public API
             let got = super::get().await.expect("get returned None after set");
             assert_eq!(got, probe, "round-tripped secret must match");
-            // 3. Clear
             super::clear().await.expect("clear");
-            // 4. Should be gone (or, if other instances share the
-            //    same `application` attribute, at least our write
-            //    was removed).
             let after = super::get().await;
             assert!(
                 after.is_none() || after.as_deref() != Some(&probe),
@@ -620,24 +742,33 @@ mod tests {
     }
 
     #[test]
-    fn owned_secret_roundtrip_through_string() {
-        // The wire shape `(oayays)` puts the secret bytes directly
-        // in field index 2 as a `Vec<u8>`. Verify the round-trip
-        // from a constructed OwnedSecret to a String — a regression
-        // to a Variant-wrapped value would silently keep tests
-        // green for text secrets but fail at the wire boundary.
-        let secret: OwnedSecret = (
-            OwnedObjectPath::try_from("/dummy").unwrap(),
-            Vec::new(),
-            b"sk-abc123".to_vec(),
-            "text/plain".to_string(),
-        );
-        let s = String::from_utf8(secret.2.clone()).unwrap();
-        assert_eq!(s, "sk-abc123");
-        assert_eq!(secret.3, "text/plain");
-        assert!(
-            secret.1.is_empty(),
-            "parameters should be empty for 'plain'"
-        );
+    #[ignore = "requires a real session D-Bus with Secret Service daemon"]
+    fn end_to_end_original_spec_roundtrip() {
+        // Same flow as the new-spec test, but bypassing detection
+        // and calling the original-spec code path directly. Useful
+        // for confirming the fallback path is exercised end-to-end
+        // even when the daemon advertises new-spec methods.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let probe = format!("sk-orig-api-{}", std::process::id());
+            let conn = super::session_bus().await.expect("session bus");
+            super::dbus_set_original(conn, probe.as_bytes())
+                .await
+                .expect("set (original)");
+            let got = super::dbus_get_original(conn)
+                .await
+                .expect("get (original)")
+                .expect("get returned None after set");
+            assert_eq!(got, probe, "round-tripped secret must match");
+            super::dbus_clear().await.expect("clear");
+            let after = super::dbus_get_original(conn)
+                .await
+                .expect("get after clear");
+            assert!(
+                after.is_none() || after.as_deref() != Some(&probe),
+                "secret was not cleared; got {:?}",
+                after
+            );
+        });
     }
 }

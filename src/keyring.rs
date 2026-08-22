@@ -77,9 +77,11 @@
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::OnceCell;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zbus::zvariant::Type;
 use zbus::{Connection, Proxy};
 
 /// Well-known bus name for the Secret Service.
@@ -535,10 +537,6 @@ pub struct Secret {
     pub value: Vec<u8>,
     pub content_type: String,
 }
-
-// Bring the derive macros into scope.
-use serde::{Deserialize, Serialize};
-use zbus::zvariant::Type;
 
 // ---------------------------------------------------------------------------
 // Helpers

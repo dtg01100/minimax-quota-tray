@@ -339,6 +339,23 @@ mod tests {
     }
 
     #[test]
+    fn auth_query_param_encodes_special_chars_in_key() {
+        let cfg = AuthConfig::QueryParam {
+            name: "key".to_string(),
+        };
+        // A key with `&` and `=` must be encoded so it doesn't corrupt
+        // the URL query string.
+        let modified = cfg.apply_to_endpoint(
+            "https://api.example.com/v1/usage",
+            "sk-abc&def=ghi",
+        );
+        assert_eq!(
+            modified,
+            "https://api.example.com/v1/usage?key=sk-abc%26def%3Dghi"
+        );
+    }
+
+    #[test]
     fn auth_default_is_bearer() {
         assert!(matches!(AuthConfig::default(), AuthConfig::Bearer));
     }

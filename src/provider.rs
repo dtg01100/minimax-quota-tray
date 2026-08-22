@@ -225,14 +225,77 @@ impl AuthConfig {
     /// If this auth style requires URL modification, return the
     /// rewritten URL. Otherwise return the input unchanged. Used by
     /// `fetch::fetch_windows_blocking` to handle query-string auth.
+    ///
+    /// The API key is percent-encoded so that keys containing
+    /// URL-significant characters (`&`, `=`, `#`, `/`, non-ASCII, etc.)
+    /// don't corrupt the request URL. The parameter name is trusted
+    /// (it comes from the user's config.json, not from the key itself)
+    /// and is appended verbatim.
     pub fn apply_to_endpoint(&self, endpoint: &str, api_key: &str) -> String {
         match self {
             AuthConfig::QueryParam { name } => {
                 let sep = if endpoint.contains('?') { '&' } else { '?' };
-                format!("{endpoint}{sep}{name}={api_key}")
+                let encoded = percent_encode_query_value(api_key);
+                format!("{endpoint}{sep}{name}={encoded}")
             }
             _ => endpoint.to_string(),
         }
+    }
+}
+
+/// Percent-encode a query-string *value*. ASCII alphanumerics and
+/// `-_.~` are left untouched (unreserved per RFC 3986); everything
+/// else is `%XX`-encoded byte-by-byte. This is sufficient for the
+/// common case (API keys in `QueryParam` auth) without pulling in a
+/// dedicated percent-encoding crate. UTF-8 multibyte characters are
+/// encoded one byte at a time, which is the correct behavior for
+/// `application/x-www-form-urlencoded`.
+fn percent_encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || byte == b'-'
+            || byte == b'_'
+            || byte == b'.'
+            || byte == b'~'
+        {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_encode_query_value_leaves_alphanumeric_untouched() {
+        assert_eq!(percent_encode_query_value("sk-abc123"), "sk-abc123");
+    }
+
+    #[test]
+    fn percent_encode_query_value_encodes_special_chars() {
+        assert_eq!(percent_encode_query_value("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
+    fn percent_encode_query_value_encodes_spaces() {
+        assert_eq!(percent_encode_query_value("a b"), "a%20b");
+    }
+
+    #[test]
+    fn percent_encode_query_value_encodes_non_ascii() {
+        // UTF-8 bytes for 'é' are 0xC3 0xA9
+        assert_eq!(percent_encode_query_value("café"), "caf%C3%A9");
+    }
+
+    #[test]
+    fn percent_encode_query_value_empty() {
+        assert_eq!(percent_encode_query_value(""), "");
     }
 }
 

@@ -80,20 +80,13 @@ pub enum Bucket {
 ///
 /// Important: gjs does NOT switch to a red ring when remaining drops
 /// below the red threshold — it keeps the yellow ring until pct hits 0,
-/// then falls through to the static `quota-throttled` dot. The earlier
-/// Rust port returned `Throttled` for `used >= red` which produced a
-/// red ring at low-but-not-zero percentages (e.g. 15% with default
-/// thresholds), diverging from gjs. The fix: only `Throttled` when
-/// the window is exhausted; otherwise Warning/Normal based on yellow
-/// or the burn projection.
-///
-/// The `red` parameter is kept in the signature for API stability but
-/// is unused — the gjs OR-with-yellow subsumes it.
+/// then falls through to the static `quota-throttled` dot. Only
+/// `Throttled` when the window is exhausted; otherwise Warning/Normal
+/// based on yellow or the burn projection.
 pub fn bucket_for(
     remaining_pct: i64,
     throttled: bool,
     yellow: i64,
-    _red: i64,
     burn: Option<&crate::burn::BurnResult>,
 ) -> Bucket {
     if throttled || remaining_pct <= 0 {
@@ -575,17 +568,17 @@ mod tests {
         // it stays yellow until pct hits 0. The `burn` parameter is
         // None in these cases (no burn-flip needed for the threshold
         // checks themselves).
-        assert_eq!(bucket_for(0, false, 60, 85, None), Bucket::Throttled);
-        assert_eq!(bucket_for(50, false, 60, 85, None), Bucket::Normal);
-        assert_eq!(bucket_for(35, false, 60, 85, None), Bucket::Warning);
+        assert_eq!(bucket_for(0, false, 60, None), Bucket::Throttled);
+        assert_eq!(bucket_for(50, false, 60, None), Bucket::Normal);
+        assert_eq!(bucket_for(35, false, 60, None), Bucket::Warning);
         // Critical regression: pct=14 (below red threshold but > 0) used
         // to return Throttled → red ring. gjs returns Warning → yellow
         // ring. The faithful reproduction requires Warning here.
-        assert_eq!(bucket_for(14, false, 60, 85, None), Bucket::Warning);
-        assert_eq!(bucket_for(80, true, 60, 85, None), Bucket::Throttled);
-        assert_eq!(bucket_for(1, false, 60, 85, None), Bucket::Warning);
-        assert_eq!(bucket_for(40, false, 60, 85, None), Bucket::Warning);
-        assert_eq!(bucket_for(41, false, 60, 85, None), Bucket::Normal);
+        assert_eq!(bucket_for(14, false, 60, None), Bucket::Warning);
+        assert_eq!(bucket_for(80, true, 60, None), Bucket::Throttled);
+        assert_eq!(bucket_for(1, false, 60, None), Bucket::Warning);
+        assert_eq!(bucket_for(40, false, 60, None), Bucket::Warning);
+        assert_eq!(bucket_for(41, false, 60, None), Bucket::Normal);
     }
 
     #[test]
@@ -602,7 +595,7 @@ mod tests {
             projected_pct_left: 90.0,
         };
         assert_eq!(
-            bucket_for(90, false, 60, 85, Some(&healthy)),
+            bucket_for(90, false, 60, Some(&healthy)),
             Bucket::Normal
         );
         // Same healthy remaining% but the burn projects exhaustion
@@ -613,18 +606,18 @@ mod tests {
             ..healthy
         };
         assert_eq!(
-            bucket_for(90, false, 60, 85, Some(&alarming)),
+            bucket_for(90, false, 60, Some(&alarming)),
             Bucket::Warning
         );
         // Burn flip is OR'd with the threshold check — a burn flip on
         // an already-low remaining% still lands at Warning (idempotent).
         assert_eq!(
-            bucket_for(20, false, 60, 85, Some(&alarming)),
+            bucket_for(20, false, 60, Some(&alarming)),
             Bucket::Warning
         );
         // Burn flip can't override Throttled — pct <= 0 still wins.
         assert_eq!(
-            bucket_for(0, false, 60, 85, Some(&alarming)),
+            bucket_for(0, false, 60, Some(&alarming)),
             Bucket::Throttled
         );
     }

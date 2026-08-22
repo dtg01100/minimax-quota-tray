@@ -608,7 +608,6 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
                 pct,
                 false,
                 cfg.thresholds.yellow,
-                cfg.thresholds.red,
                 primary_burn.as_ref(),
             );
 
@@ -849,7 +848,6 @@ async fn render_error_with_stale(
                 w.remaining_pct,
                 false,
                 cfg.thresholds.yellow,
-                cfg.thresholds.red,
                 None,
             );
             let path = icon::write_ring_svg(w.remaining_pct, bucket, rings)

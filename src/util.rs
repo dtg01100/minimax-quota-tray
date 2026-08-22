@@ -107,6 +107,14 @@ pub fn bar_markup(fraction_pct: i64) -> String {
 /// USD float to integer cents (e.g. `$25.00 → 2500`), the rate is
 /// also cents-per-hour. We convert cents→dollars for display here.
 ///
+/// `currency` is an ISO-4217 code (`"usd"`, `"eur"`, `"cny"`) or a
+/// display symbol (`"USD"`, `"¥"`). The currency symbol prefixed to
+/// the output is derived from this value; unrecognized or empty
+/// values fall back to `$`. This keeps single-currency configs
+/// working while letting multi-currency setups (e.g. a CNY-denominated
+/// DeepSeek window alongside a USD OpenRouter one) render distinct
+/// symbols.
+///
 /// Format rules (mirroring `fmt_rate`'s tier system):
 /// - < $0.01/h → `"$0.0042"` (4 decimals — typical for tiny OpenRouter
 ///   mini-models)
@@ -118,15 +126,13 @@ pub fn bar_markup(fraction_pct: i64) -> String {
 /// `"$1.0k"` → `"$1k"` rule) so the row reads cleanly: `$0.4`, `$5`,
 /// `$0.005` — never `$0.400` or `$5.00`.
 ///
-/// Non-finite or negative rates return `"$0"`. The currency symbol
-/// is hardcoded to `$` in the v1 prototype — the `currency` field on
-/// the window is preserved on `Window` for future i18n but not yet
-/// threaded through here. (Reasoning: most currency-in-quota APIs
-/// today report in USD; extending this is a one-line change when a
-/// second currency shows up.)
-pub fn fmt_cost(cents_per_hour: f64) -> String {
+/// Non-finite or negative rates return `"$0"` (or the equivalent in
+/// the configured currency).
+pub fn fmt_cost(cents_per_hour: f64, currency: Option<&str>) -> String {
+    let symbol = currency_symbol(currency);
+    let zero = format!("{symbol}0");
     if !cents_per_hour.is_finite() || cents_per_hour <= 0.0 {
-        return "$0".to_string();
+        return zero;
     }
     let usd = cents_per_hour / 100.0;
     let trim = |s: String| -> String {
@@ -137,13 +143,34 @@ pub fn fmt_cost(cents_per_hour: f64) -> String {
         }
     };
     if usd < 0.01 {
-        trim(format!("${usd:.4}"))
+        trim(format!("{symbol}{usd:.4}"))
     } else if usd < 1.0 {
-        trim(format!("${usd:.3}"))
+        trim(format!("{symbol}{usd:.3}"))
     } else if usd < 100.0 {
-        trim(format!("${usd:.2}"))
+        trim(format!("{symbol}{usd:.2}"))
     } else {
-        format!("${}", usd.round() as i64)
+        format!("{symbol}{}", usd.round() as i64)
+    }
+}
+
+/// Map a `currency` config value to a display symbol. Recognizes common
+/// ISO-4217 codes (case-insensitive) and well-known symbols; anything
+/// else falls back to `$`.
+fn currency_symbol(currency: Option<&str>) -> String {
+    match currency {
+        None => String::from("$"),
+        Some(c) => match c.trim() {
+            "" => String::from("$"),
+            "usd" | "USD" => String::from("$"),
+            "eur" | "EUR" => String::from("€"),
+            "gbp" | "GBP" => String::from("£"),
+            "jpy" | "JPY" | "cny" | "CNY" | "rmb" | "RMB" => String::from("¥"),
+            "krw" | "KRW" => String::from("₩"),
+            "inr" | "INR" => String::from("₹"),
+            // Unrecognized value — fall back to `$` rather than echoing
+            // a likely-typo back to the user.
+            _ => String::from("$"),
+        },
     }
 }
 
@@ -161,9 +188,9 @@ pub fn fmt_cost(cents_per_hour: f64) -> String {
 /// Currency-aware: when the window's `count_unit` is `"cents"` (or
 /// `"milliunits"`), the rate is rendered with `fmt_cost` instead of
 /// the token formatter — so the row reads `(40 $/h)` for Together /
-/// DeepSeek / OpenRouter-style windows. The `currency` field is
-/// currently display-only metadata (see `fmt_cost` notes); passing it
-/// here is forward-compatible with i18n but doesn't affect output yet.
+/// DeepSeek / OpenRouter-style windows. The `currency` field selects
+/// the symbol used by `fmt_cost` (e.g. `$`, `€`, `¥`); see
+/// `fmt_cost` for the recognized codes.
 ///
 /// Pricing fragment: when `cost_fragment` is `Some(s)`, it's appended
 /// to the rate portion of the label with a ` · ` separator — e.g.
@@ -174,14 +201,14 @@ pub fn fmt_cost(cents_per_hour: f64) -> String {
 pub fn burn_row_label(
     burn: &crate::burn::BurnResult,
     count_unit: Option<&str>,
-    _currency: Option<&str>,
+    currency: Option<&str>,
     cost_fragment: Option<&str>,
 ) -> String {
     let is_currency = matches!(count_unit, Some("cents") | Some("milliunits"));
     let rate_unit = if burn.unit == "pct" {
         format!("{}/h", fmt_rate(burn.rate_per_hour))
     } else if is_currency {
-        format!("{}/h", fmt_cost(burn.rate_per_hour))
+        format!("{}/h", fmt_cost(burn.rate_per_hour, currency))
     } else {
         format!("{} tok/h", fmt_rate(burn.rate_per_hour))
     };
@@ -318,25 +345,55 @@ mod tests {
         // Cents/h → $/h, with tier boundaries matching fmt_rate's
         // style. Trailing zeros are stripped at every tier (mirrors
         // `fmt_rate`'s gjs parity rule: `"$1.0k"` → `"$1k"`).
-        assert_eq!(fmt_cost(0.0), "$0");
-        assert_eq!(fmt_cost(0.5), "$0.005"); // < $0.01 → 4dp
-        assert_eq!(fmt_cost(1.0), "$0.01"); // exactly $0.01
-        assert_eq!(fmt_cost(50.0), "$0.5"); // < $1 → 3dp
-        assert_eq!(fmt_cost(99.0), "$0.99");
-        assert_eq!(fmt_cost(100.0), "$1"); // ≥ $1 → 2dp, both zeros stripped
-        assert_eq!(fmt_cost(523.0), "$5.23"); // typical PAYG burn
-        assert_eq!(fmt_cost(9999.0), "$99.99");
-        assert_eq!(fmt_cost(10_000.0), "$100"); // ≥ $100 → integer
-        assert_eq!(fmt_cost(12_345.0), "$123");
-        assert_eq!(fmt_cost(999_500.0), "$9995");
+        assert_eq!(fmt_cost(0.0, None), "$0");
+        assert_eq!(fmt_cost(0.5, None), "$0.005"); // < $0.01 → 4dp
+        assert_eq!(fmt_cost(1.0, None), "$0.01"); // exactly $0.01
+        assert_eq!(fmt_cost(50.0, None), "$0.5"); // < $1 → 3dp
+        assert_eq!(fmt_cost(99.0, None), "$0.99");
+        assert_eq!(fmt_cost(100.0, None), "$1"); // ≥ $1 → 2dp, both zeros stripped
+        assert_eq!(fmt_cost(523.0, None), "$5.23"); // typical PAYG burn
+        assert_eq!(fmt_cost(9999.0, None), "$99.99");
+        assert_eq!(fmt_cost(10_000.0, None), "$100"); // ≥ $100 → integer
+        assert_eq!(fmt_cost(12_345.0, None), "$123");
+        assert_eq!(fmt_cost(999_500.0, None), "$9995");
     }
 
     #[test]
     fn fmt_cost_handles_nonfinite() {
-        assert_eq!(fmt_cost(f64::NAN), "$0");
-        assert_eq!(fmt_cost(f64::INFINITY), "$0");
-        assert_eq!(fmt_cost(-1.0), "$0");
-        assert_eq!(fmt_cost(f64::NEG_INFINITY), "$0");
+        assert_eq!(fmt_cost(f64::NAN, None), "$0");
+        assert_eq!(fmt_cost(f64::INFINITY, None), "$0");
+        assert_eq!(fmt_cost(-1.0, None), "$0");
+        assert_eq!(fmt_cost(f64::NEG_INFINITY, None), "$0");
+    }
+
+    #[test]
+    fn fmt_cost_currency_usd() {
+        assert_eq!(fmt_cost(100.0, Some("USD")), "$1");
+        assert_eq!(fmt_cost(100.0, Some("usd")), "$1");
+    }
+
+    #[test]
+    fn fmt_cost_currency_eur() {
+        assert_eq!(fmt_cost(100.0, Some("EUR")), "€1");
+    }
+
+    #[test]
+    fn fmt_cost_currency_jpy() {
+        assert_eq!(fmt_cost(100.0, Some("JPY")), "¥1");
+        assert_eq!(fmt_cost(100.0, Some("cny")), "¥1");
+    }
+
+    #[test]
+    fn fmt_cost_currency_empty_falls_back_to_dollar() {
+        assert_eq!(fmt_cost(100.0, Some("")), "$1");
+        assert_eq!(fmt_cost(100.0, None), "$1");
+    }
+
+    #[test]
+    fn fmt_cost_currency_unknown_falls_back_to_dollar() {
+        // Unrecognized codes fall back to `$` rather than echoing a
+        // likely-typo back to the user.
+        assert_eq!(fmt_cost(100.0, Some("XYZ")), "$1");
     }
 
     // ---- burn_row_label (count_unit / currency / cost_fragment) ----

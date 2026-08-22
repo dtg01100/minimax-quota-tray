@@ -81,7 +81,8 @@ pub type PriceTable = HashMap<String, ModelPricing>;
 /// enum variant or a custom deserialize impl.
 #[derive(Debug, Deserialize)]
 struct WireModelEntry {
-    id: String,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     pricing: WirePricing,
 }
@@ -156,12 +157,13 @@ pub fn fetch_pricing_blocking(client: &HttpClient, url: &str) -> Result<PriceTab
         .with_context(|| format!("decoding pricing JSON from {url}"))?;
     let mut table = PriceTable::with_capacity(body.data.len());
     for entry in body.data {
-        // Some providers include a `null` id for deprecated entries;
-        // skip rather than panic.
-        if entry.id.is_empty() {
-            continue;
-        }
-        table.insert(entry.id, build_pricing(&entry.pricing));
+        // Some providers return null or empty `id` for deprecated entries;
+        // skip rather than panic on a missing/invalid key.
+        let id = match entry.id {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        table.insert(id, build_pricing(&entry.pricing));
     }
     Ok(table)
 }
@@ -361,7 +363,11 @@ mod tests {
 
         let mut table = PriceTable::new();
         for entry in parsed.data {
-            table.insert(entry.id, build_pricing(&entry.pricing));
+            let id = match entry.id {
+                Some(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+            table.insert(id, build_pricing(&entry.pricing));
         }
 
         let gpt = table.get("openai/gpt-4o").unwrap();
@@ -390,10 +396,29 @@ mod tests {
         let parsed: WireResponse = serde_json::from_str(body).unwrap();
         let mut table = PriceTable::new();
         for entry in parsed.data {
-            if entry.id.is_empty() {
-                continue;
-            }
-            table.insert(entry.id, build_pricing(&entry.pricing));
+            let id = match entry.id {
+                Some(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+            table.insert(id, build_pricing(&entry.pricing));
+        }
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn skips_null_id_entries() {
+        // OpenRouter sometimes returns {"id": null, ...} for legacy
+        // entries; we don't want those blowing up the HashMap key or
+        // the deserialization.
+        let body = r#"{"data": [{"id": null, "pricing": {"prompt": "0", "completion": "0"}}]}"#;
+        let parsed: WireResponse = serde_json::from_str(body).unwrap();
+        let mut table = PriceTable::new();
+        for entry in parsed.data {
+            let id = match entry.id {
+                Some(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+            table.insert(id, build_pricing(&entry.pricing));
         }
         assert!(table.is_empty());
     }

@@ -660,14 +660,16 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
                         &format!("{plan_label} — throttled", plan_label = cfg.label),
                         "Quota exhausted. The menu shows when it resets.",
                         notify::Urgency::Critical,
-                    );
+                    )
+                    .await;
                 } else if new_rank == BucketRank::Warning {
                     notify::send(
                         "warning",
                         &format!("{plan_label} — running low", plan_label = cfg.label),
                         &format!("Remaining dropped below {}%.", 100 - cfg.thresholds.yellow),
                         notify::Urgency::Normal,
-                    );
+                    )
+                    .await;
                 }
             }
 

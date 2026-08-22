@@ -1,28 +1,37 @@
-//! Threshold notifications via the freedesktop Notifications D-Bus API.
+//! Threshold notifications via the freedesktop Notification
+//! portal, with a direct `org.freedesktop.Notifications` fallback.
 //!
-//! Replaces the previous `notify-send(1)` subprocess. We call
-//! `org.freedesktop.Notifications.Notify` directly on the session bus,
-//! per https://specifications.freedesktop.org/notification-spec/.
+//! Targets https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Notification.html
+//! (v2). The portal's `AddNotification(id, vardict)` carries a
+//! caller-supplied `id` the server uses to *replace* in-flight
+//! notifications of the same kind instead of stacking them —
+//! which is the same dedup behavior the prior direct-Notifications
+//! path got via the `x-canonical-private-synchronous` hint. We
+//! pass the caller-supplied `tag` straight through as the portal
+//! `id`, dropping the hint hack.
 //!
-//! ## Why D-Bus instead of the CLI
+//! ## Why the portal
 //!
-//! - No `PATH` lookup for `notify-send` (which lives in
-//!   `libnotify-bin` / `libnotify-tools` — a separate package on
-//!   every distro we ship to). Removing it eliminates a soft
-//!   dependency; the session bus is always present on the distros
-//!   where the rest of this tray already runs.
-//! - No `fork(2)` + `execve(2)` on every bucket-rank transition.
-//!   At our cadence (1–2 notifications per hour in steady state, more
-//!   when depleting) the win is small but real, and the failure
-//!   surface shrinks: no missing-binary path, no zombie processes if
-//!   the user mashes the tray menu during a transition.
-//! - The D-Bus call returns the server-assigned `notification_id`
-//!   synchronously. We deliberately ignore it (the spec lets us
-//!   pick the ID on the next call via `replaces_id`); we use
-//!   `x-canonical-private-synchronous` instead so the notification
-//!   server dedups in-flight notifications of the same logical kind.
-//!   That matches gjs's `-h string:x-canonical-private-synchronous:`
-//!   behavior 1:1.
+//! - The Notification portal is the sandbox-friendly path; flatpak
+//!   apps cannot reach `org.freedesktop.Notifications` directly
+//!   and must go through the portal. Talking to the portal from
+//!   the start means a future flatpak packaging path requires no
+//!   code changes here.
+//! - The portal's `id`-based replace is canonical, documented, and
+//!   honored by every portal backend (GNOME's `xdg-desktop-portal-gtk`,
+//!   KDE's `xdg-desktop-portal-kde`, etc.). The old
+//!   `x-canonical-private-synchronous` hint was a libnotify-server
+//!   extension that worked on Ubuntu/GNOME but wasn't guaranteed
+//!   elsewhere.
+//!
+//! ## Fallback
+//!
+//! 1. **`xdg-desktop-portal` Notification** — `AddNotification(id, vardict)`.
+//! 2. **Direct `org.freedesktop.Notifications.Notify`** — used when
+//!    no portal daemon is running (headless CI, minimal WMs).
+//!    Replicates the original behavior with the
+//!    `x-canonical-private-synchronous` hint preserved for
+//!    gjs-parity.
 //!
 //! ## gjs parity
 //!
@@ -35,18 +44,23 @@
 //!
 //! Deduplication is the caller's job (track `_last_bucket` between
 //! refreshes, like gjs's `_lastBucket`). This module only does
-//! the D-Bus call + arg shaping.
+//! the dispatch + arg shaping.
 
 use std::sync::OnceLock;
 use tokio::sync::OnceCell;
 use zbus::zvariant::Value;
 use zbus::{Connection, Proxy};
 
-/// Well-known bus name / object path / interface for the freedesktop
-/// Notifications service. All three are the same string by spec.
+/// Direct Notifications spec constants (the fallback path).
 const NOTIF_BUS: &str = "org.freedesktop.Notifications";
 const NOTIF_PATH: &str = "/org/freedesktop/Notifications";
 const NOTIF_IFACE: &str = "org.freedesktop.Notifications";
+
+/// Desktop portal constants (the primary path).
+const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
+const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+const PORTAL_NOTIF_IFACE: &str = "org.freedesktop.portal.Notification";
+const PORTAL_APP_ID: &str = "llm-quota-tray.desktop";
 
 /// `Value::U8` byte value for each urgency, per the spec's
 /// `urgency` hint. (`y` over the wire — same numeric values as
@@ -73,26 +87,103 @@ async fn session_bus() -> zbus::Result<&'static Connection> {
         .await
 }
 
-/// Send a desktop notification via the freedesktop Notifications
-/// D-Bus API. Best-effort — failures are logged at debug level only
-/// (no daemon / headless session / D-Bus auth error shouldn't take
-/// down the tray).
+/// Send a desktop notification. Best-effort — failures are logged
+/// at debug level only (no daemon / headless session / D-Bus auth
+/// error shouldn't take down the tray).
 ///
-/// `tag` is the `x-canonical-private-synchronous` value: a stable
-/// per-notification-kind string. The notification server uses it
-/// to replace in-flight notifications of the same kind instead of
-/// stacking them, matching gjs's `-h string:x-canonical-private-
-/// synchronous:<tag>` behavior.
-pub async fn send(tag: &str, title: &str, body: &str, urgency: Urgency) {
-    let result = send_inner(tag, title, body, urgency).await;
-    if let Err(e) = result {
-        log::debug!("notification via D-Bus failed: {e}");
+/// `tag` is a stable per-notification-kind string. The portal
+/// uses it as the `id` argument to `AddNotification` so the
+/// notification server replaces in-flight notifications of the
+/// same kind instead of stacking them. On the direct-Notifications
+/// fallback path, the same string is passed via the
+/// `x-canonical-private-synchronous` hint (the libnotify-server
+/// extension that achieves the same dedup).
+///
+/// `activation_token` is the XDG Activation token the desktop
+/// shell provided at launch (`$XDG_ACTIVATION_TOKEN` or
+/// `--token=<token>`). The portal uses it to animate the
+/// notification from the originating click when the bucket
+/// transition fires close enough to launch that the token is
+/// still valid. Pass `None` when the caller doesn't have one or
+/// the transition fires long after launch (the token is
+/// single-use and expires). The direct-Notifications fallback
+/// doesn't honor activation tokens — it simply ignores the
+/// parameter.
+pub async fn send(
+    tag: &str,
+    title: &str,
+    body: &str,
+    urgency: Urgency,
+    activation_token: Option<&str>,
+) {
+    // Portal-first; if the portal daemon isn't reachable, fall
+    // through to the direct Notifications D-Bus path. Both
+    // branches are best-effort — the user gets a debug log on
+    // failure but no error surface to the caller.
+    if let Err(e) = send_portal(tag, title, body, urgency, activation_token).await {
+        log::debug!("notification via portal failed ({e:#}); trying direct");
+        if let Err(e) = send_direct(tag, title, body, urgency).await {
+            log::debug!("notification via direct D-Bus failed: {e}");
+        }
     }
 }
 
-/// Inner implementation, factored out so the `pub` entry point can
-/// be a single-line wrapper around a fallible async block.
-async fn send_inner(tag: &str, title: &str, body: &str, urgency: Urgency) -> zbus::Result<()> {
+/// Portal path: `org.freedesktop.portal.Notification.AddNotification`.
+///
+/// Spec signature:
+///   AddNotification(IN s id, IN a{sv} notification)
+///
+/// The `id` is the dedup key — the server replaces any in-flight
+/// notification with the same id instead of stacking. Notification
+/// vardict supports `title`, `body`, `priority` (low/normal/high/
+/// urgent), and others; we use the first three.
+///
+/// `activation_token` is forwarded as the `activation_token`
+/// vardict key (Notification portal v2+, see
+/// https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Notification.html).
+/// Stale tokens (None, expired) are simply omitted — the portal
+/// shows the notification without a launch animation.
+async fn send_portal(
+    tag: &str,
+    title: &str,
+    body: &str,
+    urgency: Urgency,
+    activation_token: Option<&str>,
+) -> zbus::Result<()> {
+    let conn = session_bus().await?;
+    let proxy = Proxy::new(conn, PORTAL_BUS, PORTAL_PATH, PORTAL_NOTIF_IFACE).await?;
+
+    let mut notification: std::collections::HashMap<&str, Value<'_>> =
+        std::collections::HashMap::with_capacity(4);
+    notification.insert("title", Value::Str(title.into()));
+    notification.insert("body", Value::Str(body.into()));
+    notification.insert("priority", Value::Str(urgency.to_priority().into()));
+    if let Some(tok) = activation_token {
+        notification.insert("activation_token", Value::Str(tok.into()));
+    }
+
+    // The `::<_, _, ()>` turbofish pins the return type to `()`. The
+    // Rust 2024 never-type-fallback lint requires an explicit type
+    // here because `AddNotification`'s return is empty — without
+    // the turbofish, the macro's return-type inference can pick
+    // `!` and trip the lint. Same fix for the direct-Notifications
+    // call below.
+    let _ = proxy
+        .call::<_, _, ()>("AddNotification", &(tag, notification))
+        .await;
+    Ok(())
+}
+
+/// Direct fallback: `org.freedesktop.Notifications.Notify`.
+///
+/// Identical to the pre-portal implementation, preserved for
+/// hosts without `xdg-desktop-portal` running.
+async fn send_direct(
+    tag: &str,
+    title: &str,
+    body: &str,
+    urgency: Urgency,
+) -> zbus::Result<()> {
     let conn = session_bus().await?;
     let proxy = Proxy::new(conn, NOTIF_BUS, NOTIF_PATH, NOTIF_IFACE).await?;
 
@@ -100,40 +191,30 @@ async fn send_inner(tag: &str, title: &str, body: &str, urgency: Urgency) -> zbu
     //   Notify(app_name, replaces_id, app_icon, summary, body,
     //          actions, hints, expire_timeout) -> notification_id
     //
-    // `replaces_id = 0` always → we never reuse a server-issued ID;
-    // the `x-canonical-private-synchronous` hint carries the dedup
-    // key instead. (Servers that understand it replace the in-flight
-    // notification; servers that don't still get a fresh notification
-    // per call, same as `notify-send`.)
+    // `replaces_id = 0` always; the
+    // `x-canonical-private-synchronous` hint carries the dedup
+    // key. Servers that understand it replace the in-flight
+    // notification; servers that don't get a fresh notification
+    // per call.
     //
-    // `expire_timeout = -1` → use the server's default. Negative
-    // values are explicitly documented as "use server default" in
-    // the spec.
-    //
-    // Hints are `Dict<String, Variant>`. We populate two:
-    //   * `urgency` (y / byte): 0=low, 1=normal, 2=critical.
-    //   * `x-canonical-private-synchronous` (s / string): the
-    //     caller-supplied dedup tag.
+    // `expire_timeout = -1` → use the server's default.
     let mut hints: std::collections::HashMap<&str, Value<'_>> =
         std::collections::HashMap::with_capacity(2);
     hints.insert("urgency", Value::U8(urgency.to_byte()));
     hints.insert("x-canonical-private-synchronous", Value::Str(tag.into()));
 
-    // The `_` (return value) is the server-assigned `notification_id`.
-    // We don't track it — the next call's dedup goes through the
-    // `x-canonical-private-synchronous` hint, not `replaces_id`.
     let _id: u32 = proxy
         .call(
             "Notify",
             &(
-                "llm-quota-tray",   // app_name
-                0u32,               // replaces_id (0 = new)
-                "",                 // app_icon (empty — server default)
-                title,              // summary
-                body,               // body
-                Vec::<&str>::new(), // actions
-                hints,              // hints
-                -1i32,              // expire_timeout (server default)
+                PORTAL_APP_ID,
+                0u32,
+                "",
+                title,
+                body,
+                Vec::<&str>::new(),
+                hints,
+                -1i32,
             ),
         )
         .await?;
@@ -156,12 +237,26 @@ pub enum Urgency {
 
 impl Urgency {
     /// Wire-format byte for the `urgency` hint (`y` over the wire).
-    /// Matches libnotify's `NotifyUrgency` enum.
+    /// Matches libnotify's `NotifyUrgency` enum. Used by the
+    /// direct-Notifications fallback path.
     fn to_byte(self) -> u8 {
         match self {
             Urgency::Low => URGENCY_LOW,
             Urgency::Normal => URGENCY_NORMAL,
             Urgency::Critical => URGENCY_CRITICAL,
+        }
+    }
+
+    /// Notification portal's `priority` field, per
+    /// https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Notification.html
+    /// (one of `low` / `normal` / `high` / `urgent`). Maps the
+    /// libnotify-shaped `Urgency` onto the portal's priority
+    /// vocabulary.
+    fn to_priority(self) -> &'static str {
+        match self {
+            Urgency::Low => "low",
+            Urgency::Normal => "normal",
+            Urgency::Critical => "urgent",
         }
     }
 }

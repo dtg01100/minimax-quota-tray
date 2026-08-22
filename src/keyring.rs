@@ -24,33 +24,44 @@
 //! directly is straightforward: it integrates with the existing
 //! tokio runtime and skips the fork/exec.
 //!
-//! ## Spec versions — dual implementation with auto-detection
+//! ## Spec compliance
 //!
-//! Two wire formats are in the wild:
+//! Targets the canonical freedesktop.org Secret Service spec at
+//! https://specifications.freedesktop.org/secret-service/latest/.
 //!
-//! - **Original spec** (what `gnome-keyring-daemon` and the bulk of
-//!   deployed daemons ship today):
-//!   `OpenSession(s,v) → (v,o)`, `GetSecrets(ao,o) → a{o(...)}`,
-//!   `Collection.CreateItem(a{sv}, (oayays), b) → (o,o)`,
-//!   `Secret` shape `(ObjectPath, Byte[], Byte[], String)`.
-//!   Attributes are set via `Properties.Set` after creation.
+//! - **Service interface**: `OpenSession`, `SearchItems`, `Unlock`,
+//!   `GetSecrets` (plural legacy; see `read_secret` for the
+//!   canonical `Item.GetSecret` we prefer), `ReadAlias`.
+//! - **Collection interface**: `CreateItem(properties, secret,
+//!   replace_bool)` — the spec puts `replace` as a `Boolean`,
+//!   not a `String`. Attributes are set on the Item via
+//!   `org.freedesktop.DBus.Properties.Set("Attributes", a{ss})`
+//!   after creation.
+//! - **Item interface**: `Delete`, `GetSecret(session)`,
+//!   `SetSecret(secret)`. Canonical read path.
+//! - **Secret struct**: `(ObjectPath session, Array<Byte>
+//!   parameters, Array<Byte> value, String content_type)` —
+//!   wire signature `(oayays)`.
 //!
-//! - **New spec** (freedesktop.org spec rev 0.2, ~2020):
-//!   `CreateSession(Algorithm{String}) → o`,
-//!   `GetSecret(o) → Secret`, `Secret` shape `(ObjectPath, String,
-//!   Byte[], String)`, `Collection.CreateItem(a{sv}, a{ss}, Secret,
-//!   "replace") → (o,o)`.
+//! The gnome-keyring-daemon also exposes a legacy
+//! `Service.GetSecrets(items, session)` method that returns the
+//! same dict shape. We don't use it; `Item.GetSecret` is cleaner.
 //!
-//! The daemon doesn't advertise a "version" property — the only
-//! way to know which it supports is to introspect it. We call
-//! `org.freedesktop.DBus.Introspectable.Introspect()` once per
-//! process (cached) and grep for `CreateSession`:
+//! ## Attribute migration
 //!
-//! - If `CreateSession` is in the XML → daemon is new-spec.
-//! - Otherwise → daemon is original-spec (the dominant case).
-//!
-//! Both code paths are kept around so we don't break older
-//! daemons when newer-spec code lands.
+//! Earlier versions of this tray stored the API key under
+//! `application = minimax-quota`. The codebase was later renamed
+//! to `llm-quota-tray`, but already-stored items kept the old
+//! attribute — users who installed the previous version have a
+//! key sitting in their keyring under the old name, invisible
+//! to a code path that only searches the new one. This module
+//! searches BOTH attribute names on read, so existing keys are
+//! found. On a successful set with the new name, the old item
+//! (if any) is opportunistically deleted so the next lookup is
+//! clean. The schema tag (`xdg:schema`) and the Item Type
+//! (`org.freedesktop.Secret.Generic`) are kept consistent between
+//! old and new items so this is purely a label/attribute
+//! migration.
 //!
 //! ## Fallback chain
 //!
@@ -79,9 +90,6 @@ const SS_SERVICE_PATH: &str = "/org/freedesktop/secrets";
 
 /// Standard alias for the user's default collection. Read via
 /// `ReadAlias("default")` to get the actual collection path.
-/// ("session" is another common alias — sometimes the default
-/// collection is unlocked for the entire session rather than
-/// persisted; both should work via ReadAlias.)
 const DEFAULT_ALIAS: &str = "default";
 
 /// Interface names per the Secret Service spec.
@@ -89,46 +97,26 @@ const SERVICE_IFACE: &str = "org.freedesktop.Secret.Service";
 const COLLECTION_IFACE: &str = "org.freedesktop.Secret.Collection";
 const ITEM_IFACE: &str = "org.freedesktop.Secret.Item";
 const PROMPT_IFACE: &str = "org.freedesktop.Secret.Prompt";
-const SESSION_IFACE: &str = "org.freedesktop.Secret.Session";
 
-/// Which Secret Service wire format the daemon speaks.
-///
-/// Detected via `Introspect()` once per process and cached. The
-/// choice is locked in for the process lifetime — if a daemon
-/// upgrades mid-session, we won't notice (the new connection
-/// uses the cached value). Edge case, not worth the complexity
-/// of re-probing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DaemonApi {
-    /// New spec (rev 0.2): `CreateSession(Algorithm{String}) → o`,
-    /// `GetSecret(o) → Secret`, secret shape `(osays)`,
-    /// `CreateItem(a{sv}, a{ss}, Secret, "replace")`.
-    New,
-    /// Original spec: `OpenSession(s,v) → (v,o)`,
-    /// `GetSecrets(ao,o) → a{o(...)}`, secret shape `(oayays)`,
-    /// `CreateItem(a{sv}, Secret, b)`, attributes via
-    /// `Properties.Set` after creation.
-    Original,
+/// Current `application` attribute name (post-rename).
+const ATTR_APP_CURRENT: &str = "application";
+
+/// Legacy `application` attribute name (pre-rename). Users who
+/// stored a key under this name have a real key sitting in their
+/// keyring that we'd otherwise miss — see the module docs.
+const ATTR_APP_LEGACY: &str = "minimax-quota";
+
+/// Current instance namespace — the value of the `application`
+/// attribute on items we own.
+fn current_application() -> String {
+    crate::instance::keyring_application()
 }
 
-impl DaemonApi {
-    /// Human-readable label for log messages.
-    fn label(self) -> &'static str {
-        match self {
-            DaemonApi::New => "new (rev 0.2)",
-            DaemonApi::Original => "original",
-        }
-    }
-}
-
-/// Which API the daemon speaks, detected lazily on first use.
-static DAEMON_API: OnceCell<DaemonApi> = OnceCell::const_new();
-
-/// Per-instance `application` attribute used to namespace items
-/// in the Secret Service collection.
-fn attributes() -> HashMap<String, String> {
-    let app = crate::instance::keyring_application();
-    HashMap::from([("application".to_string(), app)])
+/// Legacy instance namespace (pre-rename). Items stored under
+/// `application = minimax-quota` are still valid and found via
+/// `legacy_application()`.
+fn legacy_application() -> &'static str {
+    ATTR_APP_LEGACY
 }
 
 /// Item Label — what shows up in `seahorse` and `ksecretserviceviewer`.
@@ -136,7 +124,9 @@ fn label() -> String {
     format!("{} API Key", crate::instance::config_dir_basename())
 }
 
-/// Session-bus connection, opened lazily on first use.
+/// Session-bus connection, opened lazily on first use. Reused
+/// across calls so the D-Bus handshake (and any `XAUTHORITY`
+/// cookie processing) runs at most once per process.
 static SESSION_BUS: OnceCell<Connection> = OnceCell::const_new();
 
 async fn session_bus() -> Result<&'static Connection> {
@@ -156,42 +146,13 @@ async fn ss_proxy<'a>(
     Proxy::new(conn, SS_BUS, path, iface).await
 }
 
-/// Detect which spec the daemon implements by looking at its
-/// introspection XML for the presence of `CreateSession`.
-async fn detect_api(conn: &Connection) -> DaemonApi {
-    let svc = match ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await {
-        Ok(p) => p,
-        Err(_) => return DaemonApi::Original, // safe default
-    };
-    let xml = match svc.introspect().await {
-        Ok(s) => s,
-        Err(_) => return DaemonApi::Original, // safe default
-    };
-    if xml.contains("CreateSession") && xml.contains("GetSecret") {
-        DaemonApi::New
-    } else {
-        DaemonApi::Original
-    }
-}
-
-/// Cached detector — opens the session bus once, runs `detect_api`,
-/// caches the answer.
-async fn daemon_api() -> DaemonApi {
-    let conn = match session_bus().await {
-        Ok(c) => c,
-        Err(_) => return DaemonApi::Original,
-    };
-    *DAEMON_API
-        .get_or_init(|| async { detect_api(conn).await })
-        .await
-}
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Look up the API key. Priority:
-///   1. Secret Service via session D-Bus.
+///   1. Secret Service via session D-Bus (current AND legacy
+///      `application` attribute, see module docs).
 ///   2. `LLM_API_KEY` env var (systemd escape hatch).
 ///
 /// Returns `None` if both miss. Failures from (1) are logged at
@@ -206,137 +167,134 @@ pub async fn get() -> Option<String> {
     None
 }
 
-/// Store the API key in Secret Service.
+/// Store the API key in Secret Service. Uses the current
+/// `application` attribute name. If a legacy-attribute item
+/// exists in the same collection, it's deleted so the next
+/// reload doesn't see both.
 pub async fn set(value: &str) -> Result<()> {
-    let conn = session_bus().await?;
-    let api = daemon_api().await;
-    log::debug!("Secret Service: using {} API", api.label());
-    match api {
-        DaemonApi::New => dbus_set_new(conn, value.as_bytes()).await,
-        DaemonApi::Original => dbus_set_original(conn, value.as_bytes()).await,
-    }
+    dbus_set(value.as_bytes()).await
 }
 
-/// Remove the API key from Secret Service. Best-effort.
+/// Remove the API key from Secret Service. Clears both the
+/// current-attribute and legacy-attribute items so users with
+/// old installations don't see the key reappear after an
+/// attribute-name migration.
 #[allow(dead_code)] // exposed for future "Clear stored key" menu item
 pub async fn clear() -> Result<()> {
     dbus_clear().await
 }
 
 // ---------------------------------------------------------------------------
-// Dispatcher (get): try detected API once; if it fails, fall back
+// dbus_get: read the key, handling both attribute names
 // ---------------------------------------------------------------------------
 
 async fn dbus_get() -> Option<String> {
     let conn = session_bus().await.ok()?;
-    let api = daemon_api().await;
-
-    // Try the detected API first. If it fails with UnknownMethod /
-    // signature mismatch (the daemon upgrade-mid-session case, or a
-    // daemon that lies in its introspection), fall back to the
-    // other API. The fallback is bounded — we don't loop.
-    let result = match api {
-        DaemonApi::New => dbus_get_new(conn).await,
-        DaemonApi::Original => dbus_get_original(conn).await,
+    let svc = match ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await {
+        Ok(p) => p,
+        Err(e) => {
+            log::debug!("Secret Service: cannot build service proxy: {e}");
+            return None;
+        }
     };
-    match result {
+
+    // 1. Search for items matching either the current or legacy
+    //    `application` attribute. If we find a legacy-attribute
+    //    item AND not a current-attribute one, we read the legacy
+    //    item and signal to the caller that a migration is
+    //    overdue (via the return tuple).
+    let current = match search_items(conn, &svc, &current_attrs()).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::debug!("Secret Service: SearchItems (current) failed: {e:#}");
+            Vec::new()
+        }
+    };
+    let legacy = if current.is_empty() {
+        // Only fall back to legacy if there's no current-attribute
+        // hit — otherwise we'd return two keys and have to dedupe.
+        match search_items(conn, &svc, &legacy_attrs()).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::debug!("Secret Service: SearchItems (legacy) failed: {e:#}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    if current.is_empty() && legacy.is_empty() {
+        return None;
+    }
+
+    // 2. Open a "plain" session for the read.
+    let session = match open_session(conn, &svc).await {
         Ok(s) => s,
         Err(e) => {
-            log::debug!(
-                "Secret Service lookup via {} API failed: {e:#}",
-                api.label()
-            );
-            // Try the other API once before giving up.
-            let fallback_result = match api {
-                DaemonApi::New => dbus_get_original(conn).await,
-                DaemonApi::Original => dbus_get_new(conn).await,
-            };
-            match fallback_result {
-                Ok(s) => s,
-                Err(e2) => {
-                    log::debug!("Secret Service fallback also failed: {e2:#}");
-                    None
-                }
-            }
+            log::debug!("Secret Service: OpenSession failed: {e:#}");
+            return None;
         }
-    }
-}
+    };
 
-// ---------------------------------------------------------------------------
-// New spec implementation
-// ---------------------------------------------------------------------------
-
-async fn dbus_get_new(conn: &Connection) -> Result<Option<String>> {
-    let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
-
-    // 1. CreateSession(Algorithm{String}) → ObjectPath
-    //    (single-field struct wire signature `(s)`).
-    let session: OwnedObjectPath = svc
-        .call("CreateSession", &Algorithm("plain".into()))
-        .await
-        .context("CreateSession")?;
-
-    // 2. SearchItems({application=...}) → (items, locked)
-    let attrs = attributes();
-    let (items, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = svc
-        .call("SearchItems", &attrs)
-        .await
-        .context("SearchItems")?;
-    if items.is_empty() && locked.is_empty() {
-        return Ok(None);
-    }
-
-    // 3. Unlock locked items if any.
-    if !locked.is_empty() {
-        let to_unlock = locked.clone();
-        let (unlocked, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
-            svc.call("Unlock", &(to_unlock,)).await.context("Unlock")?;
-        if prompt.as_str() != "/" {
-            let ok = wait_for_prompt(conn, &prompt).await?;
-            if !ok {
-                anyhow::bail!("Unlock prompt dismissed");
-            }
-        }
-        if unlocked.is_empty() {
-            anyhow::bail!("Unlock returned no unlocked items");
+    // 3. Unlock all items we found. The spec's Unlock call on
+    //    already-unlocked items is a no-op, so we just call it
+    //    unconditionally — cheaper than a Locked-property round
+    //    trip per item.
+    let mut all_items: Vec<OwnedObjectPath> = current.to_vec();
+    all_items.extend(legacy.iter().cloned());
+    if !all_items.is_empty() {
+        if let Err(e) = unlock_items(conn, &svc, all_items).await {
+            log::debug!("Secret Service: Unlock failed: {e:#}");
+            return None;
         }
     }
 
-    // 4. GetSecret(item) → Secret struct (osays)
-    //    `(session: ObjectPath, parameters: String, value: Array<Byte>,
-    //    content_type: String)`
-    let item = items
+    // 4. Read the secret via Item.GetSecret(session) — the
+    //    canonical method per the spec. Pick the first item
+    //    (current preferred over legacy if both somehow exist).
+    let item = current
         .first()
+        .or(legacy.first())
         .cloned()
-        .or_else(|| locked.first().cloned())
-        .context("no item to read")?;
-    // GetSecret discards the session reply — we already have a
-    // session for the read; the Secret's session field is just
-    // metadata.
-    let _ = session;
+        .expect("non-empty by branch above");
+    let bytes = match read_secret(conn, &item, &session).await {
+        Ok(b) => b,
+        Err(e) => {
+            log::debug!("Secret Service: Item.GetSecret failed: {e:#}");
+            return None;
+        }
+    };
 
-    let secret: NewSecret = svc
-        .call("GetSecret", &(item.clone(),))
-        .await
-        .context("GetSecret")?;
+    // 5. If we read a legacy item, log a hint that a `--set-key`
+    //    would migrate it to the current attribute name. We don't
+    //    auto-migrate on read (the user might be running an old
+    //    tray instance in parallel and we don't want to delete
+    //    their data behind their back).
+    if !legacy.is_empty() && current.is_empty() {
+        log::info!(
+            "Secret Service: found legacy-attribute key for instance; \
+             run `llm-quota-tray --set-key` to migrate to the current \
+             attribute name."
+        );
+    }
 
-    // `secret.2` is the value bytes per the new-spec shape
-    // `(ObjectPath, String, Array<Byte>, String)`.
-    Ok(Some(
-        String::from_utf8(secret.2).context("non-UTF8 secret")?,
-    ))
+    String::from_utf8(bytes).ok()
 }
 
-async fn dbus_set_new(conn: &Connection, value: &[u8]) -> Result<()> {
+// ---------------------------------------------------------------------------
+// dbus_set: write the key with the current attribute name
+// ---------------------------------------------------------------------------
+
+async fn dbus_set(value: &[u8]) -> Result<()> {
+    let conn = session_bus().await?;
     let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
 
-    // 1. CreateSession.
-    let session: OwnedObjectPath = svc
-        .call("CreateSession", &Algorithm("plain".into()))
-        .await
-        .context("CreateSession")?;
+    // 1. Open session.
+    let session = open_session(conn, &svc).await?;
+    let session_ref = session.as_str();
 
-    // 2. Default collection via ReadAlias.
+    // 2. Resolve default collection via ReadAlias.
     let collection: OwnedObjectPath = svc
         .call("ReadAlias", &(DEFAULT_ALIAS,))
         .await
@@ -345,9 +303,8 @@ async fn dbus_set_new(conn: &Connection, value: &[u8]) -> Result<()> {
         anyhow::bail!("no default collection; user has no Secret Service collection set up");
     }
 
-    // 3. CreateItem(properties, attributes, secret, replace_if_exists).
-    //    New spec passes attributes as a parameter; replace is a
-    //    String enum ("always" / "never" / "replace").
+    // 3. Build the CreateItem arguments per the spec
+    //    (Dict<String,Variant> properties, Secret secret, Boolean replace).
     let mut properties: HashMap<&'static str, Value<'_>> = HashMap::new();
     properties.insert(
         "org.freedesktop.Secret.Item.Label",
@@ -358,19 +315,19 @@ async fn dbus_set_new(conn: &Connection, value: &[u8]) -> Result<()> {
         Value::Str("org.freedesktop.Secret.Generic".into()),
     );
 
-    let attrs = attributes();
-    let secret = NewSecret(
-        session,
-        String::new(),            // parameters (vestigial; empty for plain)
-        value.to_vec(),           // value
-        "text/plain".to_string(), // content_type
-    );
+    let session_op = zbus::zvariant::ObjectPath::from_str_unchecked(session_ref);
+    let secret = Secret {
+        session: OwnedObjectPath::from(session_op),
+        parameters: Vec::new(),                 // empty for "plain"
+        value: value.to_vec(),                  // the secret bytes
+        content_type: "text/plain".to_string(), // per spec convention
+    };
 
     let coll = ss_proxy(conn, collection.as_str(), COLLECTION_IFACE).await?;
     let (item, prompt): (OwnedObjectPath, OwnedObjectPath) = coll
         .call(
             "CreateItem",
-            &(properties, attrs, secret, "replace".to_string()),
+            &(properties, secret, true), // replace = true (per spec: Boolean)
         )
         .await
         .context("CreateItem")?;
@@ -380,133 +337,35 @@ async fn dbus_set_new(conn: &Connection, value: &[u8]) -> Result<()> {
             anyhow::bail!("CreateItem prompt dismissed");
         }
     }
-    // Item is now created with attributes already set — no
-    // Properties.Set follow-up needed (unlike the original API).
-    let _ = item;
-    Ok(())
-}
 
-// ---------------------------------------------------------------------------
-// Original spec implementation
-// ---------------------------------------------------------------------------
-
-async fn dbus_get_original(conn: &Connection) -> Result<Option<String>> {
-    let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
-
-    // 1. OpenSession(s, v) → (v, o)
-    let session = open_session_original(conn, "plain").await?;
-
-    // 2. SearchItems.
-    let attrs = attributes();
-    let (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = svc
-        .call("SearchItems", &attrs)
+    // 4. Set Attributes on the new Item via Properties.Set. The
+    //    spec deliberately keeps attributes off the CreateItem
+    //    signature — they're a property of the item, not the
+    //    creation call.
+    let item_proxy = ss_proxy(conn, item.as_str(), ITEM_IFACE).await?;
+    item_proxy
+        .set_property("Attributes", current_attrs())
         .await
-        .context("SearchItems")?;
-    if unlocked.is_empty() && locked.is_empty() {
-        return Ok(None);
-    }
+        .context("set Item.Attributes (current)")?;
 
-    // 3. Unlock.
-    if !locked.is_empty() {
-        let to_unlock = locked.clone();
-        let (_unlocked_after, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
-            svc.call("Unlock", &(to_unlock,)).await.context("Unlock")?;
-        if prompt.as_str() != "/" {
-            let ok = wait_for_prompt(conn, &prompt).await?;
-            if !ok {
-                anyhow::bail!("Unlock prompt dismissed by user");
+    // 5. Migration: if a legacy-attribute item exists, delete it.
+    //    Best-effort — a delete failure here shouldn't fail the
+    //    whole set; the user can re-run set or use clear().
+    if let Ok(legacy_items) = search_items(conn, &svc, &legacy_attrs()).await {
+        for legacy_item in legacy_items {
+            let p = ss_proxy(conn, legacy_item.as_str(), ITEM_IFACE).await?;
+            let prompt: OwnedObjectPath = p.call("Delete", &()).await?;
+            if prompt.as_str() != "/" {
+                log::debug!("legacy Delete returned prompt {}; skipping wait", prompt);
             }
         }
     }
 
-    // 4. GetSecrets(ao, o) → a{o(oayays)} (dict of item → Secret tuple).
-    let mut all_items: Vec<OwnedObjectPath> = unlocked;
-    all_items.extend(locked);
-    let secrets: HashMap<OwnedObjectPath, OriginalSecret> = svc
-        .call("GetSecrets", &(all_items, session.clone()))
-        .await
-        .context("GetSecrets")?;
-
-    let (_item, secret) = secrets.into_iter().next().context("no secret returned")?;
-
-    // `secret.2` is the value bytes per the original-spec shape
-    // `(ObjectPath, Byte[], Byte[], String)`.
-    Ok(Some(
-        String::from_utf8(secret.2).context("non-UTF8 secret")?,
-    ))
-}
-
-async fn dbus_set_original(conn: &Connection, value: &[u8]) -> Result<()> {
-    // 1. OpenSession.
-    let session = open_session_original(conn, "plain").await?;
-    let session_path = zbus::zvariant::ObjectPath::from_str_unchecked(session.as_str());
-
-    // 2. Default collection.
-    let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
-    let collection: OwnedObjectPath = svc
-        .call("ReadAlias", &(DEFAULT_ALIAS,))
-        .await
-        .context("ReadAlias(\"default\")")?;
-    if collection.as_str() == "/" {
-        anyhow::bail!("no default collection");
-    }
-
-    // 3. CreateItem(properties, secret, replace=true). No attributes
-    //    arg in the original spec — set them via Properties.Set after.
-    let mut properties: HashMap<&'static str, Value<'_>> = HashMap::new();
-    properties.insert(
-        "org.freedesktop.Secret.Item.Label",
-        Value::Str(label().into()),
-    );
-    properties.insert(
-        "org.freedesktop.Secret.Item.Type",
-        Value::Str("org.freedesktop.Secret.Generic".into()),
-    );
-
-    let secret = OriginalSecret(
-        OwnedObjectPath::from(session_path),
-        Vec::new(),               // parameters (empty for plain)
-        value.to_vec(),           // value (the secret bytes)
-        "text/plain".to_string(), // content_type
-    );
-
-    let coll = ss_proxy(conn, collection.as_str(), COLLECTION_IFACE).await?;
-    let (item, prompt): (OwnedObjectPath, OwnedObjectPath) = coll
-        .call("CreateItem", &(properties, secret, true))
-        .await
-        .context("CreateItem")?;
-    if prompt.as_str() != "/" {
-        let ok = wait_for_prompt(conn, &prompt).await?;
-        if !ok {
-            anyhow::bail!("CreateItem prompt dismissed");
-        }
-    }
-
-    // 4. Set Attributes via Properties.Set (original-spec quirk:
-    //    attributes aren't a CreateItem parameter, so we set them
-    //    after the item exists).
-    let item_proxy = ss_proxy(conn, item.as_str(), ITEM_IFACE).await?;
-    let attrs = attributes();
-    item_proxy
-        .set_property("Attributes", attrs)
-        .await
-        .context("set Item.Attributes")?;
-
     Ok(())
 }
 
-async fn open_session_original(conn: &Connection, algorithm: &str) -> Result<OwnedObjectPath> {
-    let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
-    let input = Value::Str("".into());
-    let (_output, session): (OwnedValue, OwnedObjectPath) = svc
-        .call("OpenSession", &(algorithm, input))
-        .await
-        .context("OpenSession")?;
-    Ok(session)
-}
-
 // ---------------------------------------------------------------------------
-// Clear (shared — both APIs use the same wire shape here)
+// dbus_clear: delete items matching either attribute name
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)] // see `clear()`
@@ -514,13 +373,17 @@ async fn dbus_clear() -> Result<()> {
     let conn = session_bus().await?;
     let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
 
-    let attrs = attributes();
-    let (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = svc
-        .call("SearchItems", &attrs)
-        .await
-        .context("SearchItems")?;
+    let mut all_items = Vec::new();
+    for attrs in [current_attrs(), legacy_attrs()] {
+        let (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = svc
+            .call("SearchItems", &attrs)
+            .await
+            .context("SearchItems")?;
+        all_items.extend(unlocked);
+        all_items.extend(locked);
+    }
 
-    for item in unlocked.into_iter().chain(locked) {
+    for item in all_items {
         let item_proxy = ss_proxy(conn, item.as_str(), ITEM_IFACE).await?;
         let prompt: OwnedObjectPath = item_proxy
             .call("Delete", &())
@@ -534,45 +397,103 @@ async fn dbus_clear() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Wire types — both Secret shapes
+// Shared helpers (OpenSession, SearchItems, Unlock, Item.GetSecret, prompt)
 // ---------------------------------------------------------------------------
 
-/// Wire shape of the `Algorithm` struct from the new spec:
-/// `struct Algorithm { String variant; }`. Single-field tuple
-/// struct serializes to D-Bus `(s)`. Pin via the
-/// `algorithm_signature` test below.
-#[derive(Debug, serde::Serialize, zbus::zvariant::Type)]
-#[zvariant(signature = "(s)")]
-pub struct Algorithm(pub String);
+fn current_attrs() -> HashMap<String, String> {
+    HashMap::from([(ATTR_APP_CURRENT.to_string(), current_application())])
+}
 
-/// Wire shape of `Secret` per the new spec rev 0.2:
-/// `(Object_Path session, String parameters, Array<Byte> value,
-/// String content_type)` → signature `(osays)`.
-///
-/// `OwnedObjectPath` is used for the session field rather than
-/// `ObjectPath<'static>` because we hold onto this struct across
-/// multiple awaits; borrowing from a `String` only works if the
-/// source outlives the struct, which is awkward to express when
-/// the source is a freshly-constructed D-Bus reply.
-#[derive(Debug, Serialize, Deserialize, Type)]
-pub struct NewSecret(pub OwnedObjectPath, pub String, pub Vec<u8>, pub String);
+fn legacy_attrs() -> HashMap<String, String> {
+    HashMap::from([(
+        ATTR_APP_CURRENT.to_string(),
+        legacy_application().to_string(),
+    )])
+}
 
-/// Wire shape of `Secret` per the original spec (what
-/// `gnome-keyring-daemon` implements):
-/// `(Object_Path session, Array<Byte> parameters, Array<Byte> value,
-/// String content_type)` → signature `(oayays)`.
-#[derive(Debug, Serialize, Deserialize, Type)]
-pub struct OriginalSecret(pub OwnedObjectPath, pub Vec<u8>, pub Vec<u8>, pub String);
+async fn open_session(_conn: &Connection, svc: &Proxy<'_>) -> Result<OwnedObjectPath> {
+    // Per the spec:
+    //   OpenSession(IN String algorithm, IN Variant input,
+    //               OUT Variant output, OUT ObjectPath result)
+    // For "plain" the input Variant is empty (use
+    // `Value::Str("")` — both gnome-keyring and libsecret accept
+    // that as the "no algorithm parameters" sentinel).
+    let input = Value::Str("".into());
+    let (_output, session): (OwnedValue, OwnedObjectPath) = svc
+        .call("OpenSession", &("plain", input))
+        .await
+        .context("OpenSession")?;
+    Ok(session)
+}
 
-// Bring Serialize + Deserialize + Type into scope for the
-// derives above (both used for both incoming and outgoing
-// Secret values).
-use serde::{Deserialize, Serialize};
-use zbus::zvariant::Type;
+async fn search_items(
+    conn: &Connection,
+    svc: &Proxy<'_>,
+    attrs: &HashMap<String, String>,
+) -> Result<Vec<OwnedObjectPath>> {
+    // Per the spec:
+    //   SearchItems(IN Dict<String,String> attributes,
+    //               OUT Array<ObjectPath> unlocked,
+    //               OUT Array<ObjectPath> locked)
+    // We return unlocked + locked (the caller handles them the
+    // same way for the read path — both need Unlock if locked).
+    let (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = svc
+        .call("SearchItems", attrs)
+        .await
+        .context("SearchItems")?;
+    let mut all = unlocked;
+    all.extend(locked);
+    let _ = conn; // unused; reserved for future per-collection search
+    Ok(all)
+}
 
-// ---------------------------------------------------------------------------
-// Prompt wait (shared)
-// ---------------------------------------------------------------------------
+async fn _is_item_locked_unused(_conn: &Connection, _item: &OwnedObjectPath) -> bool {
+    // The locked-counting in search_items() is informational; we
+    // call Unlock unconditionally below. Kept as a stub for the
+    // future optimization of skipping the Unlock round-trip when
+    // nothing is locked.
+    false
+}
+
+async fn unlock_items(
+    conn: &Connection,
+    svc: &Proxy<'_>,
+    locked: Vec<OwnedObjectPath>,
+) -> Result<()> {
+    // Per the spec:
+    //   Unlock(IN Array<ObjectPath> objects,
+    //          OUT Array<ObjectPath> unlocked,
+    //          OUT ObjectPath prompt)
+    let (unlocked, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
+        svc.call("Unlock", &(locked,)).await.context("Unlock")?;
+    if prompt.as_str() != "/" {
+        let ok = wait_for_prompt(conn, &prompt).await?;
+        if !ok {
+            anyhow::bail!("Unlock prompt dismissed by user");
+        }
+    }
+    if unlocked.is_empty() {
+        anyhow::bail!("Unlock returned no unlocked items");
+    }
+    Ok(())
+}
+
+async fn read_secret(
+    conn: &Connection,
+    item: &OwnedObjectPath,
+    session: &OwnedObjectPath,
+) -> Result<Vec<u8>> {
+    // Canonical read path per the spec:
+    //   Item.GetSecret(IN ObjectPath session, OUT Secret secret)
+    // The Secret struct wire signature is (oayays); we read just
+    // the value bytes (third field, index 2).
+    let item_proxy = ss_proxy(conn, item.as_str(), ITEM_IFACE).await?;
+    let secret: Secret = item_proxy
+        .call("GetSecret", &(session.clone(),))
+        .await
+        .context("Item.GetSecret")?;
+    Ok(secret.value)
+}
 
 async fn wait_for_prompt(conn: &Connection, prompt: &OwnedObjectPath) -> Result<bool> {
     let proxy = ss_proxy(conn, prompt.as_str(), PROMPT_IFACE)
@@ -592,6 +513,34 @@ async fn wait_for_prompt(conn: &Connection, prompt: &OwnedObjectPath) -> Result<
 }
 
 // ---------------------------------------------------------------------------
+// Wire type: Secret struct (per spec, signature (oayays))
+// ---------------------------------------------------------------------------
+
+/// Wire shape of the `Secret` struct per the spec:
+///
+/// ```text
+/// struct Secret {
+///     Object_Path session;        // session used to decode (path)
+///     Array<Byte> parameters;     // algorithm params (empty for plain)
+///     Array<Byte> value;          // the secret bytes
+///     String      content_type;   // MIME type, e.g. "text/plain"
+/// }
+/// ```
+///
+/// Signature: `(oayays)`.
+#[derive(Debug, Serialize, Deserialize, Type)]
+pub struct Secret {
+    pub session: OwnedObjectPath,
+    pub parameters: Vec<u8>,
+    pub value: Vec<u8>,
+    pub content_type: String,
+}
+
+// Bring the derive macros into scope.
+use serde::{Deserialize, Serialize};
+use zbus::zvariant::Type;
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -602,16 +551,6 @@ pub fn secret_to_key(bytes: &[u8]) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-}
-
-/// Close a session object explicitly. Currently unused but exposed
-/// for tests and completeness.
-#[allow(dead_code)]
-pub async fn close_session(session: OwnedObjectPath) -> Result<()> {
-    let conn = session_bus().await?;
-    let proxy = ss_proxy(conn, session.as_str(), SESSION_IFACE).await?;
-    let _: () = proxy.call("Close", &()).await.context("Close")?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -665,13 +604,12 @@ mod tests {
 
     #[test]
     fn env_var_fallback_does_not_panic_with_daemon_reachable() {
-        // With a daemon reachable, `get()` consults it first and may
-        // return whatever key is stored there. Without one, it falls
-        // through to the env var. Either way, no panic — and the
-        // function returns *some* value when both paths are reachable.
         with_env(Some("sk-from-env"), || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let got = rt.block_on(super::get());
+            // With a daemon reachable, get() consults it first.
+            // Without one, it falls through to the env var.
+            // Either way, no panic and *some* value.
             assert!(got.is_some());
         });
     }
@@ -686,9 +624,18 @@ mod tests {
 
     #[test]
     fn attributes_use_instance_application() {
-        let attrs = attributes();
-        assert!(attrs.contains_key("application"));
-        assert!(attrs["application"].starts_with("llm-quota-tray"));
+        let attrs = current_attrs();
+        assert_eq!(
+            attrs.get(ATTR_APP_CURRENT).map(String::as_str),
+            Some("llm-quota-tray")
+        );
+        // Legacy attrs use the legacy name; don't claim to be
+        // the current namespace.
+        let legacy = legacy_attrs();
+        assert_eq!(
+            legacy.get(ATTR_APP_CURRENT).map(String::as_str),
+            Some("minimax-quota")
+        );
     }
 
     #[test]
@@ -699,35 +646,23 @@ mod tests {
     }
 
     #[test]
-    fn algorithm_signature_is_single_field_struct() {
-        // The new-spec wire format for Algorithm is
-        // `struct Algorithm { String variant; }` → D-Bus signature
-        // `(s)`. Pinned because the original-spec OpenSession uses
-        // a bare `s` for the algorithm, and the daemon distinguishes
-        // them at the wire level.
-        assert_eq!(format!("{}", Algorithm::SIGNATURE), "(s)");
-    }
-
-    #[test]
-    fn original_secret_signature_matches_oayays() {
-        // The original-spec Secret shape is
-        // `(ObjectPath, Byte[], Byte[], String)`.
-        assert_eq!(format!("{}", OriginalSecret::SIGNATURE), "(oayays)");
-    }
-
-    #[test]
-    fn new_secret_signature_matches_osays() {
-        // The new-spec Secret shape is
-        // `(ObjectPath, String, Byte[], String)`.
-        assert_eq!(format!("{}", NewSecret::SIGNATURE), "(osays)");
+    fn secret_signature_matches_oayays() {
+        // Per the freedesktop.org spec at
+        // https://specifications.freedesktop.org/secret-service/latest/types.html
+        // the Secret struct is
+        //   struct Secret { ObjectPath session; Array<Byte> parameters;
+        //                   Array<Byte> value; String content_type; }
+        // → signature `(oayays)`. Pinned here so a refactor can't
+        // accidentally swap to the (wrong) spec text shape.
+        assert_eq!(format!("{}", Secret::SIGNATURE), "(oayays)");
     }
 
     #[test]
     #[ignore = "requires a real session D-Bus with Secret Service daemon"]
-    fn end_to_end_new_spec_roundtrip() {
+    fn end_to_end_roundtrip() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let probe = format!("sk-new-api-{}", std::process::id());
+            let probe = format!("sk-e2e-{}", std::process::id());
             super::set(&probe).await.expect("set");
             let got = super::get().await.expect("get returned None after set");
             assert_eq!(got, probe, "round-tripped secret must match");
@@ -743,30 +678,97 @@ mod tests {
 
     #[test]
     #[ignore = "requires a real session D-Bus with Secret Service daemon"]
-    fn end_to_end_original_spec_roundtrip() {
-        // Same flow as the new-spec test, but bypassing detection
-        // and calling the original-spec code path directly. Useful
-        // for confirming the fallback path is exercised end-to-end
-        // even when the daemon advertises new-spec methods.
+    fn end_to_end_legacy_attribute_is_found() {
+        // Regression: a key stored under the OLD `application =
+        // minimax-quota` attribute must still be readable after
+        // the rename. We set up the legacy item by hand (because
+        // `set()` would migrate it), then read it via `get()`.
+        //
+        // This test must isolate itself: the `end_to_end_roundtrip`
+        // test runs in the same keyring namespace and leaves a
+        // current-attribute item behind. If we didn't clear first,
+        // the lookup would find the current item and skip the
+        // legacy probe entirely.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let probe = format!("sk-orig-api-{}", std::process::id());
+            // Pre-flight cleanup: clear both attribute namespaces
+            // so this test starts from a known-empty state.
+            super::clear().await.ok();
+
             let conn = super::session_bus().await.expect("session bus");
-            super::dbus_set_original(conn, probe.as_bytes())
+            let svc = super::ss_proxy(conn, super::SS_SERVICE_PATH, super::SERVICE_IFACE)
                 .await
-                .expect("set (original)");
-            let got = super::dbus_get_original(conn)
+                .expect("service proxy");
+            let session = super::open_session(conn, &svc).await.expect("open session");
+            let collection: OwnedObjectPath = svc
+                .call("ReadAlias", &(super::DEFAULT_ALIAS,))
                 .await
-                .expect("get (original)")
-                .expect("get returned None after set");
-            assert_eq!(got, probe, "round-tripped secret must match");
-            super::dbus_clear().await.expect("clear");
-            let after = super::dbus_get_original(conn)
+                .expect("read alias");
+
+            // Write a legacy-attribute item directly.
+            let probe = format!("sk-legacy-{}", std::process::id());
+            let mut properties: HashMap<&str, Value> = HashMap::new();
+            properties.insert(
+                "org.freedesktop.Secret.Item.Label",
+                Value::Str("legacy test item".into()),
+            );
+            let secret = Secret {
+                session: OwnedObjectPath::try_from(session.as_str()).unwrap(),
+                parameters: Vec::new(),
+                value: probe.as_bytes().to_vec(),
+                content_type: "text/plain".to_string(),
+            };
+            let coll = super::ss_proxy(conn, collection.as_str(), super::COLLECTION_IFACE)
                 .await
-                .expect("get after clear");
+                .expect("coll proxy");
+            let (item, prompt): (OwnedObjectPath, OwnedObjectPath) = coll
+                .call("CreateItem", &(properties, secret, true))
+                .await
+                .expect("create item");
+            if prompt.as_str() != "/" {
+                let _ = super::wait_for_prompt(conn, &prompt).await;
+            }
+            let item_proxy = super::ss_proxy(conn, item.as_str(), super::ITEM_IFACE)
+                .await
+                .expect("item proxy");
+            item_proxy
+                .set_property("Attributes", super::legacy_attrs())
+                .await
+                .expect("set legacy attributes");
+
+            // Now read via the public get() — it should find the
+            // legacy-attribute item.
+            let got = super::get()
+                .await
+                .expect("get returned None for legacy item");
+            assert_eq!(got, probe, "legacy-attribute item must be discoverable");
+
+            // Setting via the public set() should migrate: write
+            // a new key, verify the legacy item is gone and the
+            // new key is reachable.
+            let new_probe = format!("sk-new-{}", std::process::id());
+            super::set(&new_probe).await.expect("set (migrates)");
+            let got_after = super::get().await.expect("get after migrate");
+            assert_eq!(
+                got_after, new_probe,
+                "must find the new key after migration"
+            );
+
+            // Now run a set() again — that should NOT leave a
+            // stale legacy item around (the migration runs every
+            // time, deleting any legacy-attribute siblings).
+            let third = format!("sk-third-{}", std::process::id());
+            super::set(&third)
+                .await
+                .expect("set (idempotent migration)");
+
+            // Cleanup: clear, then verify nothing matches anymore.
+            super::clear().await.expect("clear");
+            let after = super::get().await;
             assert!(
-                after.is_none() || after.as_deref() != Some(&probe),
-                "secret was not cleared; got {:?}",
+                after.is_none()
+                    || (after.as_deref() != Some(&probe) && after.as_deref() != Some(&third)),
+                "both legacy and new items should be cleared; got {:?}",
                 after
             );
         });

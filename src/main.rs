@@ -459,11 +459,13 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
         }
     }
 
-    // secret-service internally spins up its own async runtime,
-    // which clashes with our tokio runtime. Run on a blocking thread.
-    let api_key = match tokio::task::spawn_blocking(keyring::get).await {
-        Ok(Some(k)) => k,
-        _ => {
+    // Direct D-Bus call — no spawn_blocking needed. The session-bus
+    // connection is cached in `keyring` (see OnceCell there), and
+    // zbus's `Proxy::call` is async-native so it integrates with
+    // the tokio runtime without blocking.
+    let api_key = match keyring::get().await {
+        Some(k) => k,
+        None => {
             // gjs parity: "No API key configured" (the full message)
             // in the menu's error row, not just "No API key".
             render_error(tray, cfg, "No API key configured").await;
@@ -758,11 +760,7 @@ async fn render_initial(tray: &Arc<Tray>, cfg: &Config) {
     // Probe the keyring once so the absence of an API key shows up
     // in the log (and the menu's error row carries it). The chip
     // itself is just the icon — empty title (gjs parity).
-    let _has_key = tokio::task::spawn_blocking(keyring::get)
-        .await
-        .ok()
-        .flatten()
-        .is_some();
+    let _has_key = keyring::get().await.is_some();
     // No data yet — empty tooltip (gjs's "no data" case uses just the
     // plan label, not a detailed percentage; with empty data we
     // don't have a percentage to put in the desc).
@@ -1073,18 +1071,18 @@ async fn set_api_key_interactive() -> Result<Option<String>> {
 
     // Try zenity first (GNOME).
     if let Some(k) = prompt_with_zenity(&label, &app).await? {
-        keyring::set(&k)?;
+        keyring::set(&k).await?;
         return Ok(Some(k));
     }
     // Fall back to kdialog (KDE).
     if let Some(k) = prompt_with_kdialog(&label, &app).await? {
-        keyring::set(&k)?;
+        keyring::set(&k).await?;
         return Ok(Some(k));
     }
     // Fall back to secret-tool --prompt (libsecret's stdin prompt;
     // available wherever libsecret-tools is installed).
     if let Some(k) = prompt_with_secret_tool(&label, &app).await? {
-        keyring::set(&k)?;
+        keyring::set(&k).await?;
         return Ok(Some(k));
     }
     Err(anyhow::anyhow!(

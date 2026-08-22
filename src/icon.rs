@@ -115,11 +115,11 @@ pub fn bucket_for(
 /// The inner color is the bucket's **status** color — the channel
 /// that flips through green/yellow/red as the tray moves between
 /// Normal / Warning / Throttled.
-fn inner_color_for(b: Bucket, colors: &RingColors) -> String {
+fn inner_color_for(b: Bucket, colors: &RingColors) -> &str {
     match b {
-        Bucket::Normal => colors.inner.normal.clone(),
-        Bucket::Warning => colors.inner.warning.clone(),
-        Bucket::Throttled => colors.inner.throttled.clone(),
+        Bucket::Normal => &colors.inner.normal,
+        Bucket::Warning => &colors.inner.warning,
+        Bucket::Throttled => &colors.inner.throttled,
     }
 }
 
@@ -177,38 +177,34 @@ fn bucket_name(b: Bucket) -> &'static str {
 /// fresh path, automatically invalidating the on-disk cache when the
 /// user retunes `~/.config/llm-quota-tray/config.json`.
 ///
-/// We can't use `std::collections::hash_map::DefaultHasher` —
-/// `DefaultHasher` is randomized per-process to harden `HashMap`
-/// against DoS, so the same colors would hash differently on every
-/// daemon restart. FNV-1a is stable, tiny, dependency-free, and
-/// more than collision-resistant for the four ~7-char hex strings
-/// we feed it.
+/// The hash is precomputed and cached in `RingColors::cached_hash`
+/// (computed once on deserialization). This function just returns the
+/// cached value — colors never change at runtime, so there's no need
+/// to rehash on every poll.
 fn colors_hash(colors: &RingColors) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
-    for chunk in [
-        colors.inner.normal.as_bytes(),
-        b"|",
-        colors.inner.warning.as_bytes(),
-        b"|",
-        colors.inner.throttled.as_bytes(),
-        b"|",
-        colors.outer.as_bytes(),
-    ] {
-        for &b in chunk {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
-        }
-    }
-    h
+    colors.cached_hash
+}
+
+/// Cached temp-directory path. `std::env::var("TMPDIR")` is technically
+/// a syscall per call; cache the resolved path once at first use so
+/// steady-state SVG path construction does no environment lookups.
+fn temp_dir() -> std::path::PathBuf {
+    use std::sync::OnceLock;
+    static TMPDIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    TMPDIR
+        .get_or_init(|| {
+            std::env::var("TMPDIR")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+        })
+        .clone()
 }
 
 pub fn ring_svg_path(pct: i64, colors: &RingColors) -> std::path::PathBuf {
     let clamped = pct.clamp(0, 100);
     let hash = colors_hash(colors);
-    let dir = std::env::var("TMPDIR")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    let dir = temp_dir();
     dir.join(format!("llm-quota-ring-{clamped}-{hash:016x}.svg"))
 }
 
@@ -217,15 +213,12 @@ pub fn ring_svg_path(pct: i64, colors: &RingColors) -> std::path::PathBuf {
 /// `ring_svg_path()` for the full rationale on why we send SVG file
 /// paths as `IconName`. The static SVGs are written to
 /// `${TMPDIR}/llm-quota-{name}-{hash}.svg` once at startup by
-/// `write_static_svgs()`. The `{hash}` component is `colors_hash()`
+/// `write_static_svgs()`. The `{hash}` component is the cached hash
 /// of the active `RingColors` so config edits invalidate the cache
 /// without manual intervention.
 pub fn static_svg_path(name: &str, colors: &RingColors) -> std::path::PathBuf {
     let hash = colors_hash(colors);
-    let dir = std::env::var("TMPDIR")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    let dir = temp_dir();
     dir.join(format!("llm-quota-{name}-{hash:016x}.svg"))
 }
 
@@ -306,7 +299,7 @@ pub fn write_ring_svg(pct: i64, bucket: Bucket, colors: &RingColors) -> std::pat
     if path.exists() {
         return path;
     }
-    let svg = svg_for(pct, &inner_color_for(bucket, colors), outer_color(colors));
+    let svg = svg_for(pct, inner_color_for(bucket, colors), outer_color(colors));
     if let Err(e) = std::fs::write(&path, svg) {
         log::warn!("icon: failed to write ring SVG to {path:?}: {e}");
     }
@@ -388,7 +381,7 @@ fn svg_for(pct: i64, inner_color: &str, outer_color: &str) -> String {
 /// a theme icon name in that case.
 pub fn render_pixmap(pct: i64, bucket: Bucket, colors: &RingColors) -> Option<(u32, u32, Vec<u8>)> {
     let (or, og, ob) = parse_hex_rgb(outer_color(colors))?;
-    let (ir, ig, ib) = parse_hex_rgb(&inner_color_for(bucket, colors))?;
+    let (ir, ig, ib) = parse_hex_rgb(inner_color_for(bucket, colors))?;
     let mut pixmap = Pixmap::new(ICON_SIZE, ICON_SIZE)?;
 
     // 1. Track: stroke at 25% opacity in the OUTER color. The alpha
@@ -740,6 +733,7 @@ mod tests {
                 throttled: "#9933ff".to_string(),
             },
             outer: "#1d8b3a".to_string(),
+            cached_hash: 0,
         };
         assert_eq!(inner_color_for(Bucket::Normal, &alt), "#3366ff");
         assert_eq!(inner_color_for(Bucket::Warning, &alt), "#ff9900");
@@ -935,10 +929,12 @@ mod tests {
                 throttled: "#e01b24".into(),
             },
             outer: "#3584e4".into(),
+            cached_hash: 0xAAAAAAAAAAAAAAAA,
         };
         let c2 = RingColors {
             inner: c1.inner.clone(),
             outer: "#0c8599".into(), // only difference
+            cached_hash: 0xBBBBBBBBBBBBBBBB,
         };
 
         let p1 = ring_svg_path(51, &c1);
@@ -974,12 +970,12 @@ mod tests {
 
     /// The hash must be stable across runs — `DefaultHasher` is
     /// randomized per-process, which would defeat the purpose. This
-    /// test locks in that `colors_hash` produces the same value for
-    /// the same input on repeat calls.
+    /// test locks in that the cached `cached_hash` field matches the
+    /// FNV-1a computation for the same input on repeat calls.
     #[test]
     fn colors_hash_is_stable() {
         let c = default_colors();
-        // Direct call gives the same value on repeat (within a run).
+        // Cached field gives the same value on repeat (within a run).
         // Cross-run stability is locked in by the FNV-1a implementation
         // — if someone replaces it with `DefaultHasher`, this test
         // still passes (within a run) but the cross-process guarantee
@@ -990,8 +986,17 @@ mod tests {
         assert_eq!(h1, h2);
 
         // The hash must differ for different colors (basic distinctness).
-        let mut c2 = c.clone();
-        c2.outer = "#000000".into();
+        // Build a RingColors via JSON deserialization so the cached_hash
+        // is computed from the actual colors.
+        let json = r##"{
+            "inner": {
+                "normal": "#3a9d4d",
+                "warning": "#f6d32d",
+                "throttled": "#e01b24"
+            },
+            "outer": "#000000"
+        }"##;
+        let c2: crate::provider::RingColors = serde_json::from_str(json).unwrap();
         assert_ne!(colors_hash(&c), colors_hash(&c2));
     }
 

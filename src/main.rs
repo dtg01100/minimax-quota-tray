@@ -473,9 +473,6 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
         }
     };
 
-    // Refresh dashboard URL if it changed.
-    tray.set_dashboard_url(cfg.dashboard_url.clone()).await;
-
     let client = {
         let s = state.lock().await;
         match &s.http_client {
@@ -564,35 +561,24 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
                 record_sample(hist, w);
             }
 
-            // Compute burn rows for each window. We collect both
-            // the windows and their burn results into a `Vec` of
-            // pairs to feed `build_menu_state` — pairs own the
-            // window by value, and we hold the borrow on `s.histories`
-            // through `s`. To satisfy the borrow checker, we
-            // compute burn rows by reading from a transient copy
-            // (the slice is short — see `burn::decide_burn_row`'s
-            // signature).
-            let mut pairs: Vec<(Window, Option<burn::BurnResult>)> =
+            // Compute burn rows for each window. We collect burn
+            // results into a Vec so we can borrow them when building
+            // the menu state, while iterating over the windows by
+            // reference (no Window clones needed).
+            let mut burn_results: Vec<Option<burn::BurnResult>> =
                 Vec::with_capacity(windows.len());
             for w in &windows {
                 let history = s.histories.get(&w.id).map(Vec::as_slice).unwrap_or(&[]);
-                let b = burn::decide_burn_row(Some(w), history, now_ms(), &cfg.burn_warning);
-                pairs.push((w.clone(), b));
+                burn_results.push(burn::decide_burn_row(Some(w), history, now_ms(), &cfg.burn_warning));
             }
-            // Compute the primary's burn separately for icon bucket
-            // selection (same data; doing it twice avoids borrow
-            // gymnastics on the pairs vec).
-            let primary_burn = s
-                .histories
-                .get(&primary.id)
-                .and_then(|h| burn::decide_burn_row(Some(&primary), h, now_ms(), &cfg.burn_warning))
-                .or_else(|| pairs.first().and_then(|(_, b)| *b));
-            let pct = primary.remaining_pct;
-
-            // Borrow the pairs as (Window, Option<&BurnResult>) for
-            // the menu builder.
-            let pair_refs: Vec<(Window, Option<&burn::BurnResult>)> =
-                pairs.iter().map(|(w, b)| (w.clone(), b.as_ref())).collect();
+            let pair_refs: Vec<(&Window, Option<&burn::BurnResult>)> = windows
+                .iter()
+                .zip(burn_results.iter())
+                .map(|(w, b)| (w, b.as_ref()))
+                .collect();
+            // Primary's burn is the first window's burn (already computed).
+            let primary_burn = pair_refs.first().and_then(|(_, b)| *b);
+            let pct = windows[0].remaining_pct;
 
             let menu_state = build_menu_state(
                 &cfg.label,
@@ -608,7 +594,7 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
                 pct,
                 false,
                 cfg.thresholds.yellow,
-                primary_burn.as_ref(),
+                primary_burn,
             );
 
             let icon_name: String = match bucket {
@@ -661,6 +647,7 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
                         &format!("{plan_label} — throttled", plan_label = cfg.label),
                         "Quota exhausted. The menu shows when it resets.",
                         notify::Urgency::Critical,
+                        None,
                     )
                     .await;
                 } else if new_rank == BucketRank::Warning {
@@ -669,6 +656,7 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
                         &format!("{plan_label} — running low", plan_label = cfg.label),
                         &format!("Remaining dropped below {}%.", 100 - cfg.thresholds.yellow),
                         notify::Urgency::Normal,
+                        None,
                     )
                     .await;
                 }
@@ -874,8 +862,8 @@ async fn render_error_with_stale(
 
     // Build menu pairs (Window, no burn result for stale data —
     // we don't have fresh samples to project on).
-    let windows: Vec<(Window, Option<&BurnResult>)> =
-        stale_windows.iter().map(|w| (w.clone(), None)).collect();
+    let windows: Vec<(&Window, Option<&BurnResult>)> =
+        stale_windows.iter().map(|w| (w, None)).collect();
     let throttled = stale_windows
         .first()
         .map(|w| w.remaining_pct <= 0)
@@ -934,7 +922,7 @@ async fn render_out_of_menu(tray: &Arc<Tray>, cfg: &Config, offline: bool) {
 /// don't show noise.
 fn build_menu_state(
     plan_label: &str,
-    windows: &[(Window, Option<&BurnResult>)],
+    windows: &[(&Window, Option<&BurnResult>)],
     error: Option<&str>,
     stale: bool,
     age_ms: i64,
@@ -1260,7 +1248,7 @@ mod tests {
         let burn_weekly: Option<&BurnResult> = None;
         let m = build_menu_state(
             "Coding Plan",
-            &[(five_h, burn_5h), (weekly, burn_weekly)],
+            &[(&five_h, burn_5h), (&weekly, burn_weekly)],
             None,
             false,
             0,
@@ -1289,7 +1277,7 @@ mod tests {
         let burn_weekly_ref = Some(&burn_weekly);
         let m = build_menu_state(
             "Token Plan",
-            &[(five_h, burn_5h_ref), (weekly, burn_weekly_ref)],
+            &[(&five_h, burn_5h_ref), (&weekly, burn_weekly_ref)],
             None,
             false,
             0,
@@ -1313,7 +1301,7 @@ mod tests {
         let weekly = w("weekly", 90, now - 86_400_000, now + 5 * 86_400_000);
         let m = build_menu_state(
             "Coding Plan",
-            &[(five_h, None), (weekly, None)],
+            &[(&five_h, None), (&weekly, None)],
             None,
             false,
             0,
@@ -1332,7 +1320,7 @@ mod tests {
         let weekly = w("weekly", 90, now - 86_400_000, now + 5 * 86_400_000);
         let m = build_menu_state(
             "Coding Plan",
-            &[(five_h, None), (weekly, None)],
+            &[(&five_h, None), (&weekly, None)],
             Some("API error 1004"),
             true,
             3 * 60_000,

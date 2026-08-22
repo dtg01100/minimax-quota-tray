@@ -156,20 +156,20 @@ pub fn fmt_cost(cents_per_hour: f64, currency: Option<&str>) -> String {
 /// Map a `currency` config value to a display symbol. Recognizes common
 /// ISO-4217 codes (case-insensitive) and well-known symbols; anything
 /// else falls back to `$`.
-fn currency_symbol(currency: Option<&str>) -> String {
+fn currency_symbol(currency: Option<&str>) -> &'static str {
     match currency {
-        None => String::from("$"),
+        None => "$",
         Some(c) => match c.trim() {
-            "" => String::from("$"),
-            "usd" | "USD" => String::from("$"),
-            "eur" | "EUR" => String::from("€"),
-            "gbp" | "GBP" => String::from("£"),
-            "jpy" | "JPY" | "cny" | "CNY" | "rmb" | "RMB" => String::from("¥"),
-            "krw" | "KRW" => String::from("₩"),
-            "inr" | "INR" => String::from("₹"),
+            "" => "$",
+            "usd" | "USD" => "$",
+            "eur" | "EUR" => "€",
+            "gbp" | "GBP" => "£",
+            "jpy" | "JPY" | "cny" | "CNY" | "rmb" | "RMB" => "¥",
+            "krw" | "KRW" => "₩",
+            "inr" | "INR" => "₹",
             // Unrecognized value — fall back to `$` rather than echoing
             // a likely-typo back to the user.
-            _ => String::from("$"),
+            _ => "$",
         },
     }
 }

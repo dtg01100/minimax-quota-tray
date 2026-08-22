@@ -548,6 +548,7 @@ impl Tray {
     /// Update the dashboard URL at runtime (used when the user
     /// switches plans in the config and we want the menu's "Open
     /// dashboard" link to follow).
+    #[allow(dead_code)]
     pub async fn set_dashboard_url(&self, url: String) {
         *self.shared.dashboard_url.lock().await = url;
     }

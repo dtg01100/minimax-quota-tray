@@ -81,6 +81,12 @@ use serde::{Deserialize, Serialize};
 pub struct RingColors {
     pub inner: BucketColors,
     pub outer: String,
+    /// Cached FNV-1a hash of the four color strings. Computed once on
+    /// deserialization and reused across every poll (the colors never
+    /// change at runtime). Avoids rehashing ~40 bytes on each SVG path
+    /// construction.
+    #[serde(skip)]
+    pub(crate) cached_hash: u64,
 }
 
 /// Internal serde shuttle. Holds the wire shape and converts to the
@@ -123,10 +129,36 @@ impl From<RingColorsRepr> for RingColors {
             // Empty payload — defaults.
             default_inner_colors()
         };
+        let outer = r.outer.unwrap_or_else(|| DEFAULT_OUTER_COLOR.to_string());
+        let cached_hash = RingColorsRepr::hash(&inner, &outer);
         RingColors {
-            outer: r.outer.unwrap_or_else(|| DEFAULT_OUTER_COLOR.to_string()),
+            outer,
             inner,
+            cached_hash,
         }
+    }
+}
+
+impl RingColorsRepr {
+    /// Compute the stable FNV-1a hash of the four color strings. Used
+    /// both for the cached field on `RingColors` and for tests.
+    fn hash(inner: &BucketColors, outer: &str) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+        for chunk in [
+            inner.normal.as_bytes(),
+            b"|",
+            inner.warning.as_bytes(),
+            b"|",
+            inner.throttled.as_bytes(),
+            b"|",
+            outer.as_bytes(),
+        ] {
+            for &b in chunk {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+            }
+        }
+        h
     }
 }
 
@@ -166,9 +198,13 @@ impl Default for RingColors {
 /// Compile-time default ring colors. Used when config.json omits
 /// `ring_colors`. See `RingColors` for the inner/outer rationale.
 pub fn default_ring_colors() -> RingColors {
+    let inner = default_inner_colors();
+    let outer = DEFAULT_OUTER_COLOR.to_string();
+    let cached_hash = RingColorsRepr::hash(&inner, &outer);
     RingColors {
-        inner: default_inner_colors(),
-        outer: DEFAULT_OUTER_COLOR.to_string(),
+        inner,
+        outer,
+        cached_hash,
     }
 }
 

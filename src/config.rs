@@ -12,8 +12,7 @@ use std::path::PathBuf;
 
 use crate::burn::BurnConfig;
 use crate::provider::{
-    default_ring_colors, default_shape, AuthConfig, PlanShape, RingColors,
-    DEFAULT_USER_AGENT,
+    default_ring_colors, default_shape, AuthConfig, PlanShape, RingColors, DEFAULT_USER_AGENT,
 };
 
 /// Default config dir basename (no instance suffix). Neutral — no
@@ -125,7 +124,10 @@ impl Default for Config {
             refresh_seconds: 120,
             refresh_min_seconds: default_refresh_min_seconds(),
             refresh_max_backoff_seconds: 600,
-            thresholds: Thresholds { yellow: 60, red: 85 },
+            thresholds: Thresholds {
+                yellow: 60,
+                red: 85,
+            },
             burn_warning: BurnConfig::default(),
             pricing_endpoint: None,
             pricing_refresh_polls: None,
@@ -134,7 +136,9 @@ impl Default for Config {
 }
 
 /// Default for `refresh_min_seconds` — matches the gjs default.
-fn default_refresh_min_seconds() -> u64 { 15 }
+fn default_refresh_min_seconds() -> u64 {
+    15
+}
 
 /// Per-instance config path: `<config_dir>/<instance>/config.json`.
 /// If `instance` is empty, returns the original single-instance
@@ -162,7 +166,10 @@ pub fn load_for(instance: &str) -> Config {
         Ok(bytes) => match serde_json::from_slice::<Config>(&bytes) {
             Ok(c) => c,
             Err(e) => {
-                log::warn!("config at {} is malformed ({e}); using defaults", path.display());
+                log::warn!(
+                    "config at {} is malformed ({e}); using defaults",
+                    path.display()
+                );
                 Config::default()
             }
         },
@@ -225,29 +232,34 @@ mod tests {
     #[test]
     fn defaults_when_file_does_not_exist() {
         let _g = lock_home();
-        let tmp = std::env::temp_dir().join("minimax-cfg-empty");
+        let tmp = std::env::temp_dir().join("llm-quota-cfg-empty");
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("HOME", &tmp);
         let cfg = load();
         assert_eq!(cfg.refresh_seconds, 120);
-        assert_eq!(cfg.refresh_min_seconds, 15,
-                   "default refresh_min_seconds must be 15");
+        assert_eq!(
+            cfg.refresh_min_seconds, 15,
+            "default refresh_min_seconds must be 15"
+        );
         std::env::remove_var("HOME");
     }
 
     #[test]
     fn refresh_min_seconds_field_is_optional_in_json() {
         let _g = lock_home();
-        let tmp = std::env::temp_dir().join("minimax-cfg-no-min");
+        let tmp = std::env::temp_dir().join("llm-quota-cfg-no-min");
         let _ = std::fs::remove_dir_all(&tmp);
         let path = tmp.join("config.json");
-        write_at(&path, r#"{
+        write_at(
+            &path,
+            r#"{
             "endpoint": "https://example.invalid/coding",
             "dashboard_url": "https://example.invalid/dash",
             "label": "Coding Plan",
             "refresh_seconds": 120,
             "refresh_max_backoff_seconds": 600
-        }"#);
+        }"#,
+        );
         let bytes = std::fs::read(&path).unwrap();
         let cfg: Config = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(cfg.refresh_min_seconds, 15);
@@ -256,12 +268,15 @@ mod tests {
 
     #[test]
     fn per_instance_config_path() {
-        assert!(config_path_for("").to_string_lossy()
-                .contains(".config/llm-quota-tray/config.json"));
-        assert!(config_path_for("codex").to_string_lossy()
-                .contains(".config/llm-quota-tray-codex/config.json"));
-        assert!(config_path_for("openai").to_string_lossy()
-                .contains(".config/llm-quota-tray-openai/config.json"));
+        assert!(config_path_for("")
+            .to_string_lossy()
+            .contains(".config/llm-quota-tray/config.json"));
+        assert!(config_path_for("codex")
+            .to_string_lossy()
+            .contains(".config/llm-quota-tray-codex/config.json"));
+        assert!(config_path_for("openai")
+            .to_string_lossy()
+            .contains(".config/llm-quota-tray-openai/config.json"));
     }
 
     #[test]
@@ -286,8 +301,8 @@ mod tests {
             "refresh_max_backoff_seconds": 600
         }"##;
         let cfg: Config = serde_json::from_slice(json.as_bytes()).unwrap();
-        assert_eq!(cfg.ring_colors.inner.normal,   "#ff9900");
-        assert_eq!(cfg.ring_colors.inner.warning,  "#ff5500");
+        assert_eq!(cfg.ring_colors.inner.normal, "#ff9900");
+        assert_eq!(cfg.ring_colors.inner.warning, "#ff5500");
         assert_eq!(cfg.ring_colors.inner.throttled, "#ff0000");
         assert_eq!(cfg.ring_colors.outer, "#1d8b3a");
     }
@@ -335,11 +350,14 @@ mod tests {
             "refresh_max_backoff_seconds": 600
         }"##;
         let cfg: Config = serde_json::from_slice(json.as_bytes()).unwrap();
-        assert_eq!(cfg.ring_colors.inner.normal,   "#3a9d4d");
-        assert_eq!(cfg.ring_colors.inner.warning,  "#f6d32d");
+        assert_eq!(cfg.ring_colors.inner.normal, "#3a9d4d");
+        assert_eq!(cfg.ring_colors.inner.warning, "#f6d32d");
         assert_eq!(cfg.ring_colors.inner.throttled, "#e01b24");
-        assert_eq!(cfg.ring_colors.outer, crate::provider::DEFAULT_OUTER_COLOR,
-                   "legacy config with no outer field should fall back to the neutral accent");
+        assert_eq!(
+            cfg.ring_colors.outer,
+            crate::provider::DEFAULT_OUTER_COLOR,
+            "legacy config with no outer field should fall back to the neutral accent"
+        );
     }
 
     #[test]
@@ -358,10 +376,10 @@ mod tests {
         }"##;
         let cfg: Config = serde_json::from_slice(json.as_bytes()).unwrap();
         let defaults = crate::provider::default_ring_colors();
-        assert_eq!(cfg.ring_colors.inner.normal,    defaults.inner.normal);
-        assert_eq!(cfg.ring_colors.inner.warning,   defaults.inner.warning);
+        assert_eq!(cfg.ring_colors.inner.normal, defaults.inner.normal);
+        assert_eq!(cfg.ring_colors.inner.warning, defaults.inner.warning);
         assert_eq!(cfg.ring_colors.inner.throttled, defaults.inner.throttled);
-        assert_eq!(cfg.ring_colors.outer,           defaults.outer);
+        assert_eq!(cfg.ring_colors.outer, defaults.outer);
     }
 
     #[test]
@@ -424,7 +442,7 @@ mod tests {
     #[test]
     fn malformed_falls_back_to_defaults() {
         let _g = lock_home();
-        let tmp = std::env::temp_dir().join("minimax-cfg-malformed");
+        let tmp = std::env::temp_dir().join("llm-quota-cfg-malformed");
         let path = tmp.join("config.json");
         write_at(&path, "this is not json");
         std::env::set_var("HOME", &tmp);
@@ -437,7 +455,7 @@ mod tests {
     #[test]
     fn load_or_init_writes_defaults_when_missing() {
         let _g = lock_home();
-        let tmp = std::env::temp_dir().join("minimax-cfg-init");
+        let tmp = std::env::temp_dir().join("llm-quota-cfg-init");
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("HOME", &tmp);
         let cfg = load_or_init().unwrap();
@@ -452,14 +470,13 @@ mod tests {
     fn load_or_init_writes_default_config_with_0600() {
         use std::os::unix::fs::PermissionsExt;
         let _g = lock_home();
-        let tmp = std::env::temp_dir().join("minimax-cfg-0600");
+        let tmp = std::env::temp_dir().join("llm-quota-cfg-0600");
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("HOME", &tmp);
         let _ = load_or_init().unwrap();
         let path = config_path();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600,
-                   "default-written config must be 0600");
+        assert_eq!(mode, 0o600, "default-written config must be 0600");
         std::env::remove_var("HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -473,11 +490,13 @@ mod tests {
     /// `deny_unknown_fields`).
     #[test]
     fn provider_templates_deserialize() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("examples/providers");
-        assert!(dir.is_dir(),
-                "examples/providers/ should exist next to Cargo.toml \
-                 — got {}", dir.display());
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/providers");
+        assert!(
+            dir.is_dir(),
+            "examples/providers/ should exist next to Cargo.toml \
+                 — got {}",
+            dir.display()
+        );
 
         let mut found_any = false;
         let mut errors: Vec<String> = Vec::new();
@@ -495,11 +514,17 @@ mod tests {
             let name = path.file_name().unwrap().to_string_lossy().to_string();
             let bytes = match std::fs::read(&path) {
                 Ok(b) => b,
-                Err(e) => { errors.push(format!("{name}: read error: {e}")); continue; }
+                Err(e) => {
+                    errors.push(format!("{name}: read error: {e}"));
+                    continue;
+                }
             };
             let cfg: Config = match serde_json::from_slice(&bytes) {
                 Ok(c) => c,
-                Err(e) => { errors.push(format!("{name}: parse error: {e}")); continue; }
+                Err(e) => {
+                    errors.push(format!("{name}: parse error: {e}"));
+                    continue;
+                }
             };
 
             // Required fields a template is expected to populate.
@@ -519,8 +544,7 @@ mod tests {
                     errors.push(format!("{name}: window has empty id"));
                 }
                 if w.field_prefix.trim().is_empty() {
-                    errors.push(format!("{name}: window {} has empty field_prefix",
-                                        w.id));
+                    errors.push(format!("{name}: window {} has empty field_prefix", w.id));
                 }
             }
             // 0 means 'never poll' — almost certainly a typo.
@@ -529,11 +553,16 @@ mod tests {
             }
         }
 
-        assert!(found_any,
-                "no .json templates found under {}", dir.display());
+        assert!(
+            found_any,
+            "no .json templates found under {}",
+            dir.display()
+        );
         if !errors.is_empty() {
-            panic!("provider template validation failed:\n  - {}",
-                   errors.join("\n  - "));
+            panic!(
+                "provider template validation failed:\n  - {}",
+                errors.join("\n  - ")
+            );
         }
     }
 }

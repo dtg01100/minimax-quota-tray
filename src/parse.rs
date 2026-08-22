@@ -39,7 +39,8 @@ fn pct(v: &Value, key: &str) -> i64 {
 /// can traverse into nested objects/arrays because providers
 /// nest their model tags inconsistently.
 fn model_id_at(entry: &Value, path: &str) -> Option<String> {
-    entry.pointer(path)
+    entry
+        .pointer(path)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
@@ -70,7 +71,9 @@ fn parse_one_window(entry: &Value, w: &WindowShape, now_ms: i64) -> Window {
     // Read the model id from the entry if `pricing_model_path` is
     // configured. None when unset or when the field is missing
     // (defensive — never errors).
-    let model = w.pricing_model_path.as_deref()
+    let model = w
+        .pricing_model_path
+        .as_deref()
         .and_then(|p| model_id_at(entry, p));
     Window {
         id: w.id.clone(),
@@ -113,9 +116,10 @@ fn first_entry<'a>(payload: &'a Value, shape: &PlanShape) -> Option<&'a Value> {
 /// fields).
 pub fn parse_plan(payload: &Value, shape: &PlanShape, now_ms: i64) -> Result<Vec<Window>> {
     let entry = first_entry(payload, shape)
-        .ok_or_else(|| anyhow::anyhow!(
-            "payload missing entry at {}", shape.entries_path))?;
-    Ok(shape.windows.iter()
+        .ok_or_else(|| anyhow::anyhow!("payload missing entry at {}", shape.entries_path))?;
+    Ok(shape
+        .windows
+        .iter()
         .map(|w| parse_one_window(entry, w, now_ms))
         .collect())
 }
@@ -156,7 +160,8 @@ mod tests {
                 "message_path": "/base_resp/status_msg",
                 "success_codes": [0]
             }
-        })).expect("test fixture shape should deserialize")
+        }))
+        .expect("test fixture shape should deserialize")
     }
 
     /// Convenience: parse the standard fixture and destructure the
@@ -166,8 +171,11 @@ mod tests {
         let shape = minimax_shape();
         let mut windows = parse_plan(payload, &shape, now_ms)
             .expect("parse_plan(MiniMax shape) should succeed on the fixture");
-        assert_eq!(windows.len(), 2,
-                   "MiniMax shape should produce exactly 2 windows");
+        assert_eq!(
+            windows.len(),
+            2,
+            "MiniMax shape should produce exactly 2 windows"
+        );
         // Vec::remove swaps the tail in, so this is O(1) — but
         // for a 2-element test Vec it doesn't matter.
         let weekly = windows.pop().expect("len checked");
@@ -239,8 +247,8 @@ mod tests {
         // in ms, no conversion — the bug we just fixed).
         assert_eq!(five_h.reset_at - TEST_NOW_MS, 16_320_000); // 4.53h
         assert_eq!(weekly.reset_at - TEST_NOW_MS, 561_600_000); // 6.5d
-        // 5h window length is exactly 5h = 18_000_000 ms (since
-        // TEST_NOW_MS is picked to make this true).
+                                                                // 5h window length is exactly 5h = 18_000_000 ms (since
+                                                                // TEST_NOW_MS is picked to make this true).
         assert_eq!(five_h.reset_at - five_h.start_at, 18_000_000);
     }
 
@@ -313,7 +321,8 @@ mod tests {
                 "currency": "USD"
             }],
             "error_envelope": null
-        })).expect("shape with count_unit + currency should deserialize");
+        }))
+        .expect("shape with count_unit + currency should deserialize");
 
         // Now feed it a payload that looks like OpenRouter's auth/key
         // response after an adapter has scaled USD floats to cents.
@@ -360,7 +369,8 @@ mod tests {
                 "reset_is_absolute_epoch": false,
                 "pricing_model_path": "/model"
             }]
-        })).unwrap();
+        }))
+        .unwrap();
 
         let v = json!({
             "model": "openai/gpt-4o",
@@ -390,7 +400,8 @@ mod tests {
                 "reset_is_absolute_epoch": false,
                 "pricing_model_path": "/model"
             }]
-        })).unwrap();
+        }))
+        .unwrap();
         let v = json!({
             "data": [{
                 "model": "deepseek/deepseek-v4-flash",
@@ -421,7 +432,8 @@ mod tests {
                 "reset_is_absolute_epoch": false,
                 "pricing_model_path": "/model"
             }]
-        })).unwrap();
+        }))
+        .unwrap();
         let v = json!({
             // No `model` key
             "x_total_count": 0,
@@ -448,7 +460,8 @@ mod tests {
                 "reset_unit_ms": 1,
                 "reset_is_absolute_epoch": false
             }]
-        })).unwrap();
+        }))
+        .unwrap();
         let v = json!({
             "model_remains": [{
                 "current_interval_total_count": 1000,
@@ -523,7 +536,8 @@ mod tests {
                 "reset_unit_ms": 1,
                 "reset_is_absolute_epoch": false
             }]
-        })).unwrap();
+        }))
+        .unwrap();
         let v = json!({
             "daily_total_count": 1000,
             "daily_usage_count": 200,
@@ -552,7 +566,8 @@ mod tests {
                 { "id": "d1", "field_prefix": "d1",
                   "start_unit_ms": 1, "reset_unit_ms": 1, "reset_is_absolute_epoch": false }
             ]
-        })).unwrap();
+        }))
+        .unwrap();
         let v = json!({
             "m5_total_count": 0, "m5_usage_count": 0, "m5_remaining_percent": 80,
             "start_time": 0, "remains_time": 100,

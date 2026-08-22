@@ -30,7 +30,9 @@
 //! the percentage fill. See `RingColors` for the full inner/outer
 //! rationale.
 
-use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, StrokeDash, Transform};
+use tiny_skia::{
+    Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, StrokeDash, Transform,
+};
 
 use crate::provider::RingColors;
 
@@ -69,13 +71,12 @@ pub enum Bucket {
 /// Compute the bucket from remaining% + the window's `throttled` flag +
 /// optional burn-rate projection. Matches gjs `bucketForChip()`:
 ///
-///   - throttled: pct <= 0 OR `throttled` flag set (window exhausted)
-///   - warning:   used% >= yellow OR burn projects exhaustion before
-///                reset (gjs ORs the burn flip with the threshold checks
-///                — if the trend would empty the window before it
-///                resets, the chip flips to yellow even when remaining%
-///                looks healthy)
-///   - normal:    otherwise
+/// - throttled: pct <= 0 OR `throttled` flag set (window exhausted)
+/// - warning:   used% >= yellow OR burn projects exhaustion before
+///   reset (gjs ORs the burn flip with the threshold checks — if the
+///   trend would empty the window before it resets, the chip flips to
+///   yellow even when remaining% looks healthy)
+/// - normal:    otherwise
 ///
 /// Important: gjs does NOT switch to a red ring when remaining drops
 /// below the red threshold — it keeps the yellow ring until pct hits 0,
@@ -95,9 +96,13 @@ pub fn bucket_for(
     _red: i64,
     burn: Option<&crate::burn::BurnResult>,
 ) -> Bucket {
-    if throttled || remaining_pct <= 0 { return Bucket::Throttled; }
+    if throttled || remaining_pct <= 0 {
+        return Bucket::Throttled;
+    }
     let used = 100 - remaining_pct;
-    if used >= yellow { return Bucket::Warning; }
+    if used >= yellow {
+        return Bucket::Warning;
+    }
     // Burn-driven flip: a healthy-looking remaining% but a burn rate
     // that would exhaust the window before it resets → yellow. The
     // title text already carries `⚠ exhausts in Xm` historically
@@ -106,7 +111,7 @@ pub fn bucket_for(
     // carries the message),
     // so flipping the icon too matches gjs — chip color and chip text
     // both flip together when the burn rate signals trouble.
-    if burn.map_or(false, |b| b.exhaust_before_reset) {
+    if burn.is_some_and(|b| b.exhaust_before_reset) {
         return Bucket::Warning;
     }
     Bucket::Normal
@@ -119,8 +124,8 @@ pub fn bucket_for(
 /// Normal / Warning / Throttled.
 fn inner_color_for(b: Bucket, colors: &RingColors) -> String {
     match b {
-        Bucket::Normal    => colors.inner.normal.clone(),
-        Bucket::Warning   => colors.inner.warning.clone(),
+        Bucket::Normal => colors.inner.normal.clone(),
+        Bucket::Warning => colors.inner.warning.clone(),
         Bucket::Throttled => colors.inner.throttled.clone(),
     }
 }
@@ -210,15 +215,15 @@ pub fn ring_svg_path(pct: i64, colors: &RingColors) -> std::path::PathBuf {
     let dir = std::env::var("TMPDIR")
         .ok()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir());
-    dir.join(format!("minimax-quota-ring-{clamped}-{hash:016x}.svg"))
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join(format!("llm-quota-ring-{clamped}-{hash:016x}.svg"))
 }
 
 /// Path to a pre-written SVG for the given static-state icon name
 /// (`normal`, `warning`, `throttled`, `error`, `offline`). See
 /// `ring_svg_path()` for the full rationale on why we send SVG file
 /// paths as `IconName`. The static SVGs are written to
-/// `${TMPDIR}/minimax-quota-{name}-{hash}.svg` once at startup by
+/// `${TMPDIR}/llm-quota-{name}-{hash}.svg` once at startup by
 /// `write_static_svgs()`. The `{hash}` component is `colors_hash()`
 /// of the active `RingColors` so config edits invalidate the cache
 /// without manual intervention.
@@ -227,8 +232,8 @@ pub fn static_svg_path(name: &str, colors: &RingColors) -> std::path::PathBuf {
     let dir = std::env::var("TMPDIR")
         .ok()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir());
-    dir.join(format!("minimax-quota-{name}-{hash:016x}.svg"))
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join(format!("llm-quota-{name}-{hash:016x}.svg"))
 }
 
 /// SVG template for a static icon — a single filled `<circle r="9">`
@@ -249,17 +254,16 @@ fn svg_static(color: &str) -> String {
 /// Each static icon is a single `<circle r="9" fill="{color}">` — a
 /// solid dot. The set covers the five states the chip can be in:
 ///
-///   - `normal`:    inner dot color for the Normal bucket
-///                  (from `colors.inner.normal`)
-///   - `warning`:   inner dot color for the Warning bucket
-///                  (from `colors.inner.warning`)
-///   - `throttled`: inner dot color for the Throttled bucket
-///                  (from `colors.inner.throttled`; also matches
-///                  `quota-error` for visual consistency with the
-///                  legacy gjs chip)
-///   - `error`:     same as throttled — the tray uses one red for both
-///                  "exhausted" and "fetch failed"
-///   - `offline`:   gray (`OFFLINE_COLOR`)
+/// - `normal`:    inner dot color for the Normal bucket
+///   (from `colors.inner.normal`)
+/// - `warning`:   inner dot color for the Warning bucket
+///   (from `colors.inner.warning`)
+/// - `throttled`: inner dot color for the Throttled bucket
+///   (from `colors.inner.throttled`; also matches `quota-error` for
+///   visual consistency with the legacy gjs chip)
+/// - `error`:     same as throttled — the tray uses one red for both
+///   "exhausted" and "fetch failed"
+/// - `offline`:   gray (`OFFLINE_COLOR`)
 ///
 /// Static-state icons use the **inner** status color, not the outer
 /// ring color — they're rendered as solid dots when no percentage
@@ -270,21 +274,23 @@ pub fn write_static_svgs(colors: &RingColors) {
     let dir = std::env::var("TMPDIR")
         .ok()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir());
+        .unwrap_or_else(std::env::temp_dir);
     // The throttled color also serves as the error dot color; we
     // intentionally collapse these into a single visual state so
     // the user gets the same "I need attention" cue either way.
     let entries: [(&str, &str); 5] = [
-        ("normal",    &colors.inner.normal),
-        ("warning",   &colors.inner.warning),
+        ("normal", &colors.inner.normal),
+        ("warning", &colors.inner.warning),
         ("throttled", &colors.inner.throttled),
-        ("error",     &colors.inner.throttled),
-        ("offline",   OFFLINE_COLOR),
+        ("error", &colors.inner.throttled),
+        ("offline", OFFLINE_COLOR),
     ];
     let hash = colors_hash(colors);
     for (name, color) in entries {
-        let path = dir.join(format!("minimax-quota-{name}-{hash:016x}.svg"));
-        if path.exists() { continue; }
+        let path = dir.join(format!("llm-quota-{name}-{hash:016x}.svg"));
+        if path.exists() {
+            continue;
+        }
         if let Err(e) = std::fs::write(&path, svg_static(color)) {
             log::warn!("icon: failed to write static SVG {path:?}: {e}");
         }
@@ -304,10 +310,10 @@ pub fn write_static_svgs(colors: &RingColors) {
 /// 22×22.
 pub fn write_ring_svg(pct: i64, bucket: Bucket, colors: &RingColors) -> std::path::PathBuf {
     let path = ring_svg_path(pct, colors);
-    if path.exists() { return path; }
-    let svg = svg_for(pct,
-                      &inner_color_for(bucket, colors),
-                      outer_color(colors));
+    if path.exists() {
+        return path;
+    }
+    let svg = svg_for(pct, &inner_color_for(bucket, colors), outer_color(colors));
     if let Err(e) = std::fs::write(&path, svg) {
         log::warn!("icon: failed to write ring SVG to {path:?}: {e}");
     }
@@ -408,9 +414,11 @@ pub fn render_pixmap(pct: i64, bucket: Bucket, colors: &RingColors) -> Option<(u
         pb.finish()?
     };
 
-    let mut track_stroke = Stroke::default();
-    track_stroke.width = RING_STROKE;
-    track_stroke.line_cap = LineCap::Butt;
+    let track_stroke = Stroke {
+        width: RING_STROKE,
+        line_cap: LineCap::Butt,
+        ..Stroke::default()
+    };
 
     pixmap.stroke_path(
         &track_path,
@@ -441,13 +449,18 @@ pub fn render_pixmap(pct: i64, bucket: Bucket, colors: &RingColors) -> Option<(u
         pb.finish()?
     };
 
-    let mut arc_stroke = Stroke::default();
-    arc_stroke.width = RING_STROKE;
-    arc_stroke.line_cap = LineCap::Round;
-    // StrokeDash::new returns None when the array is empty or has an
-    // odd length — at this point both fg_arc and fg_rest are ≥0 and
-    // sum to a positive value, so .expect() is safe and never fires.
-    arc_stroke.dash = StrokeDash::new(vec![fg_arc, fg_rest], 0.0);
+    let arc_stroke = Stroke {
+        width: RING_STROKE,
+        line_cap: LineCap::Round,
+        // StrokeDash::new returns None when the array is empty or has
+        // an odd length. At this point both fg_arc and fg_rest are ≥0
+        // and sum to the circumference (>0), so we always get Some(_)
+        // back — but the field is `Option<StrokeDash>`, so we keep the
+        // Option and let tiny-skia ignore `None` (drawn as a
+        // continuous stroke, equivalent to no dasharray).
+        dash: StrokeDash::new(vec![fg_arc, fg_rest], 0.0),
+        ..Stroke::default()
+    };
 
     // SVG's `transform="rotate(-90 11 11)"` rotates the path around
     // the icon center so the dasharray starts at 12 o'clock. tiny-skia's
@@ -455,13 +468,7 @@ pub fn render_pixmap(pct: i64, bucket: Bucket, colors: &RingColors) -> Option<(u
     // point" semantics.
     let arc_xform = Transform::from_rotate_at(-90.0, 11.0, 11.0);
 
-    pixmap.stroke_path(
-        &arc_path,
-        &arc_paint,
-        &arc_stroke,
-        arc_xform,
-        None,
-    );
+    pixmap.stroke_path(&arc_path, &arc_paint, &arc_stroke, arc_xform, None);
 
     // 3. Inner dot: filled circle in the INNER (bucket-status)
     //    color. Tiny-skia ignores stroke vs fill via fill_path; we
@@ -493,7 +500,9 @@ pub fn render_pixmap(pct: i64, bucket: Bucket, colors: &RingColors) -> Option<(u
 /// constants so the None branch is unreachable.
 fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
     let bytes = s.as_bytes();
-    if bytes.len() != 7 || bytes[0] != b'#' { return None; }
+    if bytes.len() != 7 || bytes[0] != b'#' {
+        return None;
+    }
     let r = u8::from_str_radix(std::str::from_utf8(&bytes[1..3]).ok()?, 16).ok()?;
     let g = u8::from_str_radix(std::str::from_utf8(&bytes[3..5]).ok()?, 16).ok()?;
     let b = u8::from_str_radix(std::str::from_utf8(&bytes[5..7]).ok()?, 16).ok()?;
@@ -529,8 +538,9 @@ fn track_alpha() -> u8 {
 /// premultiplied, as it does).
 fn pixmap_to_bgra(pixmap: &Pixmap) -> Vec<u8> {
     let data = pixmap.data();
+    let (chunks, _tail) = data.as_chunks::<4>();
     let mut out = Vec::with_capacity(data.len());
-    for px in data.chunks_exact(4) {
+    for px in chunks {
         // px is [R, G, B, A] premultiplied. Swap to host-endian uint32
         // order: [B, G, R, A] on little-endian (x86, aarch64).
         out.push(px[2]); // B
@@ -547,7 +557,7 @@ fn pixmap_to_bgra(pixmap: &Pixmap) -> Vec<u8> {
 /// retained for future use if we add an in-memory pixmap cache.
 #[allow(dead_code)]
 pub fn cache_step(pct: i64) -> i64 {
-    (pct.max(0).min(100) as i64) / 2 * 2  // round to nearest 2%
+    pct.clamp(0, 100) / 2 * 2 // round to nearest 2%
 }
 
 #[cfg(test)]
@@ -591,33 +601,48 @@ mod tests {
             exhaust_before_reset: false,
             projected_pct_left: 90.0,
         };
-        assert_eq!(bucket_for(90, false, 60, 85, Some(&healthy)),
-                   Bucket::Normal);
+        assert_eq!(
+            bucket_for(90, false, 60, 85, Some(&healthy)),
+            Bucket::Normal
+        );
         // Same healthy remaining% but the burn projects exhaustion
         // before reset → flips to Warning (yellow ring), matching gjs
         // bucketForChip's `(burn && burn.exhaustBeforeReset)` clause.
-        let alarming = BurnResult { exhaust_before_reset: true, ..healthy };
-        assert_eq!(bucket_for(90, false, 60, 85, Some(&alarming)),
-                   Bucket::Warning);
+        let alarming = BurnResult {
+            exhaust_before_reset: true,
+            ..healthy
+        };
+        assert_eq!(
+            bucket_for(90, false, 60, 85, Some(&alarming)),
+            Bucket::Warning
+        );
         // Burn flip is OR'd with the threshold check — a burn flip on
         // an already-low remaining% still lands at Warning (idempotent).
-        assert_eq!(bucket_for(20, false, 60, 85, Some(&alarming)),
-                   Bucket::Warning);
+        assert_eq!(
+            bucket_for(20, false, 60, 85, Some(&alarming)),
+            Bucket::Warning
+        );
         // Burn flip can't override Throttled — pct <= 0 still wins.
-        assert_eq!(bucket_for(0, false, 60, 85, Some(&alarming)),
-                   Bucket::Throttled);
+        assert_eq!(
+            bucket_for(0, false, 60, 85, Some(&alarming)),
+            Bucket::Throttled
+        );
     }
 
     #[test]
     fn svg_contains_ring_elements() {
         let s = svg_for(80, "#3a9d4d", "#3584e4");
         assert!(s.contains("<svg"));
-        assert!(s.contains("stroke=\"#3584e4\""),
-                "outer ring should use the outer color; got: {s}");
+        assert!(
+            s.contains("stroke=\"#3584e4\""),
+            "outer ring should use the outer color; got: {s}"
+        );
         // 80% of 2π·9 ≈ 45.239, minus halfStroke (1.25) ≈ 43.989.
         // Dasharray correction matches the gjs `arc - halfStroke` rule.
-        assert!(s.contains("43.989") || s.contains("43.990"),
-                "expected corrected dasharray ~43.99; got: {s}");
+        assert!(
+            s.contains("43.989") || s.contains("43.990"),
+            "expected corrected dasharray ~43.99; got: {s}"
+        );
     }
 
     #[test]
@@ -628,10 +653,14 @@ mod tests {
         // the inner/outer split, the inner dot uses the bucket's
         // status color (separate from the outer ring).
         let s = svg_for(80, "#3a9d4d", "#3584e4");
-        assert!(s.contains("r=\"3.5\""),
-                "inner dot circle missing (r=3.5); got: {s}");
-        assert!(s.contains("fill=\"#3a9d4d\""),
-                "inner dot fill should match inner color (bucket); got: {s}");
+        assert!(
+            s.contains("r=\"3.5\""),
+            "inner dot circle missing (r=3.5); got: {s}"
+        );
+        assert!(
+            s.contains("fill=\"#3a9d4d\""),
+            "inner dot fill should match inner color (bucket); got: {s}"
+        );
     }
 
     #[test]
@@ -640,10 +669,14 @@ mod tests {
         // SVG verbatim — the inner dot uses the inner color, the
         // outer ring strokes use the outer color.
         let s = svg_for(80, "#ff0000", "#00ff00");
-        assert!(s.contains("stroke=\"#00ff00\""),
-                "outer ring stroke should use outer color #00ff00; got: {s}");
-        assert!(s.contains("fill=\"#ff0000\""),
-                "inner dot fill should use inner color #ff0000; got: {s}");
+        assert!(
+            s.contains("stroke=\"#00ff00\""),
+            "outer ring stroke should use outer color #00ff00; got: {s}"
+        );
+        assert!(
+            s.contains("fill=\"#ff0000\""),
+            "inner dot fill should use inner color #ff0000; got: {s}"
+        );
     }
 
     #[test]
@@ -652,8 +685,10 @@ mod tests {
         // rounded dot instead of a flat dasharray cut. The track (full
         // circle) doesn't need them — only the foreground arc.
         let s = svg_for(80, "#3a9d4d", "#3584e4");
-        assert!(s.contains("stroke-linecap=\"round\""),
-                "progress arc should use stroke-linecap=round; got: {s}");
+        assert!(
+            s.contains("stroke-linecap=\"round\""),
+            "progress arc should use stroke-linecap=round; got: {s}"
+        );
     }
 
     #[test]
@@ -664,10 +699,14 @@ mod tests {
         // used a separate dark grey (#3a3a3a) which fights the panel
         // theme on light backgrounds.
         let s = svg_for(80, "#3a9d4d", "#3584e4");
-        assert!(s.contains("stroke-opacity=\"0.25\""),
-                "track should use stroke-opacity=0.25; got: {s}");
-        assert!(!s.contains("#3a3a3a"),
-                "track should NOT use the legacy dark grey color; got: {s}");
+        assert!(
+            s.contains("stroke-opacity=\"0.25\""),
+            "track should use stroke-opacity=0.25; got: {s}"
+        );
+        assert!(
+            !s.contains("#3a3a3a"),
+            "track should NOT use the legacy dark grey color; got: {s}"
+        );
     }
 
     #[test]
@@ -675,8 +714,10 @@ mod tests {
         // gjs uses stroke-width="2.5". The earlier Rust version used 3.0
         // which made the ring look chunkier than the gjs original.
         let s = svg_for(80, "#3a9d4d", "#3584e4");
-        assert!(s.contains("stroke-width=\"2.5\""),
-                "ring stroke-width should be 2.5 (matches gjs); got: {s}");
+        assert!(
+            s.contains("stroke-width=\"2.5\""),
+            "ring stroke-width should be 2.5 (matches gjs); got: {s}"
+        );
     }
 
     #[test]
@@ -687,8 +728,8 @@ mod tests {
         // provider::default_ring_colors are the source of truth; this
         // test guards against accidental edits.
         let colors = crate::provider::default_ring_colors();
-        assert_eq!(inner_color_for(Bucket::Normal,    &colors), "#3a9d4d");
-        assert_eq!(inner_color_for(Bucket::Warning,   &colors), "#f6d32d");
+        assert_eq!(inner_color_for(Bucket::Normal, &colors), "#3a9d4d");
+        assert_eq!(inner_color_for(Bucket::Warning, &colors), "#f6d32d");
         assert_eq!(inner_color_for(Bucket::Throttled, &colors), "#e01b24");
         assert_eq!(outer_color(&colors), "#3584e4");
     }
@@ -701,14 +742,14 @@ mod tests {
         // independently.
         let alt = RingColors {
             inner: BucketColors {
-                normal:   "#3366ff".to_string(),
-                warning:  "#ff9900".to_string(),
+                normal: "#3366ff".to_string(),
+                warning: "#ff9900".to_string(),
                 throttled: "#9933ff".to_string(),
             },
             outer: "#1d8b3a".to_string(),
         };
-        assert_eq!(inner_color_for(Bucket::Normal,    &alt), "#3366ff");
-        assert_eq!(inner_color_for(Bucket::Warning,   &alt), "#ff9900");
+        assert_eq!(inner_color_for(Bucket::Normal, &alt), "#3366ff");
+        assert_eq!(inner_color_for(Bucket::Warning, &alt), "#ff9900");
         assert_eq!(inner_color_for(Bucket::Throttled, &alt), "#9933ff");
         assert_eq!(outer_color(&alt), "#1d8b3a");
     }
@@ -722,8 +763,10 @@ mod tests {
         let s = svg_for(0, "#3a9d4d", "#3584e4");
         // fg_arc = max(0, 0 - 1.25) = 0; fg_rest = circ - 0 = circ.
         // dasharray should contain 0.000 and ~56.5 (the circumference).
-        assert!(s.contains("0.000"),
-                "expected zero-length dasharray at pct=0; got: {s}");
+        assert!(
+            s.contains("0.000"),
+            "expected zero-length dasharray at pct=0; got: {s}"
+        );
     }
 
     #[test]
@@ -752,11 +795,13 @@ mod tests {
         // On host-endian (x86 = BGRA bytes per pixel), the alpha channel
         // is the LAST byte of each 4-byte group. Cogl/GTK interprets these
         // bytes as a host uint32.
-        let (_w, _h, bytes) = render_pixmap(50, Bucket::Normal,
-                                            &crate::provider::default_ring_colors()).unwrap();
-        let any_visible = bytes.chunks_exact(4)
-            .any(|px| px[3] > 0);
-        assert!(any_visible, "rendered pixmap should have visible pixels (alpha > 0)");
+        let (_w, _h, bytes) =
+            render_pixmap(50, Bucket::Normal, &crate::provider::default_ring_colors()).unwrap();
+        let any_visible = bytes.as_chunks::<4>().0.iter().any(|px| px[3] > 0);
+        assert!(
+            any_visible,
+            "rendered pixmap should have visible pixels (alpha > 0)"
+        );
     }
 
     #[test]
@@ -766,13 +811,22 @@ mod tests {
         // pixel should be the outer color verbatim in BGRA host-endian
         // order: #3584e4 = (R=53, G=132, B=228) → B=0xe4, G=0x84,
         // R=0x35, A=0xff.
-        let (_w, _h, bytes) = render_pixmap(100, Bucket::Warning,
-                                            &crate::provider::default_ring_colors()).unwrap();
-        let any_ring_pixel = bytes.chunks_exact(4)
+        let (_w, _h, bytes) = render_pixmap(
+            100,
+            Bucket::Warning,
+            &crate::provider::default_ring_colors(),
+        )
+        .unwrap();
+        let any_ring_pixel = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|px| px[0] == 0xe4 && px[1] == 0x84 && px[2] == 0x35 && px[3] == 0xff);
-        assert!(any_ring_pixel,
-                "expected outer-color pixel (0xe4, 0x84, 0x35, 0xff) in the 100% fill ring; \
-                 ring should be drawn in the outer color regardless of bucket");
+        assert!(
+            any_ring_pixel,
+            "expected outer-color pixel (0xe4, 0x84, 0x35, 0xff) in the 100% fill ring; \
+                 ring should be drawn in the outer color regardless of bucket"
+        );
     }
 
     #[test]
@@ -781,12 +835,21 @@ mod tests {
         // color. With bucket=Warning and the default palette, the dot
         // is #f6d32d = (R=246, G=211, B=45) → B=0x2d, G=0xd3, R=0xf6,
         // A=0xff.
-        let (_w, _h, bytes) = render_pixmap(100, Bucket::Warning,
-                                            &crate::provider::default_ring_colors()).unwrap();
-        let any_dot_pixel = bytes.chunks_exact(4)
+        let (_w, _h, bytes) = render_pixmap(
+            100,
+            Bucket::Warning,
+            &crate::provider::default_ring_colors(),
+        )
+        .unwrap();
+        let any_dot_pixel = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|px| px[0] == 0x2d && px[1] == 0xd3 && px[2] == 0xf6 && px[3] == 0xff);
-        assert!(any_dot_pixel,
-                "expected inner-color pixel (0x2d, 0xd3, 0xf6, 0xff) for the Warning bucket dot");
+        assert!(
+            any_dot_pixel,
+            "expected inner-color pixel (0x2d, 0xd3, 0xf6, 0xff) for the Warning bucket dot"
+        );
     }
 
     #[test]
@@ -818,29 +881,33 @@ mod tests {
     // staring at a "three dots" placeholder.
     // ------------------------------------------------------------------
 
-    fn default_colors() -> RingColors { crate::provider::default_ring_colors() }
+    fn default_colors() -> RingColors {
+        crate::provider::default_ring_colors()
+    }
 
     #[test]
     fn ring_svg_path_uses_svg_extension() {
         let p = ring_svg_path(80, &default_colors());
         // The filename ends with `.svg`; the pct segment and 16-hex
         // color hash are between the prefix and the extension.
-        assert!(p.to_str().unwrap().ends_with(".svg"),
-                "expected .svg extension; got {p:?}");
+        assert!(
+            p.to_str().unwrap().ends_with(".svg"),
+            "expected .svg extension; got {p:?}"
+        );
     }
 
     #[test]
     fn ring_svg_path_clamps_out_of_range_pct() {
         // Same clamping rule as the old PNG path — out-of-range pct
         // gets pinned to 0 or 100 in the filename so a hostile or
-        // buggy refresh can't write `minimax-quota-ring--5.svg`.
+        // buggy refresh can't write `llm-quota-ring--5.svg`.
         // Filenames now include a color hash, so we check for the
         // substring `-{pct}-` (hash separator on both sides) rather
         // than the trailing position.
         let c = default_colors();
-        assert!(ring_svg_path(0,   &c).to_str().unwrap().contains("-0-"));
+        assert!(ring_svg_path(0, &c).to_str().unwrap().contains("-0-"));
         assert!(ring_svg_path(100, &c).to_str().unwrap().contains("-100-"));
-        assert!(ring_svg_path(-5,  &c).to_str().unwrap().contains("-0-"));
+        assert!(ring_svg_path(-5, &c).to_str().unwrap().contains("-0-"));
         assert!(ring_svg_path(150, &c).to_str().unwrap().contains("-100-"));
     }
 
@@ -853,8 +920,10 @@ mod tests {
             // prefix and color hash). Checking the substring is
             // robust to hash-format changes.
             let needle = format!("-{name}-");
-            assert!(p.to_str().unwrap().contains(&needle),
-                    "expected `{needle}` segment; got {p:?}");
+            assert!(
+                p.to_str().unwrap().contains(&needle),
+                "expected `{needle}` segment; got {p:?}"
+            );
         }
     }
 
@@ -868,29 +937,33 @@ mod tests {
     fn color_change_produces_different_path() {
         let c1 = RingColors {
             inner: BucketColors {
-                normal:   "#3a9d4d".into(),
-                warning:  "#f6d32d".into(),
+                normal: "#3a9d4d".into(),
+                warning: "#f6d32d".into(),
                 throttled: "#e01b24".into(),
             },
             outer: "#3584e4".into(),
         };
         let c2 = RingColors {
             inner: c1.inner.clone(),
-            outer: "#0c8599".into(),  // only difference
+            outer: "#0c8599".into(), // only difference
         };
 
         let p1 = ring_svg_path(51, &c1);
         let p2 = ring_svg_path(51, &c2);
-        assert_ne!(p1, p2,
-                   "changing outer color must produce a fresh path; \
-                    got {p1:?} == {p2:?}");
+        assert_ne!(
+            p1, p2,
+            "changing outer color must produce a fresh path; \
+                    got {p1:?} == {p2:?}"
+        );
 
         // Same principle for static paths.
         let s1 = static_svg_path("normal", &c1);
         let s2 = static_svg_path("normal", &c2);
-        assert_ne!(s1, s2,
-                   "changing outer color must produce a fresh static path; \
-                    got {s1:?} == {s2:?}");
+        assert_ne!(
+            s1, s2,
+            "changing outer color must produce a fresh static path; \
+                    got {s1:?} == {s2:?}"
+        );
     }
 
     /// Same colors → same path (cache hit works as before).
@@ -899,9 +972,11 @@ mod tests {
         let c = default_colors();
         let p1 = ring_svg_path(42, &c);
         let p2 = ring_svg_path(42, &c);
-        assert_eq!(p1, p2,
-                   "same colors + same pct must produce the same path \
-                    (cache-keyed; otherwise we'd churn writes every poll)");
+        assert_eq!(
+            p1, p2,
+            "same colors + same pct must produce the same path \
+                    (cache-keyed; otherwise we'd churn writes every poll)"
+        );
     }
 
     /// The hash must be stable across runs — `DefaultHasher` is
@@ -944,10 +1019,14 @@ mod tests {
         // dots, not ring layers. If a future refactor adds the ring
         // layers here by accident, the static path would no longer be
         // a single filled circle and this test catches it.
-        assert!(!s.contains("stroke="),
-                "static SVG should have no stroke; got: {s}");
-        assert!(!s.contains("stroke-dasharray"),
-                "static SVG should have no dasharray; got: {s}");
+        assert!(
+            !s.contains("stroke="),
+            "static SVG should have no stroke; got: {s}"
+        );
+        assert!(
+            !s.contains("stroke-dasharray"),
+            "static SVG should have no dasharray; got: {s}"
+        );
     }
 
     #[test]
@@ -975,7 +1054,7 @@ mod tests {
         static TMPDIR_LOCK: Mutex<()> = Mutex::new(());
         let _g = TMPDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        let tmp = std::env::temp_dir().join("minimax-icon-static-test");
+        let tmp = std::env::temp_dir().join("llm-quota-icon-static-test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -984,7 +1063,9 @@ mod tests {
         // single-threaded with respect to other tests that mutate
         // TMPDIR. cargo test runs each test in its own thread, but
         // the lock ensures no two tests that read `TMPDIR` overlap.
-        unsafe { std::env::set_var("TMPDIR", &tmp); }
+        unsafe {
+            std::env::set_var("TMPDIR", &tmp);
+        }
 
         write_static_svgs(&crate::provider::default_ring_colors());
 
@@ -998,23 +1079,33 @@ mod tests {
         let colors = crate::provider::default_ring_colors();
         for name in ["normal", "warning", "throttled", "error", "offline"] {
             let path = tmp.join(static_svg_path(name, &colors).file_name().unwrap());
-            assert!(path.starts_with(&tmp),
-                    "{path:?} should be under TMPDIR={tmp:?}");
+            assert!(
+                path.starts_with(&tmp),
+                "{path:?} should be under TMPDIR={tmp:?}"
+            );
             let body = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("missing/wrong-type {path:?}: {e}"));
-            assert!(body.starts_with("<svg"),
-                    "{path:?} should start with <svg; got {body:?}");
-            assert!(body.contains("circle"),
-                    "{path:?} should contain <circle>; got {body:?}");
+            assert!(
+                body.starts_with("<svg"),
+                "{path:?} should start with <svg; got {body:?}"
+            );
+            assert!(
+                body.contains("circle"),
+                "{path:?} should contain <circle>; got {body:?}"
+            );
         }
 
         // Restore TMPDIR so the rest of the suite isn't affected.
         if let Some(v) = prev {
             // SAFETY: see above.
-            unsafe { std::env::set_var("TMPDIR", v); }
+            unsafe {
+                std::env::set_var("TMPDIR", v);
+            }
         } else {
             // SAFETY: see above.
-            unsafe { std::env::remove_var("TMPDIR"); }
+            unsafe {
+                std::env::remove_var("TMPDIR");
+            }
         }
 
         // Idempotent — second call doesn't re-write or fail. (No
@@ -1035,22 +1126,23 @@ mod dump_tests {
     #[test]
     #[ignore = "dump helper, run with `cargo test --release dump_icons -- --ignored`"]
     fn dump_icons_for_visual_inspection() {
-        for (pct, bucket) in [(100, Bucket::Normal),
-                              (80,  Bucket::Normal),
-                              (50,  Bucket::Normal),
-                              (80,  Bucket::Warning),
-                              // Boundary: pct=14 used to be Throttled (red ring);
-                              // now Warning (yellow ring) — the gjs faithful fix.
-                              (14,  Bucket::Warning),
-                              // Exhausted: pct=0 → Throttled bucket, but render_pixmap
-                              // is intentionally not called in main.rs (skipped to fall
-                              // through to the static quota-throttled SVG). This dumps
-                              // the pixmap anyway for comparison reference.
-                              (0,   Bucket::Throttled)] {
-            let (_w, _h, bytes) = render_pixmap(pct, bucket,
-                &crate::provider::default_ring_colors()).unwrap();
-            std::fs::write(
-                format!("/tmp/icon_{}_{:?}.argb", pct, bucket), &bytes).unwrap();
+        for (pct, bucket) in [
+            (100, Bucket::Normal),
+            (80, Bucket::Normal),
+            (50, Bucket::Normal),
+            (80, Bucket::Warning),
+            // Boundary: pct=14 used to be Throttled (red ring);
+            // now Warning (yellow ring) — the gjs faithful fix.
+            (14, Bucket::Warning),
+            // Exhausted: pct=0 → Throttled bucket, but render_pixmap
+            // is intentionally not called in main.rs (skipped to fall
+            // through to the static quota-throttled SVG). This dumps
+            // the pixmap anyway for comparison reference.
+            (0, Bucket::Throttled),
+        ] {
+            let (_w, _h, bytes) =
+                render_pixmap(pct, bucket, &crate::provider::default_ring_colors()).unwrap();
+            std::fs::write(format!("/tmp/icon_{}_{:?}.argb", pct, bucket), &bytes).unwrap();
         }
         assert!(Path::new("/tmp/icon_100_Normal.argb").exists());
     }

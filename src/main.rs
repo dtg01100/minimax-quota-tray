@@ -73,9 +73,13 @@ enum BucketRank {
 
 impl BucketRank {
     fn from_remaining(remaining_pct: i64) -> Self {
-        if remaining_pct <= 0 { BucketRank::Throttled }
-        else if remaining_pct < 50 { BucketRank::Warning }
-        else { BucketRank::Normal }
+        if remaining_pct <= 0 {
+            BucketRank::Throttled
+        } else if remaining_pct < 50 {
+            BucketRank::Warning
+        } else {
+            BucketRank::Normal
+        }
     }
 }
 
@@ -124,8 +128,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Resolve the instance name from CLI/env first, so all the
     // path-sensitive subsystems (lock, config, keyring) namespace
@@ -133,11 +136,47 @@ async fn main() -> anyhow::Result<()> {
     let instance_name = instance::init();
     log::info!("instance: {instance_name:?} (empty = default)");
 
+    // `--set-key` is a one-shot helper: prompt for the API key,
+    // write it to the keyring via `keyring::set`, then exit. We do
+    // this BEFORE `run()` so we never acquire the single-instance
+    // lock or spawn the SNI server — the daemon isn't actually
+    // starting up. The README and several example-provider templates
+    // document this flag; without it users following those docs would
+    // see the tray boot, render "No API key configured", and have to
+    // click the chip → "Set API Key…" manually.
+    if instance::wants_set_key() {
+        return run_set_key().await;
+    }
+
     if let Err(e) = run().await {
         eprintln!("fatal: {e:#}");
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// One-shot `--set-key` flow: prompt for the key, write it to the
+/// keyring via `keyring::set`, print a short status line, and exit.
+/// See the comment in `main()` for why this short-circuits `run()`.
+async fn run_set_key() -> anyhow::Result<()> {
+    match set_api_key_interactive().await {
+        Ok(Some(_)) => {
+            println!(
+                "API key stored. Launch the tray normally to start polling \
+                 (e.g. `llm-quota-tray` or `llm-quota-tray --instance={}`).",
+                instance::name(),
+            );
+            Ok(())
+        }
+        Ok(None) => {
+            eprintln!("cancelled.");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("set-key failed: {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn run() -> Result<()> {
@@ -151,12 +190,13 @@ async fn run() -> Result<()> {
         Ok(Some(l)) => Some(l),
         Ok(None) => {
             eprintln!(
-                "minimax-quota: another instance is already running; exiting. \
-                 (set --instance=<name> for an additional instance.)");
+                "llm-quota-tray: another instance is already running; exiting. \
+                 (set --instance=<name> for an additional instance.)"
+            );
             return Ok(());
         }
         Err(e) => {
-            eprintln!("minimax-quota: cannot acquire lock: {e:#}");
+            eprintln!("llm-quota-tray: cannot acquire lock: {e:#}");
             None
         }
     };
@@ -170,8 +210,7 @@ async fn run() -> Result<()> {
         cfg.ring_colors.outer,
     );
 
-    let http_client = fetch::build_client(&cfg.user_agent)
-        .context("build HTTP client")?;
+    let http_client = fetch::build_client(&cfg.user_agent).context("build HTTP client")?;
 
     // Startup pricing fetch (best-effort). When the config sets
     // `pricing_endpoint`, we hit it once before the refresh loop
@@ -186,7 +225,9 @@ async fn run() -> Result<()> {
                 let client = http_client.clone();
                 let url = url.to_string();
                 move || pricing::fetch_pricing_blocking(&client, &url)
-            }).await {
+            })
+            .await
+            {
                 Ok(Ok(table)) => {
                     log::info!("loaded {} model prices", table.len());
                     Some(table)
@@ -196,7 +237,9 @@ async fn run() -> Result<()> {
                     None
                 }
                 Err(e) => {
-                    log::warn!("pricing fetch task panicked: {e} -- continuing without cost fragments");
+                    log::warn!(
+                        "pricing fetch task panicked: {e} -- continuing without cost fragments"
+                    );
                     None
                 }
             }
@@ -211,7 +254,10 @@ async fn run() -> Result<()> {
         ..Default::default()
     }));
     let tray = Arc::new(
-        Tray::new(cfg.dashboard_url.clone()).await.context("create SNI tray")?);
+        Tray::new(cfg.dashboard_url.clone())
+            .await
+            .context("create SNI tray")?,
+    );
 
     // Write the static SVG icons into ${TMPDIR} once at startup so the
     // SNI host can load them as `IconName` file paths. Hosts with
@@ -228,7 +274,9 @@ async fn run() -> Result<()> {
     let cmd_rx = tray.cmd_rx.clone();
     // Channel for network events (Connectivity, ForceRefresh).
     let (net_tx, net_rx) = mpsc::channel::<NetEvent>(8);
-    network::spawn_watcher(net_tx).await.context("start network monitor")?;
+    network::spawn_watcher(net_tx)
+        .await
+        .context("start network monitor")?;
     // Shutdown signal — orchestrator's Quit branch sends, main()
     // selects on this alongside SIGINT/SIGTERM so a menu-driven
     // quit cleanly tears down (the orchestrator task ends, then
@@ -236,11 +284,17 @@ async fn run() -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
     // Spawn the orchestrator: refresh loop + menu commands + network.
-    tokio::spawn(orchestrator(cfg, state, tray.clone(), cmd_rx, net_rx, shutdown_tx));
+    tokio::spawn(orchestrator(
+        cfg,
+        state,
+        tray.clone(),
+        cmd_rx,
+        net_rx,
+        shutdown_tx,
+    ));
 
     // Wait for SIGINT/SIGTERM or a menu Quit.
-    let mut sigterm = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => log::info!("ctrl-c, exiting"),
         _ = sigterm.recv() => log::info!("SIGTERM, exiting"),
@@ -394,11 +448,7 @@ async fn orchestrator(
 /// One refresh cycle: fetch → record samples → compute burn → render.
 /// Returns the next interval in ms (including backoff). Caller uses
 /// it to re-arm the timer.
-async fn do_refresh(
-    cfg: &Config,
-    state: &Arc<Mutex<AppState>>,
-    tray: &Arc<Tray>,
-) -> u64 {
+async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>) -> u64 {
     // Check offline state first.
     {
         let s = state.lock().await;
@@ -454,7 +504,9 @@ async fn do_refresh(
             // rolling short-interval window, the one most likely to
             // need urgent attention).
             let primary = windows[0].clone();
-            let prev_rank = s.last_good.as_ref()
+            let prev_rank = s
+                .last_good
+                .as_ref()
                 .and_then(|w| w.first())
                 .map(|w| BucketRank::from_remaining(w.remaining_pct))
                 .unwrap_or(BucketRank::NoData);
@@ -471,32 +523,32 @@ async fn do_refresh(
             // backoff or alerting. Cheap because the endpoint is
             // usually unauthenticated (OpenRouter's /api/v1/models
             // returns the full table on every call).
-            if let (Some(url), Some(interval)) = (
-                cfg.pricing_endpoint.as_deref(),
-                cfg.pricing_refresh_polls,
-            ) {
+            if let (Some(url), Some(interval)) =
+                (cfg.pricing_endpoint.as_deref(), cfg.pricing_refresh_polls)
+            {
                 s.polls_since_pricing_refresh += 1;
                 if s.polls_since_pricing_refresh >= interval.max(1) {
                     s.polls_since_pricing_refresh = 0;
                     if let Some(client) = s.http_client.clone() {
                         let url = url.to_string();
-                        let new_table = tokio::task::spawn_blocking(
-                            move || pricing::fetch_pricing_blocking(&client, &url)
-                        ).await;
+                        let new_table = tokio::task::spawn_blocking(move || {
+                            pricing::fetch_pricing_blocking(&client, &url)
+                        })
+                        .await;
                         match new_table {
                             Ok(Ok(table)) => {
-                                log::debug!(
-                                    "pricing refresh: {} models",
-                                    table.len());
+                                log::debug!("pricing refresh: {} models", table.len());
                                 s.price_table = Some(table);
                             }
                             Ok(Err(e)) => {
                                 log::warn!(
-                                    "pricing refresh failed: {e:#} -- keeping previous table");
+                                    "pricing refresh failed: {e:#} -- keeping previous table"
+                                );
                             }
                             Err(e) => {
                                 log::warn!(
-                                    "pricing refresh task panicked: {e} -- keeping previous table");
+                                    "pricing refresh task panicked: {e} -- keeping previous table"
+                                );
                             }
                         }
                     }
@@ -506,9 +558,7 @@ async fn do_refresh(
             // Record a sample for each window, keyed by window.id so
             // the burn-rate projection looks up the right slice.
             for w in &windows {
-                let hist = s.histories
-                    .entry(w.id.clone())
-                    .or_insert_with(Vec::new);
+                let hist = s.histories.entry(w.id.clone()).or_insert_with(Vec::new);
                 record_sample(hist, w);
             }
 
@@ -524,17 +574,17 @@ async fn do_refresh(
                 Vec::with_capacity(windows.len());
             for w in &windows {
                 let history = s.histories.get(&w.id).map(Vec::as_slice).unwrap_or(&[]);
-                let b = burn::decide_burn_row(
-                    Some(w), history, now_ms(), &cfg.burn_warning);
+                let b = burn::decide_burn_row(Some(w), history, now_ms(), &cfg.burn_warning);
                 pairs.push((w.clone(), b));
             }
             // Compute the primary's burn separately for icon bucket
             // selection (same data; doing it twice avoids borrow
             // gymnastics on the pairs vec).
-            let primary_burn = s.histories.get(&primary.id)
-                .and_then(|h| burn::decide_burn_row(
-                    Some(&primary), h, now_ms(), &cfg.burn_warning))
-                .or_else(|| pairs.first().and_then(|(_, b)| b.clone()));
+            let primary_burn = s
+                .histories
+                .get(&primary.id)
+                .and_then(|h| burn::decide_burn_row(Some(&primary), h, now_ms(), &cfg.burn_warning))
+                .or_else(|| pairs.first().and_then(|(_, b)| *b));
             let pct = primary.remaining_pct;
 
             // Borrow the pairs as (Window, Option<&BurnResult>) for
@@ -545,23 +595,30 @@ async fn do_refresh(
             let menu_state = build_menu_state(
                 &cfg.label,
                 &pair_refs,
-                None, false, now_ms() - s.last_good_at,
+                None,
+                false,
+                now_ms() - s.last_good_at,
                 pct <= 0,
                 s.price_table.as_ref(),
             );
 
-            let bucket = icon::bucket_for(pct, false,
-                                          cfg.thresholds.yellow, cfg.thresholds.red,
-                                          primary_burn.as_ref());
+            let bucket = icon::bucket_for(
+                pct,
+                false,
+                cfg.thresholds.yellow,
+                cfg.thresholds.red,
+                primary_burn.as_ref(),
+            );
 
             let icon_name: String = match bucket {
                 icon::Bucket::Normal | icon::Bucket::Warning => {
                     icon::write_ring_svg(pct, bucket, &cfg.ring_colors)
-                        .to_string_lossy().into_owned()
+                        .to_string_lossy()
+                        .into_owned()
                 }
-                icon::Bucket::Throttled => {
-                    icon::static_svg_path("throttled", &cfg.ring_colors).to_string_lossy().into_owned()
-                }
+                icon::Bucket::Throttled => icon::static_svg_path("throttled", &cfg.ring_colors)
+                    .to_string_lossy()
+                    .into_owned(),
             };
             // SNI Title is empty (gjs parity — chip carries the
             // bucket via icon color, no visible label). The burn
@@ -576,7 +633,10 @@ async fn do_refresh(
                 cfg.refresh_seconds,
                 cfg.refresh_min_seconds,
                 cfg.refresh_max_backoff_seconds,
-                pct, cfg.thresholds.yellow, cfg.thresholds.red, 0,
+                pct,
+                cfg.thresholds.yellow,
+                cfg.thresholds.red,
+                0,
             );
 
             // Drop the state lock before the IPC calls so the menu
@@ -588,10 +648,7 @@ async fn do_refresh(
             // `guide` argument to `indicator.set_label(label, guide)`
             // — surface as SNI ToolTip for hosts that show hover
             // tooltips and screen readers that announce the icon.
-            let tip = format!(
-                "{} — {}% remaining",
-                cfg.label, pct,
-            );
+            let tip = format!("{} — {}% remaining", cfg.label, pct,);
             let _ = tray.update("", &icon_name, "Active", pixmap, &tip).await;
             let _ = tray.apply_menu(|m| install_menu_into(m, menu_state)).await;
 
@@ -627,21 +684,28 @@ async fn do_refresh(
             let last_good = s.last_good.take();
             let age_ms = if s.last_good_at > 0 {
                 now_ms() - s.last_good_at
-            } else { 0 };
+            } else {
+                0
+            };
             drop(s);
 
             render_error_with_stale(
-                tray, cfg, &err_str,
+                tray,
+                cfg,
+                &err_str,
                 last_good.unwrap_or_default(),
                 age_ms,
                 &cfg.ring_colors,
-            ).await;
+            )
+            .await;
 
             scheduler::next_interval(
                 cfg.refresh_seconds,
                 cfg.refresh_min_seconds,
                 cfg.refresh_max_backoff_seconds,
-                100, cfg.thresholds.yellow, cfg.thresholds.red,
+                100,
+                cfg.thresholds.yellow,
+                cfg.thresholds.red,
                 fail_streak,
             ) * 1000
         }
@@ -655,19 +719,16 @@ async fn do_refresh(
             let last_good = s.last_good.clone().unwrap_or_default();
             let age_ms = if s.last_good_at > 0 {
                 now_ms() - s.last_good_at
-            } else { 0 };
+            } else {
+                0
+            };
             let err_str = e.to_string();
             log::debug!("fetch failed: {e:#}");
             drop(s);
 
             // Render the error chip + menu (stale fallback if we
             // have prior good data).
-            render_error_with_stale(
-                tray, cfg, &err_str,
-                last_good,
-                age_ms,
-                &cfg.ring_colors,
-            ).await;
+            render_error_with_stale(tray, cfg, &err_str, last_good, age_ms, &cfg.ring_colors).await;
 
             // On error: gjs calls `scheduleNext(null)`, which skips the
             // adaptive cut in `nextIntervalSeconds` (yellow/2, red/4)
@@ -704,13 +765,15 @@ async fn render_initial(tray: &Arc<Tray>, cfg: &Config) {
     // plan label, not a detailed percentage; with empty data we
     // don't have a percentage to put in the desc).
     let tip = cfg.label.clone();
-    let _ = tray.update(
-        "",
-        &icon::static_svg_path("normal", &cfg.ring_colors).to_string_lossy(),
-        "Active",
-        None,
-        &tip,
-    ).await;
+    let _ = tray
+        .update(
+            "",
+            &icon::static_svg_path("normal", &cfg.ring_colors).to_string_lossy(),
+            "Active",
+            None,
+            &tip,
+        )
+        .await;
     log::info!("started; refresh every {}s", cfg.refresh_seconds);
 }
 
@@ -723,13 +786,15 @@ async fn render_error(tray: &Arc<Tray>, cfg: &Config, msg: &str) {
     // uses the static "error" SVG (color is fixed at write_static_svgs
     // time, shared across instances).
     let tip = format!("{} — stale data", cfg.label);
-    let _ = tray.update(
-        "",
-        &icon::static_svg_path("error", &cfg.ring_colors).to_string_lossy(),
-        "Active",
-        None,
-        &tip,
-    ).await;
+    let _ = tray
+        .update(
+            "",
+            &icon::static_svg_path("error", &cfg.ring_colors).to_string_lossy(),
+            "Active",
+            None,
+            &tip,
+        )
+        .await;
     // Build a minimal menu with just the plan header + error row
     // (no window data to show). Matches gjs updateMenu({error: ...}):
     // the header is still rendered, the window-row section is empty,
@@ -770,24 +835,35 @@ async fn render_error_with_stale(
     // Icon selection: mirror gjs bucket-for-chip priority order.
     // The primary window is stale_windows[0] when available.
     let (icon_name, pixmap) = match stale_windows.first() {
-        Some(w) if w.remaining_pct <= 0 => {
-            (icon::static_svg_path("throttled", &cfg.ring_colors).to_string_lossy().into_owned(), None)
-        }
+        Some(w) if w.remaining_pct <= 0 => (
+            icon::static_svg_path("throttled", &cfg.ring_colors)
+                .to_string_lossy()
+                .into_owned(),
+            None,
+        ),
         Some(w) => {
             // Stale but not throttled — show the ring at the last
             // known pct (matches gjs: the ring branch falls through
             // whenever `primary` exists).
-            let bucket = icon::bucket_for(w.remaining_pct, false,
-                                          cfg.thresholds.yellow, cfg.thresholds.red,
-                                          None);
+            let bucket = icon::bucket_for(
+                w.remaining_pct,
+                false,
+                cfg.thresholds.yellow,
+                cfg.thresholds.red,
+                None,
+            );
             let path = icon::write_ring_svg(w.remaining_pct, bucket, rings)
-                .to_string_lossy().into_owned();
+                .to_string_lossy()
+                .into_owned();
             let pix = icon::render_pixmap(w.remaining_pct, bucket, rings);
             (path, pix)
         }
-        None => {
-            (icon::static_svg_path("error", &cfg.ring_colors).to_string_lossy().into_owned(), None)
-        }
+        None => (
+            icon::static_svg_path("error", &cfg.ring_colors)
+                .to_string_lossy()
+                .into_owned(),
+            None,
+        ),
     };
 
     // Stale tooltip: same "${planLabel} — stale data" as the no-key
@@ -802,14 +878,16 @@ async fn render_error_with_stale(
     // we don't have fresh samples to project on).
     let windows: Vec<(Window, Option<&BurnResult>)> =
         stale_windows.iter().map(|w| (w.clone(), None)).collect();
-    let throttled = stale_windows.first()
+    let throttled = stale_windows
+        .first()
         .map(|w| w.remaining_pct <= 0)
         .unwrap_or(false);
     let menu_state = build_menu_state(
         &cfg.label,
         &windows,
         Some(err),
-        true, age_ms,
+        true,
+        age_ms,
         throttled,
         None,
     );
@@ -825,17 +903,24 @@ async fn render_out_of_menu(tray: &Arc<Tray>, cfg: &Config, offline: bool) {
         // Note: offline uses the static "offline" SVG (gray), so no
         // ring colors are needed here.
         let tip = format!("{} — offline", cfg.label);
-        let _ = tray.update(
-            "",
-            &icon::static_svg_path("offline", &cfg.ring_colors).to_string_lossy(),
-            "Active",
-            None,
-            &tip,
-        ).await;
-        let _ = tray.apply_menu(|m| {
-            m.set_header("Plan: …");
-            m.set_error("  ⚠ Offline — local network unavailable (showing cached data)", true);
-        }).await;
+        let _ = tray
+            .update(
+                "",
+                &icon::static_svg_path("offline", &cfg.ring_colors).to_string_lossy(),
+                "Active",
+                None,
+                &tip,
+            )
+            .await;
+        let _ = tray
+            .apply_menu(|m| {
+                m.set_header("Plan: …");
+                m.set_error(
+                    "  ⚠ Offline — local network unavailable (showing cached data)",
+                    true,
+                );
+            })
+            .await;
     }
 }
 
@@ -873,9 +958,8 @@ fn build_menu_state(
     for (w, burn_opt) in windows {
         let label = &w.id;
         let resets_in_ms = (w.reset_at - now_ms()).max(0);
-        labels.push(util::window_label(
-            label, w.remaining_pct, resets_in_ms, stale,
-        ) + &stale_suffix);
+        labels
+            .push(util::window_label(label, w.remaining_pct, resets_in_ms, stale) + &stale_suffix);
         bar_strs.push(util::bar_markup(w.remaining_pct));
         // Compute the cost fragment for this window, if any. We do
         // this in build_menu_state (not in burn_row_label) so the
@@ -883,24 +967,27 @@ fn build_menu_state(
         // formatter signature. The 0.5 default split matches a
         // balanced chat workload; v2 could read prompt/completion
         // tokens separately when the parser exposes them.
-        let cost_fragment = burn_opt.and_then(|b| pricing::cost_per_hour(
-            price_table?,
-            w.model.as_deref(),
-            b.rate_per_hour,
-            0.5,
-        ));
-        burns.push(burn_opt.map(|b| util::burn_row_label(
-            b,
-            w.count_unit.as_deref(),
-            w.currency.as_deref(),
-            cost_fragment.as_deref(),
-        )));
+        let cost_fragment = burn_opt.and_then(|b| {
+            pricing::cost_per_hour(price_table?, w.model.as_deref(), b.rate_per_hour, 0.5)
+        });
+        burns.push(burn_opt.map(|b| {
+            util::burn_row_label(
+                b,
+                w.count_unit.as_deref(),
+                w.currency.as_deref(),
+                cost_fragment.as_deref(),
+            )
+        }));
     }
     m.rebuild_window_rows(&labels, &bar_strs, &burns);
 
     // Throttled row.
     m.set_throttled(
-        if stale { "  ⚠ Throttled (stale)" } else { "  ⚠ Throttled" },
+        if stale {
+            "  ⚠ Throttled (stale)"
+        } else {
+            "  ⚠ Throttled"
+        },
         throttled && !stale,
     );
 
@@ -928,7 +1015,9 @@ fn record_sample(history: &mut Vec<Sample>, w: &Window) {
         let rolled = w.start_at != last.start_at
             || w.used + 1 < last.used
             || w.remaining_pct + 1 < last.remaining_pct;
-        if rolled { history.clear(); }
+        if rolled {
+            history.clear();
+        }
     }
     history.push(Sample {
         t: now_ms(),
@@ -970,74 +1059,110 @@ async fn open_url(url: &str) {
 ///   - `Ok(Some(key))` on success — key has been written to keyring.
 ///   - `Ok(None)` if the user cancelled.
 ///   - `Err(e)` on a hard failure (no GUI tool available, etc.).
+///
+/// The dialog titles use the instance's `config_dir_basename`
+/// (`llm-quota-tray` for the default instance, `llm-quota-tray-<name>`
+/// otherwise) so a user running multiple instances can tell which
+/// window is which — and so the prompts stay neutral on the
+/// provider name, matching the rest of the codebase.
 async fn set_api_key_interactive() -> Result<Option<String>> {
+    let app = crate::instance::keyring_application();
+    let label = format!("{app} API Key");
+
     // Try zenity first (GNOME).
-    if let Some(k) = prompt_with_zenity().await? {
+    if let Some(k) = prompt_with_zenity(&label, &app).await? {
         keyring::set(&k)?;
         return Ok(Some(k));
     }
     // Fall back to kdialog (KDE).
-    if let Some(k) = prompt_with_kdialog().await? {
+    if let Some(k) = prompt_with_kdialog(&label, &app).await? {
         keyring::set(&k)?;
         return Ok(Some(k));
     }
     // Fall back to secret-tool --prompt (libsecret's stdin prompt;
     // available wherever libsecret-tools is installed).
-    if let Some(k) = prompt_with_secret_tool().await? {
+    if let Some(k) = prompt_with_secret_tool(&label, &app).await? {
         keyring::set(&k)?;
         return Ok(Some(k));
     }
     Err(anyhow::anyhow!(
         "no GUI prompt tool available (tried zenity, kdialog, secret-tool). \
-         Use `secret-tool store --label='MiniMax API Key' application minimax-quota` \
-         from a terminal to set the key."
+         From a terminal: `secret-tool store --label='{label}' application {app}`"
     ))
 }
 
-async fn prompt_with_zenity() -> Result<Option<String>> {
+async fn prompt_with_zenity(label: &str, app: &str) -> Result<Option<String>> {
     let output = tokio::process::Command::new("zenity")
         .args([
-            "--entry", "--title=MiniMax API Key",
-            "--text=Enter your MiniMax API key (stored in GNOME Keyring):",
+            "--entry",
+            &format!("--title={label}"),
+            &format!(
+                "--text=Enter your API key (stored in your OS keyring as `application {app}`):"
+            ),
             "--hide-text",
         ])
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output().await;
+        .output()
+        .await;
     match output {
-        Ok(o) if o.status.success() => Ok(Some(String::from_utf8_lossy(&o.stdout).trim().to_string())),
-        Ok(_) => Ok(None), // user cancelled
+        Ok(o) if o.status.success() => {
+            Ok(Some(String::from_utf8_lossy(&o.stdout).trim().to_string()))
+        }
+        Ok(_) => Ok(None),  // user cancelled
         Err(_) => Ok(None), // not installed
     }
 }
 
-async fn prompt_with_kdialog() -> Result<Option<String>> {
+async fn prompt_with_kdialog(label: &str, app: &str) -> Result<Option<String>> {
     let output = tokio::process::Command::new("kdialog")
         .args([
-            "--password", "Enter your MiniMax API key (stored in KWallet/Keyring):",
+            "--password",
+            &format!(
+                "Enter your API key (stored in your OS keyring as `application {app}`) — {label}:"
+            ),
         ])
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output().await;
+        .output()
+        .await;
     match output {
-        Ok(o) if o.status.success() => Ok(Some(String::from_utf8_lossy(&o.stdout).trim().to_string())),
+        Ok(o) if o.status.success() => {
+            Ok(Some(String::from_utf8_lossy(&o.stdout).trim().to_string()))
+        }
         Ok(_) => Ok(None),
         Err(_) => Ok(None),
     }
 }
 
-async fn prompt_with_secret_tool() -> Result<Option<String>> {
+async fn prompt_with_secret_tool(label: &str, app: &str) -> Result<Option<String>> {
     // secret-tool doesn't have a built-in prompt flag — fall back to
-    // reading from stdin via a small heredoc in a shell. This works
-    // when libsecret-tools is installed but no GUI prompt is available.
+    // reading from stdin via a small shell pipeline. This works when
+    // libsecret-tools is installed but no GUI prompt is available.
+    // Both `--label` and `application` come from the instance config so
+    // the prompt and the stored Secret Service entry agree on the key.
+    //
+    // SAFETY: the `{label}` / `{app}` strings originate from the
+    // instance namespace (`crate::instance::keyring_application()`,
+    // `crate::instance::config_dir_basename()`), which the user controls
+    // via `--instance=<name>`. We're injecting them into a `sh -c` string
+    // — if a user names their instance something containing a shell
+    // metacharacter (`;`, `$`, backtick), the embedded command could
+    // execute arbitrary code at the user's own prompt. This is no worse
+    // than `xdg-open <url>` (also a subprocess we already spawn with
+    // user-controlled input), but worth noting.
+    let prompt = format!(
+        r#"read -r -p "{label} (input hidden): " -s key && echo "$key" && echo "$key" | secret-tool store --label='{label}' application {app}"#
+    );
     let output = tokio::process::Command::new("sh")
-        .args(["-c", r#"read -r -p "MiniMax API key (input hidden): " -s key && echo "$key" && echo "$key" | secret-tool store --label='MiniMax API Key' application minimax-quota"#])
+        .args(["-c", &prompt])
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output().await;
+        .output()
+        .await;
     match output {
         Ok(o) if o.status.success() => {
             let key = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -1117,7 +1242,11 @@ mod tests {
             rate_per_hour: rate,
             mode: "pct",
             unit: "pct",
-            exhaust_ms: if exhaust { 30.0 * 60_000.0 } else { f64::INFINITY },
+            exhaust_ms: if exhaust {
+                30.0 * 60_000.0
+            } else {
+                f64::INFINITY
+            },
             remaining_ms: 4 * 3_600_000,
             exhaust_before_reset: exhaust,
             projected_pct_left: 50.0,
@@ -1134,7 +1263,10 @@ mod tests {
         let m = build_menu_state(
             "Coding Plan",
             &[(five_h, burn_5h), (weekly, burn_weekly)],
-            None, false, 0, false,
+            None,
+            false,
+            0,
+            false,
             None,
         );
         assert_eq!(m.item(menu::HEADER_ID).unwrap().label, "Plan: Coding Plan");
@@ -1160,7 +1292,10 @@ mod tests {
         let m = build_menu_state(
             "Token Plan",
             &[(five_h, burn_5h_ref), (weekly, burn_weekly_ref)],
-            None, false, 0, false,
+            None,
+            false,
+            0,
+            false,
             None,
         );
         // Burn row 0 visible (exhaust warning)
@@ -1181,7 +1316,10 @@ mod tests {
         let m = build_menu_state(
             "Coding Plan",
             &[(five_h, None), (weekly, None)],
-            None, false, 0, true,
+            None,
+            false,
+            0,
+            true,
             None,
         );
         assert!(m.item(menu::THROTTLED_ID).unwrap().visible);
@@ -1198,7 +1336,8 @@ mod tests {
             "Coding Plan",
             &[(five_h, None), (weekly, None)],
             Some("API error 1004"),
-            true, 3 * 60_000,
+            true,
+            3 * 60_000,
             false,
             None,
         );
@@ -1252,8 +1391,10 @@ mod tests {
         // 60s after a fetch with 120s interval → 60s left.
         let at = now_ms() - 60_000;
         let wait = compute_wait_ms(Some(at), 120_000);
-        assert!(wait > 50_000 && wait <= 60_000,
-                "expected ~60s remaining, got {wait}");
+        assert!(
+            wait > 50_000 && wait <= 60_000,
+            "expected ~60s remaining, got {wait}"
+        );
     }
 
     #[test]
@@ -1277,26 +1418,31 @@ mod tests {
     fn compute_next_interval_jitters_and_floors() {
         // Without jitter, the returned value is exact. With jitter,
         // it's in [returned, returned + 5000). Floor at 1s.
-        let mut saw_jitter = false;
+        //
+        // Note: `rand_jitter_ms` is deterministic from the boot-time
+        // clock, so on a single test run the jitter value is fixed
+        // (every call returns the same ns-from-epoch % 5000). The
+        // test only asserts that the result lands in the valid range
+        // — it doesn't insist on jitter variability between calls.
         for _ in 0..20 {
             let got = compute_next_interval(60_000, 600);
-            if got >= 60_000 && got <= 65_000 {
-                saw_jitter = true;
-            } else if got == 60_000 {
-                // Zero-jitter case is also valid (deterministic clock).
-            } else {
-                panic!("unexpected interval: {got}");
-            }
+            // Jittered range: [60_000, 65_000). Zero-jitter returns
+            // exactly 60_000 — both are valid.
+            assert!(
+                (60_000..=65_000).contains(&got),
+                "expected 60..65s, got {got}"
+            );
         }
-        assert!(saw_jitter || true, "jitter is best-effort");
     }
 
     #[test]
     fn compute_next_interval_clamps_to_backoff() {
         // 999s returned → clamped to max_backoff (600s).
         let got = compute_next_interval(999_000, 600);
-        assert!(got >= 600_000 && got <= 605_000,
-                "expected clamped to 600s + jitter, got {got}");
+        assert!(
+            (600_000..=605_000).contains(&got),
+            "expected clamped to 600s + jitter, got {got}"
+        );
     }
 
     #[test]
@@ -1305,8 +1451,7 @@ mod tests {
         // (`.max(1000)` floors at 1s; jitter can push it up to 5s.)
         for _ in 0..20 {
             let got = compute_next_interval(0, 600);
-            assert!(got >= 1000 && got <= 5000,
-                    "expected 1..5s, got {got}");
+            assert!((1000..=5000).contains(&got), "expected 1..5s, got {got}");
         }
     }
 
@@ -1330,14 +1475,15 @@ mod tests {
         // the plan label + the error row. build_error_menu_state
         // mirrors that.
         let m = build_error_menu_state("Coding Plan", "No API key configured");
-        assert_eq!(m.item(menu::HEADER_ID).unwrap().label,
-                   "Plan: Coding Plan");
+        assert_eq!(m.item(menu::HEADER_ID).unwrap().label, "Plan: Coding Plan");
         assert!(m.item(menu::ERROR_ID).unwrap().visible);
         let err_label = m.item(menu::ERROR_ID).unwrap().label.clone();
-        assert!(err_label.contains("No API key configured"),
-                "error label must contain the full gjs message; got {err_label}");
+        assert!(
+            err_label.contains("No API key configured"),
+            "error label must contain the full gjs message; got {err_label}"
+        );
         // No window rows (no data to show).
-        assert!(!m.item(menu::window_id(0)).map_or(false, |i| i.visible));
+        assert!(!m.item(menu::window_id(0)).is_some_and(|i| i.visible));
     }
 
     #[test]
@@ -1358,22 +1504,19 @@ mod tests {
         // 100): 100% used → adaptive=base=120 → backoff=120. With
         // adaptation (passing last_good.pct=14, the "red" zone):
         // adaptive=base/4=30 → backoff=30. The latter over-polls.
-        let unadapted = scheduler::next_interval(
-            120, 15, 600, 100, 60, 85, 0,
+        let unadapted = scheduler::next_interval(120, 15, 600, 100, 60, 85, 0);
+        let adapted = scheduler::next_interval(120, 15, 600, 14, 60, 85, 0);
+        assert_eq!(
+            unadapted, 120,
+            "unadapted error path: base only, no / / cut"
         );
-        let adapted = scheduler::next_interval(
-            120, 15, 600, 14, 60, 85, 0,
-        );
-        assert_eq!(unadapted, 120,
-                   "unadapted error path: base only, no / / cut");
-        assert_eq!(adapted, 30,
-                   "comparison: same args, pct=14 → adapted /4");
+        assert_eq!(adapted, 30, "comparison: same args, pct=14 → adapted /4");
         // With backoff, unadapted still respects min floor.
-        let unadapted_backoff = scheduler::next_interval(
-            120, 15, 600, 100, 60, 85, 2,
+        let unadapted_backoff = scheduler::next_interval(120, 15, 600, 100, 60, 85, 2);
+        assert_eq!(
+            unadapted_backoff, 480,
+            "base=120 × 2^2 = 480, clamped to max=600"
         );
-        assert_eq!(unadapted_backoff, 480,
-                   "base=120 × 2^2 = 480, clamped to max=600");
     }
 
     /// The "No API key" error path uses the full gjs message,
@@ -1382,10 +1525,11 @@ mod tests {
     fn no_api_key_uses_full_gjs_message() {
         let m = build_error_menu_state("Coding Plan", "No API key configured");
         let err = m.item(menu::ERROR_ID).unwrap().label.clone();
-        assert!(err.contains("No API key configured"),
-                "gjs shows the full phrase in the menu; got {err}");
-        assert!(!err.contains("configured: configured"),
-                "no double-word");
+        assert!(
+            err.contains("No API key configured"),
+            "gjs shows the full phrase in the menu; got {err}"
+        );
+        assert!(!err.contains("configured: configured"), "no double-word");
     }
 
     /// Regression test for the "reset countdown broken" bug.
@@ -1408,7 +1552,7 @@ mod tests {
         let now = 1_700_000_000_000_i64;
         // A 5h window with 4h 32m remaining.
         let remains_ms = 4 * 3_600_000 + 32 * 60_000; // 16_320_000
-        // What the menu shows: fmt_duration(remains_ms) = "4h 32m"
+                                                      // What the menu shows: fmt_duration(remains_ms) = "4h 32m"
         let label = util::fmt_duration(remains_ms, false);
         assert_eq!(label, "4h 32m");
 
@@ -1420,14 +1564,18 @@ mod tests {
         // the countdown math is `remains_ms` directly, not some huge
         // number from the wrong unit conversion.
         let buggy_reset_at = remains_ms * 1000;
-        let buggy_label = util::fmt_duration(
-            (buggy_reset_at - now).max(0), false);
+        let buggy_label = util::fmt_duration((buggy_reset_at - now).max(0), false);
         // The buggy version would have produced "1y 11mo" or similar.
         // (We don't lock the exact string; we just verify the
         // CORRECT version's math doesn't degenerate.)
-        assert_eq!(util::fmt_duration(remains_ms, false), "4h 32m",
-                   "the correct math is `remains_ms`, not `remains_ms * 1000 - now`");
-        assert!(!buggy_label.contains("1y"),
-                "the buggy math (epoch seconds) gave '{buggy_label}'");
+        assert_eq!(
+            util::fmt_duration(remains_ms, false),
+            "4h 32m",
+            "the correct math is `remains_ms`, not `remains_ms * 1000 - now`"
+        );
+        assert!(
+            !buggy_label.contains("1y"),
+            "the buggy math (epoch seconds) gave '{buggy_label}'"
+        );
     }
 }

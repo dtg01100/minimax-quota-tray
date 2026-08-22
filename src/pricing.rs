@@ -123,11 +123,14 @@ fn build_pricing(p: &WirePricing) -> ModelPricing {
     ModelPricing {
         prompt_per_token: parse_rate(&p.prompt),
         completion_per_token: parse_rate(&p.completion),
-        input_cache_read_per_token: p.input_cache_read.as_deref()
-            .and_then(|s| {
-                let v = parse_rate(s);
-                if v > 0.0 { Some(v) } else { None }
-            }),
+        input_cache_read_per_token: p.input_cache_read.as_deref().and_then(|s| {
+            let v = parse_rate(s);
+            if v > 0.0 {
+                Some(v)
+            } else {
+                None
+            }
+        }),
     }
 }
 
@@ -139,19 +142,17 @@ fn build_pricing(p: &WirePricing) -> ModelPricing {
 /// Why blocking: the HTTP client lives on the blocking runtime
 /// (see `fetch.rs`) so we reuse it here to avoid building two
 /// TLS stacks.
-pub fn fetch_pricing_blocking(
-    client: &HttpClient,
-    url: &str,
-) -> Result<PriceTable> {
-    let resp = client.get(url)
+pub fn fetch_pricing_blocking(client: &HttpClient, url: &str) -> Result<PriceTable> {
+    let resp = client
+        .get(url)
         .send()
         .with_context(|| format!("GET {url}"))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(anyhow::anyhow!(
-            "pricing endpoint returned HTTP {status}"));
+        return Err(anyhow::anyhow!("pricing endpoint returned HTTP {status}"));
     }
-    let body: WireResponse = resp.json()
+    let body: WireResponse = resp
+        .json()
         .with_context(|| format!("decoding pricing JSON from {url}"))?;
     let mut table = PriceTable::with_capacity(body.data.len());
     for entry in body.data {
@@ -197,8 +198,7 @@ pub fn cost_per_hour(
     let prompt_tokens = tokens_per_hour * ps;
     let completion_tokens = tokens_per_hour * (1.0 - ps);
     let usd_per_hour =
-        prompt_tokens * pricing.prompt_per_token +
-        completion_tokens * pricing.completion_per_token;
+        prompt_tokens * pricing.prompt_per_token + completion_tokens * pricing.completion_per_token;
     if !usd_per_hour.is_finite() || usd_per_hour < 0.001 {
         // Below 1/10 cent — hide. Returns "0" formatters would
         // round it, but we want the row to look like a normal
@@ -212,7 +212,9 @@ pub fn cost_per_hour(
     // Trailing-zero strip mirroring fmt_cost / fmt_rate style.
     let trimmed = if s.contains('.') {
         s.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else { s };
+    } else {
+        s
+    };
     Some(format!("{trimmed}/h"))
 }
 
@@ -230,11 +232,14 @@ mod tests {
 
     fn table_with(id: &str, prompt: f64, completion: f64) -> PriceTable {
         let mut t = PriceTable::new();
-        t.insert(id.to_string(), ModelPricing {
-            prompt_per_token: prompt,
-            completion_per_token: completion,
-            input_cache_read_per_token: None,
-        });
+        t.insert(
+            id.to_string(),
+            ModelPricing {
+                prompt_per_token: prompt,
+                completion_per_token: completion,
+                input_cache_read_per_token: None,
+            },
+        );
         t
     }
 
@@ -247,7 +252,7 @@ mod tests {
         assert_eq!(parse_rate(""), 0.0);
         assert_eq!(parse_rate("nan"), 0.0);
         assert_eq!(parse_rate("not-a-number"), 0.0);
-        assert_eq!(parse_rate("-1.0"), 0.0);     // negative ⇒ 0
+        assert_eq!(parse_rate("-1.0"), 0.0); // negative ⇒ 0
         assert_eq!(parse_rate("inf"), 0.0);
     }
 
@@ -276,8 +281,7 @@ mod tests {
         let t = table_with("cheap", 2e-7, 6e-7);
         // 100 tokens/h on a cheap model: $0.00004/h — below threshold
         let c = cost_per_hour(&t, Some("cheap"), 100.0, 0.5);
-        assert!(c.is_none(),
-                "sub-tenth-cent should be hidden, got {c:?}");
+        assert!(c.is_none(), "sub-tenth-cent should be hidden, got {c:?}");
     }
 
     #[test]
@@ -386,7 +390,9 @@ mod tests {
         let parsed: WireResponse = serde_json::from_str(body).unwrap();
         let mut table = PriceTable::new();
         for entry in parsed.data {
-            if entry.id.is_empty() { continue; }
+            if entry.id.is_empty() {
+                continue;
+            }
             table.insert(entry.id, build_pricing(&entry.pricing));
         }
         assert!(table.is_empty());

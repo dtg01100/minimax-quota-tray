@@ -25,9 +25,10 @@ fn binary_starts_under_session_dbus() {
     // The startup log includes the SNI warning (no watcher in headless
     // test) and the plan label — both are proof the daemon reached its
     // main loop without panicking.
-    assert!(stderr.contains("llm-quota-tray")
-            || stderr.contains("refresh every"),
-            "binary should reach steady state; got: {stderr}");
+    assert!(
+        stderr.contains("llm-quota-tray") || stderr.contains("refresh every"),
+        "binary should reach steady state; got: {stderr}"
+    );
 }
 
 /// Measure RSS in MB after a short warmup. Used as a regression guard
@@ -58,7 +59,9 @@ fn rss_under_target() {
         // The SNI-only binary should be ~7-10 MB. Allow up to 20 MB as a
         // headroom for debug allocations, env, etc. If this regresses,
         // someone re-introduced a heavy library.
-        assert!(rss_mb < 20.0,
-                "RSS {rss_mb:.1} MB exceeds 20 MB target — investigate a possible heavy dependency");
+        assert!(
+            rss_mb < 20.0,
+            "RSS {rss_mb:.1} MB exceeds 20 MB target — investigate a possible heavy dependency"
+        );
     }
 }

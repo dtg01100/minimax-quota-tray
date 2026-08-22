@@ -39,16 +39,16 @@ pub fn next_interval(
     }
     .max(min_seconds); // never below min_seconds — avoid hammer-the-API
 
-    // Exponential backoff on errors.
-    let backoff = if fail_streak == 0 {
+    // Exponential backoff on errors. The `fail_streak == 0` branch
+    // returns `adaptive` unchanged — `2u64.saturating_pow(0) == 1`
+    // would also work, but the explicit branch reads more clearly.
+    if fail_streak == 0 {
         adaptive
     } else {
         adaptive
             .saturating_mul(2u64.saturating_pow(fail_streak.min(8)))
             .min(max_backoff)
-    };
-
-    backoff
+    }
 }
 
 #[cfg(test)]

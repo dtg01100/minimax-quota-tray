@@ -31,10 +31,14 @@ pub fn send(tag: &str, title: &str, body: &str, urgency: Urgency) {
     };
     let result = Command::new("notify-send")
         .args([
-            "-a", "llm-quota-tray",
-            "-h", &format!("string:x-canonical-private-synchronous:{tag}"),
-            "-u", urgency_str,
-            title, body,
+            "-a",
+            "llm-quota-tray",
+            "-h",
+            &format!("string:x-canonical-private-synchronous:{tag}"),
+            "-u",
+            urgency_str,
+            title,
+            body,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -66,7 +70,11 @@ mod tests {
     #[test]
     fn urgency_str_mapping() {
         fn s(u: Urgency) -> &'static str {
-            match u { Urgency::Low => "low", Urgency::Normal => "normal", Urgency::Critical => "critical" }
+            match u {
+                Urgency::Low => "low",
+                Urgency::Normal => "normal",
+                Urgency::Critical => "critical",
+            }
         }
         assert_eq!(s(Urgency::Low), "low");
         assert_eq!(s(Urgency::Normal), "normal");

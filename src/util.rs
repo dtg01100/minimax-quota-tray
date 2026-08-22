@@ -9,14 +9,22 @@
 /// appropriate rounding via the `floor` flag at the call site.
 pub fn fmt_duration(ms: i64, floor: bool) -> String {
     let abs = ms.max(0);
-    let mins = if floor { abs / 60_000 } else { (abs + 59_999) / 60_000 };
+    let mins = if floor {
+        abs / 60_000
+    } else {
+        (abs + 59_999) / 60_000
+    };
     if mins < 60 {
         return format!("{mins}m");
     }
     let h = mins / 60;
     let m = mins % 60;
     if h < 24 {
-        return if m == 0 { format!("{h}h") } else { format!("{h}h {m}m") };
+        return if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h {m}m")
+        };
     }
     let d = h / 24;
     let rh = h % 24;
@@ -74,18 +82,21 @@ pub fn fmt_rate(rate: f64) -> String {
 
 /// Plain-text progress bar. Matches gjs `barMarkup()`.
 ///
-/// W = 22 columns (chosen by gjs to fit inside a 24-character
-/// terminal at the typical menu font). Block characters U+2588 (full)
-/// + U+2591 (light shade) — universally rendered by every menu widget;
-/// gjs explicitly avoids Pango markup here because some SNI menu
+/// `W = 22` columns (chosen by gjs to fit inside a 24-character
+/// terminal at the typical menu font), drawn with the universally-
+/// supported block characters U+2588 (full) + U+2591 (light shade);
+/// gjs explicitly avoids Pango markup because some SNI menu
 /// renderers don't support it.
 pub fn bar_markup(fraction_pct: i64) -> String {
     const W: i64 = 22;
-    let clamped = fraction_pct.max(0).min(100);
-    let filled = ((clamped as i64 * W) + 50) / 100; // round-to-nearest
+    let clamped = fraction_pct.clamp(0, 100);
+    let filled = ((clamped * W) + 50) / 100; // round-to-nearest
     let empty = W - filled;
-    format!("  [{} {}]", "\u{2588}".repeat(filled as usize),
-            "\u{2591}".repeat(empty as usize))
+    format!(
+        "  [{} {}]",
+        "\u{2588}".repeat(filled as usize),
+        "\u{2591}".repeat(empty as usize)
+    )
 }
 
 /// Compact cost-per-hour label for currency-denominated windows
@@ -121,7 +132,9 @@ pub fn fmt_cost(cents_per_hour: f64) -> String {
     let trim = |s: String| -> String {
         if s.contains('.') {
             s.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else { s }
+        } else {
+            s
+        }
     };
     if usd < 0.01 {
         trim(format!("${usd:.4}"))
@@ -177,8 +190,10 @@ pub fn burn_row_label(
         None => rate_unit,
     };
     if burn.exhaust_before_reset {
-        format!("  ⚠ {rate_unit} → exhausts ~{} before reset",
-                fmt_duration(burn.exhaust_ms as i64, false))
+        format!(
+            "  ⚠ {rate_unit} → exhausts ~{} before reset",
+            fmt_duration(burn.exhaust_ms as i64, false)
+        )
     } else {
         let pct_left = burn.projected_pct_left.round() as i64;
         format!("  · on pace to have ~{pct_left}% left at reset ({rate_unit})")
@@ -189,8 +204,10 @@ pub fn burn_row_label(
 /// Appends a stale suffix when the data is from the last good fetch
 /// but the most recent attempt failed.
 pub fn window_label(label: &str, remaining_pct: i64, resets_in_ms: i64, stale: bool) -> String {
-    let base = format!("  {label}: {remaining_pct}% left · resets in {}",
-                       fmt_duration(resets_in_ms, false));
+    let base = format!(
+        "  {label}: {remaining_pct}% left · resets in {}",
+        fmt_duration(resets_in_ms, false)
+    );
     if stale {
         // The caller passes the age of the last good fetch via the
         // title-level suffix ("last update Xm ago"); here we keep
@@ -259,7 +276,7 @@ mod tests {
         assert_eq!(fmt_rate(99500.0), "99.5k"); // gjs: k=99.5 < 100 → decimal
         assert_eq!(fmt_rate(100000.0), "100k"); // k=100 → integer
         assert_eq!(fmt_rate(150000.0), "150k"); // k=150 → integer
-        // Decimal stripping on the sub-100k range
+                                                // Decimal stripping on the sub-100k range
         assert_eq!(fmt_rate(2000.0), "2k"); // not 2.0k
         assert_eq!(fmt_rate(10000.0), "10k"); // not 10.0k
     }
@@ -275,13 +292,21 @@ mod tests {
 
     /// Helper for the burn_row_label tests below. Builds a
     /// token-mode BurnResult with a fixed rate + pct.
-    fn burn_for_test(rate_per_hour: f64, projected_pct_left: f64,
-                     exhaust_before_reset: bool, unit: &'static str) -> crate::burn::BurnResult {
+    fn burn_for_test(
+        rate_per_hour: f64,
+        projected_pct_left: f64,
+        exhaust_before_reset: bool,
+        unit: &'static str,
+    ) -> crate::burn::BurnResult {
         crate::burn::BurnResult {
             rate_per_hour,
             mode: unit,
             unit,
-            exhaust_ms: if exhaust_before_reset { 60.0 * 60_000.0 } else { f64::INFINITY },
+            exhaust_ms: if exhaust_before_reset {
+                60.0 * 60_000.0
+            } else {
+                f64::INFINITY
+            },
             remaining_ms: 5 * 60 * 60_000,
             exhaust_before_reset,
             projected_pct_left,
@@ -293,16 +318,16 @@ mod tests {
         // Cents/h → $/h, with tier boundaries matching fmt_rate's
         // style. Trailing zeros are stripped at every tier (mirrors
         // `fmt_rate`'s gjs parity rule: `"$1.0k"` → `"$1k"`).
-        assert_eq!(fmt_cost(0.0),       "$0");
-        assert_eq!(fmt_cost(0.5),       "$0.005");   // < $0.01 → 4dp
-        assert_eq!(fmt_cost(1.0),       "$0.01");    // exactly $0.01
-        assert_eq!(fmt_cost(50.0),      "$0.5");     // < $1 → 3dp
-        assert_eq!(fmt_cost(99.0),      "$0.99");
-        assert_eq!(fmt_cost(100.0),     "$1");       // ≥ $1 → 2dp, both zeros stripped
-        assert_eq!(fmt_cost(523.0),     "$5.23");    // typical PAYG burn
-        assert_eq!(fmt_cost(9999.0),    "$99.99");
-        assert_eq!(fmt_cost(10_000.0),  "$100");     // ≥ $100 → integer
-        assert_eq!(fmt_cost(12_345.0),  "$123");
+        assert_eq!(fmt_cost(0.0), "$0");
+        assert_eq!(fmt_cost(0.5), "$0.005"); // < $0.01 → 4dp
+        assert_eq!(fmt_cost(1.0), "$0.01"); // exactly $0.01
+        assert_eq!(fmt_cost(50.0), "$0.5"); // < $1 → 3dp
+        assert_eq!(fmt_cost(99.0), "$0.99");
+        assert_eq!(fmt_cost(100.0), "$1"); // ≥ $1 → 2dp, both zeros stripped
+        assert_eq!(fmt_cost(523.0), "$5.23"); // typical PAYG burn
+        assert_eq!(fmt_cost(9999.0), "$99.99");
+        assert_eq!(fmt_cost(10_000.0), "$100"); // ≥ $100 → integer
+        assert_eq!(fmt_cost(12_345.0), "$123");
         assert_eq!(fmt_cost(999_500.0), "$9995");
     }
 
@@ -320,8 +345,10 @@ mod tests {
     fn burn_row_label_default_uses_tok_h() {
         // Legacy: no count_unit → "tok/h" suffix (matches gjs parity).
         let b = burn_for_test(40.0, 48.0, false, "token");
-        assert_eq!(burn_row_label(&b, None, None, None),
-                   "  · on pace to have ~48% left at reset (40 tok/h)");
+        assert_eq!(
+            burn_row_label(&b, None, None, None),
+            "  · on pace to have ~48% left at reset (40 tok/h)"
+        );
     }
 
     #[test]
@@ -329,8 +356,10 @@ mod tests {
         // OpenRouter / Together / DeepSeek prototype: count_unit="cents".
         // The same rate (40/h) now reads as "$0.4/h".
         let b = burn_for_test(40.0, 48.0, false, "token");
-        assert_eq!(burn_row_label(&b, Some("cents"), Some("USD"), None),
-                   "  · on pace to have ~48% left at reset ($0.4/h)");
+        assert_eq!(
+            burn_row_label(&b, Some("cents"), Some("USD"), None),
+            "  · on pace to have ~48% left at reset ($0.4/h)"
+        );
     }
 
     #[test]
@@ -339,23 +368,29 @@ mod tests {
         // 1000 milliunits/h with our fmt_cost (which treats input as
         // cents/h) renders "$10/h" after trailing-zero strip.
         let b = burn_for_test(1000.0, 50.0, false, "token");
-        assert_eq!(burn_row_label(&b, Some("milliunits"), None, None),
-                   "  · on pace to have ~50% left at reset ($10/h)");
+        assert_eq!(
+            burn_row_label(&b, Some("milliunits"), None, None),
+            "  · on pace to have ~50% left at reset ($10/h)"
+        );
     }
 
     #[test]
     fn burn_row_label_cents_warn_variant() {
         let b = burn_for_test(500.0, 0.0, true, "token");
-        assert_eq!(burn_row_label(&b, Some("cents"), Some("USD"), None),
-                   "  ⚠ $5/h → exhausts ~1h before reset");
+        assert_eq!(
+            burn_row_label(&b, Some("cents"), Some("USD"), None),
+            "  ⚠ $5/h → exhausts ~1h before reset"
+        );
     }
 
     #[test]
     fn burn_row_label_cents_zero_rate_still_renders() {
         // Idle (rate=0) should not emit garbage — fmt_cost returns "$0".
         let b = burn_for_test(0.0, 100.0, false, "token");
-        assert_eq!(burn_row_label(&b, Some("cents"), Some("USD"), None),
-                   "  · on pace to have ~100% left at reset ($0/h)");
+        assert_eq!(
+            burn_row_label(&b, Some("cents"), Some("USD"), None),
+            "  · on pace to have ~100% left at reset ($0/h)"
+        );
     }
 
     #[test]
@@ -364,8 +399,10 @@ mod tests {
         // in %/h, never $/h. Lock this in so the OpenRouter change
         // doesn't accidentally promote a pct window to currency.
         let b = burn_for_test(15.0, 62.0, false, "pct");
-        assert_eq!(burn_row_label(&b, Some("cents"), Some("USD"), None),
-                   "  · on pace to have ~62% left at reset (15/h)");
+        assert_eq!(
+            burn_row_label(&b, Some("cents"), Some("USD"), None),
+            "  · on pace to have ~62% left at reset (15/h)"
+        );
     }
 
     #[test]
@@ -374,15 +411,19 @@ mod tests {
         // with a " · " separator. Sanity-checks the OpenRouter
         // pricing-lookup wiring end-to-end through this function.
         let b = burn_for_test(100_000.0, 50.0, false, "token");
-        assert_eq!(burn_row_label(&b, None, None, Some("$0.4/h")),
-                   "  · on pace to have ~50% left at reset (100k tok/h · $0.4/h)");
+        assert_eq!(
+            burn_row_label(&b, None, None, Some("$0.4/h")),
+            "  · on pace to have ~50% left at reset (100k tok/h · $0.4/h)"
+        );
     }
 
     #[test]
     fn burn_row_label_cost_fragment_works_in_warn_variant() {
         let b = burn_for_test(500_000.0, 0.0, true, "token");
-        assert_eq!(burn_row_label(&b, None, None, Some("$5/h")),
-                   "  ⚠ 500k tok/h · $5/h → exhausts ~1h before reset");
+        assert_eq!(
+            burn_row_label(&b, None, None, Some("$5/h")),
+            "  ⚠ 500k tok/h · $5/h → exhausts ~1h before reset"
+        );
     }
 
     #[test]
@@ -392,8 +433,10 @@ mod tests {
         // lookup found the model). Verify the " · " append is
         // harmless rather than erroring.
         let b = burn_for_test(40.0, 48.0, false, "token");
-        assert_eq!(burn_row_label(&b, Some("cents"), Some("USD"), Some("$0.0001/h")),
-                   "  · on pace to have ~48% left at reset ($0.4/h · $0.0001/h)");
+        assert_eq!(
+            burn_row_label(&b, Some("cents"), Some("USD"), Some("$0.0001/h")),
+            "  · on pace to have ~48% left at reset ($0.4/h · $0.0001/h)"
+        );
     }
 
     #[test]
@@ -402,8 +445,10 @@ mod tests {
         // appended regardless of mode (callers should gate upstream).
         // Lock in current behavior so any future change is intentional.
         let b = burn_for_test(15.0, 62.0, false, "pct");
-        assert_eq!(burn_row_label(&b, None, None, Some("$0.4/h")),
-                   "  · on pace to have ~62% left at reset (15/h · $0.4/h)");
+        assert_eq!(
+            burn_row_label(&b, None, None, Some("$0.4/h")),
+            "  · on pace to have ~62% left at reset (15/h · $0.4/h)"
+        );
     }
 
     #[test]
@@ -417,18 +462,36 @@ mod tests {
         // Length: "  [" (3) + 22 bar chars + " " (1) + "]" (1) = 27 chars
         let filled_count = s.chars().filter(|c| *c == '\u{2588}').count();
         let empty_count = s.chars().filter(|c| *c == '\u{2591}').count();
-        assert_eq!(filled_count + empty_count, 22,
-                   "expected 22 chars between brackets, got {filled_count}+{empty_count}");
+        assert_eq!(
+            filled_count + empty_count,
+            22,
+            "expected 22 chars between brackets, got {filled_count}+{empty_count}"
+        );
         assert_eq!(s.chars().count(), 27);
     }
 
     #[test]
     fn bar_markup_edge_cases() {
-        assert_eq!(bar_markup(0).chars().filter(|c| *c == '\u{2588}').count(), 0);
-        assert_eq!(bar_markup(100).chars().filter(|c| *c == '\u{2588}').count(), 22);
-        assert_eq!(bar_markup(50).chars().filter(|c| *c == '\u{2588}').count(), 11);
+        assert_eq!(
+            bar_markup(0).chars().filter(|c| *c == '\u{2588}').count(),
+            0
+        );
+        assert_eq!(
+            bar_markup(100).chars().filter(|c| *c == '\u{2588}').count(),
+            22
+        );
+        assert_eq!(
+            bar_markup(50).chars().filter(|c| *c == '\u{2588}').count(),
+            11
+        );
         // Clamping
-        assert_eq!(bar_markup(-5).chars().filter(|c| *c == '\u{2588}').count(), 0);
-        assert_eq!(bar_markup(150).chars().filter(|c| *c == '\u{2588}').count(), 22);
+        assert_eq!(
+            bar_markup(-5).chars().filter(|c| *c == '\u{2588}').count(),
+            0
+        );
+        assert_eq!(
+            bar_markup(150).chars().filter(|c| *c == '\u{2588}').count(),
+            22
+        );
     }
 }

@@ -94,7 +94,9 @@ async fn run_watcher(conn: zbus::Connection, tx: mpsc::Sender<NetEvent>) -> Resu
             Ok(v) => v,
             Err(_) => continue,
         };
-        if new_state == last_state { continue; }
+        if new_state == last_state {
+            continue;
+        }
         last_state = new_state;
         let online = new_state == 70;
         let _ = tx.send(NetEvent::Connectivity(online)).await;

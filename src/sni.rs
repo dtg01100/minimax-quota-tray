@@ -9,13 +9,13 @@
 //!
 //! What we expose:
 //!   - `Category`     = "ApplicationStatus"
-//!   - `Id`           = "llm-quota-tray"
-//!   - `Title`        = always `""` (gjs parity — the chip carries
-//!                       the bucket via icon color, never a visible
-//!                       text label; the menu carries the detail)
-//!   - `Status`       = "Active" / "Passive"
-//!   - `IconName`     = PNG path on disk — updated per refresh
-//!   - `Menu`         = `/Menu` (a real dbusmenu tree; see menu module)
+//! - `Id`           = "llm-quota-tray"
+//! - `Title`        = always `""` (gjs parity — the chip carries the
+//!   bucket via icon color, never a visible text label; the menu
+//!   carries the detail)
+//! - `Status`       = "Active" / "Passive"
+//! - `IconName`     = PNG path on disk — updated per refresh
+//! - `Menu`         = `/Menu` (a real dbusmenu tree; see menu module)
 //!
 //! `DBusMenu` (com.canonical.dbusmenu at `/Menu`) backs onto
 //! `crate::menu::MenuInner` for the full menu tree — plan header,
@@ -34,8 +34,8 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use zbus::{interface, object_server::InterfaceRef, Connection};
 use zbus::zvariant::OwnedValue;
+use zbus::{interface, object_server::InterfaceRef, Connection};
 
 use crate::menu::{self, MenuCommand, MenuInner, ROOT_ID};
 
@@ -85,8 +85,13 @@ struct SharedState {
 
 impl SharedState {
     fn new(initial_dashboard_url: String) -> Self {
+        // SNI Title defaults to empty (gjs parity — the chip carries
+        // the bucket via icon color, never a visible text label).
+        // The first `tray.update(...)` from `main::render_initial`
+        // also writes `""`; this default keeps the property truthful
+        // for the brief window before `render_initial` runs.
         Self {
-            title: Mutex::new("MiniMax".to_string()),
+            title: Mutex::new(String::new()),
             icon_name: Mutex::new("dialog-information-symbolic".to_string()),
             status: Mutex::new("Passive".to_string()),
             pixmap: Mutex::new(None),
@@ -182,22 +187,35 @@ impl StatusNotifierItem {
     /// itself is always served regardless of this flag; this just
     /// controls whether the host wires clicks to it.
     #[zbus(property)]
-    async fn item_is_menu(&self) -> bool { true }
+    async fn item_is_menu(&self) -> bool {
+        true
+    }
 
-    async fn activate(&self, _x: i32, _y: i32) -> zbus::fdo::Result<()> { Ok(()) }
+    async fn activate(&self, _x: i32, _y: i32) -> zbus::fdo::Result<()> {
+        Ok(())
+    }
 
-    async fn secondary_activate(&self, _x: i32, _y: i32) -> zbus::fdo::Result<()> { Ok(()) }
+    async fn secondary_activate(&self, _x: i32, _y: i32) -> zbus::fdo::Result<()> {
+        Ok(())
+    }
 
-    async fn scroll(&self, _delta: i32, _orientation: &str) -> zbus::fdo::Result<()> { Ok(()) }
+    async fn scroll(&self, _delta: i32, _orientation: &str) -> zbus::fdo::Result<()> {
+        Ok(())
+    }
 
     #[zbus(signal)]
-    async fn new_icon(_signal_emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
+    async fn new_icon(_signal_emitter: &zbus::object_server::SignalEmitter<'_>)
+        -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn new_title(_signal_emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
+    async fn new_title(
+        _signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+    ) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn new_status(_signal_emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
+    async fn new_status(
+        _signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+    ) -> zbus::Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -214,16 +232,24 @@ pub struct DBusMenu {
 #[interface(name = "com.canonical.dbusmenu")]
 impl DBusMenu {
     #[zbus(property)]
-    fn version(&self) -> u32 { 3 }
+    fn version(&self) -> u32 {
+        3
+    }
 
     #[zbus(property)]
-    fn text_direction(&self) -> String { "ltr".to_string() }
+    fn text_direction(&self) -> String {
+        "ltr".to_string()
+    }
 
     #[zbus(property)]
-    fn status(&self) -> String { "normal".to_string() }
+    fn status(&self) -> String {
+        "normal".to_string()
+    }
 
     #[zbus(property)]
-    fn icon_theme_path(&self) -> Vec<String> { Vec::new() }
+    fn icon_theme_path(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Layout of the subtree rooted at `parent_id`. The
     /// `recursion_depth` is `i32`: -1 means "infinite depth" (we
@@ -237,12 +263,11 @@ impl DBusMenu {
         parent_id: i32,
         recursion_depth: i32,
         _property_names: Vec<String>,
-    ) -> zbus::fdo::Result<(
-        u32,
-        (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>),
-    )> {
+    ) -> zbus::fdo::Result<crate::menu::ItemLayoutResponse> {
         let menu = self.shared.menu_state.lock().await;
-        let recurse = recursion_depth < 0 || recursion_depth > 0;
+        // `recursion_depth` is i32: -1 = "infinite" (we always recurse),
+        // 0 = "just this item", >0 = "descend that many levels".
+        let recurse = recursion_depth != 0;
         Ok(menu::build_layout_response(&menu, parent_id, recurse))
     }
 
@@ -261,34 +286,32 @@ impl DBusMenu {
         Ok(out)
     }
 
-    async fn get_property(
-        &self,
-        id: i32,
-        name: String,
-    ) -> zbus::fdo::Result<OwnedValue> {
+    async fn get_property(&self, id: i32, name: String) -> zbus::fdo::Result<OwnedValue> {
         let menu = self.shared.menu_state.lock().await;
         let Some(item) = menu.item(id) else {
             return Ok(OwnedValue::from(zbus::zvariant::Str::from("")));
         };
         let props = menu::build_properties(item);
-        Ok(props.get(&name).cloned()
+        Ok(props
+            .get(&name)
+            .cloned()
             .unwrap_or_else(|| OwnedValue::from(zbus::zvariant::Str::from(""))))
     }
 
     /// Handle user actions on menu items.
     ///   - `event_id = "clicked"` — fire the action (Refresh, etc.)
     ///   - anything else — no-op
-    async fn event(
-        &self,
-        id: i32,
-        event_id: String,
-        _data: OwnedValue,
-        _timestamp: u32,
-    ) {
-        if event_id != "clicked" { return; }
+    async fn event(&self, id: i32, event_id: String, _data: OwnedValue, _timestamp: u32) {
+        if event_id != "clicked" {
+            return;
+        }
         let menu = self.shared.menu_state.lock().await;
-        let Some(item) = menu.item(id) else { return; };
-        let Some(cmd) = item.action.clone() else { return; };
+        let Some(item) = menu.item(id) else {
+            return;
+        };
+        let Some(cmd) = item.action.clone() else {
+            return;
+        };
         drop(menu);
         // best-effort dispatch — the receiver might have been dropped
         // if the main loop has exited; in that case the click is just
@@ -296,10 +319,7 @@ impl DBusMenu {
         let _ = self.cmd_tx.send(cmd).await;
     }
 
-    async fn event_group(
-        &self,
-        events: Vec<(i32, String, OwnedValue, u32)>,
-    ) -> Vec<i32> {
+    async fn event_group(&self, events: Vec<(i32, String, OwnedValue, u32)>) -> Vec<i32> {
         for (id, event_id, data, ts) in events {
             self.event(id, event_id, data, ts).await;
         }
@@ -311,12 +331,13 @@ impl DBusMenu {
     /// ItemsUpdated + LayoutUpdated + ItemPropertiesUpdated signals
     /// when state actually changes, so the client never needs a
     /// hint-driven re-fetch.
-    async fn about_to_show(&self, _id: i32) -> bool { false }
+    async fn about_to_show(&self, _id: i32) -> bool {
+        false
+    }
 
-    async fn about_to_show_group(
-        &self,
-        _ids: Vec<i32>,
-    ) -> (Vec<i32>, Vec<i32>) { (Vec::new(), Vec::new()) }
+    async fn about_to_show_group(&self, _ids: Vec<i32>) -> (Vec<i32>, Vec<i32>) {
+        (Vec::new(), Vec::new())
+    }
 
     /// dbusmenu ItemsUpdated signal. The spec signature is
     /// `(update_id: u, removed_ids: a(ias))`. A missing
@@ -393,13 +414,18 @@ impl Tray {
             .await
             .context("build connection")?;
 
-        let sni_iface = StatusNotifierItem { shared: Arc::clone(&shared) };
+        let sni_iface = StatusNotifierItem {
+            shared: Arc::clone(&shared),
+        };
         conn.object_server()
             .at(SNI_PATH, sni_iface)
             .await
             .context("export SNI object")?;
 
-        let menu_iface = DBusMenu { shared: Arc::clone(&shared), cmd_tx: cmd_tx.clone() };
+        let menu_iface = DBusMenu {
+            shared: Arc::clone(&shared),
+            cmd_tx: cmd_tx.clone(),
+        };
         conn.object_server()
             .at(MENU_PATH, menu_iface)
             .await
@@ -418,7 +444,9 @@ impl Tray {
             .context("look up dbusmenu interface ref")?;
 
         if let Err(e) = register_with_watcher(&conn).await {
-            log::debug!("explicit RegisterStatusNotifierItem failed (auto-discovery still applies): {e}");
+            log::debug!(
+                "explicit RegisterStatusNotifierItem failed (auto-discovery still applies): {e}"
+            );
         }
 
         Ok(Self {
@@ -432,16 +460,16 @@ impl Tray {
     }
 
     /// Update the SNI chip (title, icon, status, optional pixmap, and
-/// accessibility tooltip). Called from the polling loop on every
-/// refresh. Emits NewIcon/NewTitle/NewStatus signals.
-///
-/// `tool_tip_desc` is the second argument of gjs's libayatana
-/// `set_label(label, guide)` (the `guide`). On hosts that surface
-/// SNI ToolTip, the description appears on hover; on hosts that
-/// don't, the menu and chip are unaffected. Defaults to empty
-/// (gjs's "no API key" / "offline" states use a plain plan label,
-/// not a detailed percentage — pass "" to match).
-pub async fn update(
+    /// accessibility tooltip). Called from the polling loop on every
+    /// refresh. Emits NewIcon/NewTitle/NewStatus signals.
+    ///
+    /// `tool_tip_desc` is the second argument of gjs's libayatana
+    /// `set_label(label, guide)` (the `guide`). On hosts that surface
+    /// SNI ToolTip, the description appears on hover; on hosts that
+    /// don't, the menu and chip are unaffected. Defaults to empty
+    /// (gjs's "no API key" / "offline" states use a plain plan label,
+    /// not a detailed percentage — pass "" to match).
+    pub async fn update(
         &self,
         title: &str,
         icon_name: &str,
@@ -462,9 +490,15 @@ pub async fn update(
         }
         *self.shared.tool_tip_desc.lock().await = tool_tip_desc.to_string();
         let emitter = self.iface_ref.signal_emitter();
-        StatusNotifierItem::new_icon(emitter).await.context("emit NewIcon")?;
-        StatusNotifierItem::new_title(emitter).await.context("emit NewTitle")?;
-        StatusNotifierItem::new_status(emitter).await.context("emit NewStatus")?;
+        StatusNotifierItem::new_icon(emitter)
+            .await
+            .context("emit NewIcon")?;
+        StatusNotifierItem::new_title(emitter)
+            .await
+            .context("emit NewTitle")?;
+        StatusNotifierItem::new_status(emitter)
+            .await
+            .context("emit NewStatus")?;
         Ok(())
     }
 
@@ -502,9 +536,11 @@ pub async fn update(
         let emitter = self.menu_iface_ref.signal_emitter();
         if new_revision != prev_revision {
             DBusMenu::items_updated(emitter, new_revision, Vec::new())
-                .await.context("emit ItemsUpdated")?;
+                .await
+                .context("emit ItemsUpdated")?;
             DBusMenu::layout_updated(emitter, new_revision, ROOT_ID)
-                .await.context("emit LayoutUpdated")?;
+                .await
+                .context("emit LayoutUpdated")?;
         }
         Ok(())
     }
@@ -572,8 +608,10 @@ mod tests {
 
     #[test]
     fn interface_name_constant() {
-        assert_eq!(StatusNotifierItem::name().as_str(),
-                  "org.kde.StatusNotifierItem");
+        assert_eq!(
+            StatusNotifierItem::name().as_str(),
+            "org.kde.StatusNotifierItem"
+        );
     }
 
     #[test]
@@ -594,9 +632,18 @@ mod tests {
         // directly, so this is mostly a sanity check that the IDs
         // line up.
         use crate::menu::*;
-        assert_eq!(s.item(REFRESH_ID).unwrap().action, Some(MenuCommand::Refresh));
-        assert_eq!(s.item(DASHBOARD_ID).unwrap().action, Some(MenuCommand::OpenDashboard));
-        assert_eq!(s.item(SET_KEY_ID).unwrap().action, Some(MenuCommand::SetApiKey));
+        assert_eq!(
+            s.item(REFRESH_ID).unwrap().action,
+            Some(MenuCommand::Refresh)
+        );
+        assert_eq!(
+            s.item(DASHBOARD_ID).unwrap().action,
+            Some(MenuCommand::OpenDashboard)
+        );
+        assert_eq!(
+            s.item(SET_KEY_ID).unwrap().action,
+            Some(MenuCommand::SetApiKey)
+        );
         assert_eq!(s.item(QUIT_ID).unwrap().action, Some(MenuCommand::Quit));
     }
 
@@ -617,8 +664,10 @@ mod tests {
     fn shared_state_initial() {
         let s = SharedState::new("https://example.invalid/dashboard".to_string());
         // Synchronous fields only — title/icon_name/status are async-locked.
-        assert_eq!(s.dashboard_url.try_lock().unwrap().clone(),
-                   "https://example.invalid/dashboard");
+        assert_eq!(
+            s.dashboard_url.try_lock().unwrap().clone(),
+            "https://example.invalid/dashboard"
+        );
         // ToolTip desc defaults to empty (no data yet).
         assert_eq!(s.tool_tip_desc.try_lock().unwrap().clone(), "");
     }

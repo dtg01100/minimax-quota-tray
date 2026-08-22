@@ -221,12 +221,11 @@ mod tests {
             Some(v) => std::env::set_var("LLM_API_KEY", v),
             None => std::env::remove_var("LLM_API_KEY"),
         }
-        let result = body();
+        body();
         match prev {
             Some(v) => std::env::set_var("LLM_API_KEY", v),
             None => std::env::remove_var("LLM_API_KEY"),
         }
-        result
     }
 
     #[test]
@@ -243,8 +242,10 @@ mod tests {
 
     #[test]
     fn secret_with_leading_and_trailing_whitespace_is_trimmed() {
-        assert_eq!(secret_to_key(b"  sk-test-key  \r\n").as_deref(),
-                   Some("sk-test-key"));
+        assert_eq!(
+            secret_to_key(b"  sk-test-key  \r\n").as_deref(),
+            Some("sk-test-key")
+        );
     }
 
     #[test]
@@ -260,7 +261,10 @@ mod tests {
 
     #[test]
     fn clean_secret_passes_through_unchanged() {
-        assert_eq!(secret_to_key(b"sk-clean-key").as_deref(), Some("sk-clean-key"));
+        assert_eq!(
+            secret_to_key(b"sk-clean-key").as_deref(),
+            Some("sk-clean-key")
+        );
     }
 
     #[test]
@@ -296,8 +300,9 @@ mod tests {
     #[test]
     fn legacy_key_path_under_home() {
         let path = legacy_key_path();
-        assert!(path.starts_with(std::env::var("HOME").unwrap_or_default())
-                || path.starts_with("/tmp"));
+        assert!(
+            path.starts_with(std::env::var("HOME").unwrap_or_default()) || path.starts_with("/tmp")
+        );
         assert!(path.ends_with(".config/.config/llm-quota-tray/key"));
     }
 
@@ -318,8 +323,10 @@ mod tests {
         std::env::set_var("PATH", "");
         std::env::set_var("HOME", &tmp);
 
-        assert!(!legacy_key_path().exists(),
-                "precondition: legacy file should not exist yet");
+        assert!(
+            !legacy_key_path().exists(),
+            "precondition: legacy file should not exist yet"
+        );
 
         set("test-key-12345").unwrap();
         assert_eq!(
@@ -328,8 +335,10 @@ mod tests {
         );
 
         clear().unwrap();
-        assert!(!legacy_key_path().exists(),
-                "clear() should remove the legacy file");
+        assert!(
+            !legacy_key_path().exists(),
+            "clear() should remove the legacy file"
+        );
 
         // Restore env so other tests aren't affected.
         match saved_path {

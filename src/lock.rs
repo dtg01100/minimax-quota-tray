@@ -50,7 +50,9 @@ impl Lock {
             }
             Err(e) => {
                 return Err(anyhow::anyhow!(
-                    "create lock file at {}: {e}", path.display()));
+                    "create lock file at {}: {e}",
+                    path.display()
+                ));
             }
         }
 
@@ -103,7 +105,7 @@ mod tests {
     /// Override HOME/XDG_RUNTIME_DIR to a temp dir so the lock
     /// doesn't stomp on a real one during tests.
     fn isolated_lock_path() {
-        let tmp = std::env::temp_dir().join("minimax-lock-test");
+        let tmp = std::env::temp_dir().join("llm-quota-lock-test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("XDG_RUNTIME_DIR", &tmp);
         let _ = std::fs::create_dir_all(&tmp);
@@ -116,7 +118,10 @@ mod tests {
         let lock = Lock::acquire().expect("acquire").expect("not held");
         // Second acquire should refuse.
         let second = Lock::acquire().expect("acquire2");
-        assert!(second.is_none(), "second acquire should fail while first holds");
+        assert!(
+            second.is_none(),
+            "second acquire should fail while first holds"
+        );
         lock.release();
         // Now third acquire should succeed.
         let third = Lock::acquire().expect("acquire3").expect("free");

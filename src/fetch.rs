@@ -26,8 +26,7 @@ pub use reqwest::blocking::Client as HttpClient;
 
 /// Build a shared blocking reqwest client. TLS via rustls.
 pub fn build_client(user_agent_prefix: &str) -> Result<Client> {
-    let user_agent = format!("{}/{}",
-        user_agent_prefix, env!("CARGO_PKG_VERSION"));
+    let user_agent = format!("{}/{}", user_agent_prefix, env!("CARGO_PKG_VERSION"));
     Client::builder()
         .user_agent(user_agent)
         .timeout(std::time::Duration::from_secs(15))
@@ -92,66 +91,62 @@ pub fn fetch_windows_blocking(
 
 /// Strip anything that looks like a credential from an error snippet
 /// before it's surfaced in the menu's error row. The first 80 bytes
-/// are kept (gjs's `slice(0, 80)`); `Bearer ...`, `Authorization ...`,
-/// and `api[-_]key ...` patterns are replaced with `[redacted]`.
+/// are kept (gjs's `slice(0, 80)`); **any line** containing one of
+/// the trigger words (`bearer`, `authorization`, `api-key`,
+/// `api_key`, `token`) is replaced with `[redacted line]`, so the
+/// pattern doesn't need to predict the separator (`:`, `=`, `-`,
+/// etc.) that follows the trigger.
+///
+/// Whole-line redaction is intentional and conservative: a partial
+/// redact like `Bearer ***` would still leak the *shape* of the
+/// credential and miss keys that share the prefix
+/// (e.g. `X-Bearer-Auth: foo`). Redacting the whole line tells the
+/// user "a credential was here" without exposing the value or its
+/// structure.
 pub fn sanitize_error_snippet(raw: &str) -> String {
     let truncated: String = raw.chars().take(80).collect();
-    regex_lite_redact(&truncated)
+    redact_credential_lines(&truncated)
 }
 
-/// Inline lightweight regex substitute — we don't pull the `regex`
-/// crate for one pattern.
-fn regex_lite_redact(s: &str) -> String {
-    let bytes = s.as_bytes();
+/// Patterns that, when found in a line, trigger whole-line redaction.
+/// Lowercase comparison — `Authorization` and `authorization` both
+/// match. `token` is included so providers that echo a `token=...`
+/// in error bodies (some OAuth flows, e.g. Anthropic's
+/// `x-auth-token` family) are caught.
+const TRIGGER_PATTERNS: &[&str] = &["bearer", "authorization", "api-key", "api_key", "token"];
+
+/// O(n) per-line scan. The truncated snippet is at most 80 chars
+/// and rarely contains more than one or two newlines, so this
+/// avoids the `regex` crate's footprint.
+fn redact_credential_lines(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut i = 0;
     let lower = s.to_ascii_lowercase();
-    while i < bytes.len() {
-        if let Some((rel, end)) = find_match(&lower, i) {
-            out.push_str(&s[i..i + rel]);
-            out.push_str("[redacted]");
-            i = end;
-        } else {
-            out.push_str(&s[i..]);
-            break;
+    let mut line_start = 0usize;
+    for (i, ch) in s.char_indices() {
+        // Newline ends a line — flush the accumulated line and
+        // reset for the next one. `char_indices` advances past
+        // multi-byte chars safely.
+        if ch == '\n' {
+            flush_line(&mut out, &s[line_start..i], &lower[line_start..i]);
+            line_start = i + ch.len_utf8();
         }
     }
+    // Tail after the last newline.
+    flush_line(&mut out, &s[line_start..], &lower[line_start..]);
     out
 }
 
-fn find_match(lower: &str, start: usize) -> Option<(usize, usize)> {
-    let bytes = lower.as_bytes();
-    if start >= bytes.len() {
-        return None;
+fn flush_line(out: &mut String, line: &str, lower: &str) {
+    if lower.contains(TRIGGER_PATTERNS[0])
+        || lower.contains(TRIGGER_PATTERNS[1])
+        || lower.contains(TRIGGER_PATTERNS[2])
+        || lower.contains(TRIGGER_PATTERNS[3])
+        || lower.contains(TRIGGER_PATTERNS[4])
+    {
+        out.push_str("[redacted line]");
+    } else {
+        out.push_str(line);
     }
-    let patterns: &[&str] = &["bearer", "authorization", "api-key", "api_key"];
-    for idx in start..bytes.len() {
-        for pat in patterns {
-            if lower[idx..].starts_with(pat) {
-                let after_pat = idx + pat.len();
-                let mut k = after_pat;
-                if k < bytes.len() && (bytes[k] == b':' || bytes[k] == b'=') {
-                    k += 1;
-                }
-                while k < bytes.len() && (bytes[k] as char).is_ascii_whitespace() {
-                    k += 1;
-                }
-                let cred_start = k;
-                while k < bytes.len() && is_cred_char(bytes[k]) {
-                    k += 1;
-                }
-                if k > cred_start {
-                    return Some((idx, k));
-                }
-                break;
-            }
-        }
-    }
-    None
-}
-
-fn is_cred_char(b: u8) -> bool {
-    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'+' | b'/' | b'=')
 }
 
 /// Generic provider-error-envelope reader. Reads the integer status
@@ -163,7 +158,10 @@ fn is_cred_char(b: u8) -> bool {
 /// the body (`{"base_resp": {"status_code": 1004, "status_msg":
 /// "login fail: ..."}}`). Providers that use standard HTTP status
 /// codes only should set `error_envelope: None` in their `PlanShape`.
-fn envelope_error(body: &Value, envelope: Option<&crate::provider::ErrorEnvelope>) -> Option<String> {
+fn envelope_error(
+    body: &Value,
+    envelope: Option<&crate::provider::ErrorEnvelope>,
+) -> Option<String> {
     let env = envelope?;
     let code = body.pointer(&env.code_path).and_then(|c| c.as_i64())?;
     if env.success_codes.contains(&code) {
@@ -298,7 +296,9 @@ mod tests {
 
     #[test]
     fn auth_header_custom_name() {
-        let cfg = AuthConfig::Header { name: "x-api-key".to_string() };
+        let cfg = AuthConfig::Header {
+            name: "x-api-key".to_string(),
+        };
         let (name, value) = cfg.build("sk-test");
         assert_eq!(name, "x-api-key");
         assert_eq!(value, "sk-test");
@@ -317,18 +317,25 @@ mod tests {
 
     #[test]
     fn auth_query_param_appends_to_endpoint() {
-        let cfg = AuthConfig::QueryParam { name: "key".to_string() };
+        let cfg = AuthConfig::QueryParam {
+            name: "key".to_string(),
+        };
         let (name, _) = cfg.build("sk-test");
-        assert_eq!(name, "");  // no header
+        assert_eq!(name, ""); // no header
         let modified = cfg.apply_to_endpoint("https://api.example.com/v1/usage", "sk-test");
         assert_eq!(modified, "https://api.example.com/v1/usage?key=sk-test");
     }
 
     #[test]
     fn auth_query_param_preserves_existing_query() {
-        let cfg = AuthConfig::QueryParam { name: "key".to_string() };
+        let cfg = AuthConfig::QueryParam {
+            name: "key".to_string(),
+        };
         let modified = cfg.apply_to_endpoint("https://api.example.com/v1/usage?foo=bar", "sk-test");
-        assert_eq!(modified, "https://api.example.com/v1/usage?foo=bar&key=sk-test");
+        assert_eq!(
+            modified,
+            "https://api.example.com/v1/usage?foo=bar&key=sk-test"
+        );
     }
 
     #[test]

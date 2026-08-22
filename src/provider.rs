@@ -21,8 +21,9 @@
 //!   - lock file   → `${XDG_RUNTIME_DIR}/<base>-<name>.pid`
 //!   - keyring app → `<base>-<name>`
 //!
-//! where `<base>` is `minimax-quota`. Two instances never collide on
-//! disk, in the keyring, or in the PID lock.
+//! where `<base>` is `llm-quota-tray` (see `crate::instance`). Two
+//! instances never collide on disk, in the keyring, or in the PID
+//! lock.
 //!
 //! Each instance is its own tray icon (different chip, different
 //! colors, different menu). Each can target a different API (via
@@ -36,7 +37,7 @@
 //!
 //! ```bash
 //! llm-quota-tray --instance=codex
-//! # then write ~/.config/minimax-quota-codex/config.json
+//! # then write ~/.config/llm-quota-tray-codex/config.json
 //! ```
 //!
 //! For a brand-new JSON shape, edit the per-instance config to
@@ -114,8 +115,8 @@ impl From<RingColorsRepr> for RingColors {
         } else if r.normal.is_some() || r.warning.is_some() || r.throttled.is_some() {
             // Legacy shape — pull bucket colors off the top level.
             BucketColors {
-                normal:   r.normal.unwrap_or_default(),
-                warning:  r.warning.unwrap_or_default(),
+                normal: r.normal.unwrap_or_default(),
+                warning: r.warning.unwrap_or_default(),
                 throttled: r.throttled.unwrap_or_default(),
             }
         } else {
@@ -145,8 +146,8 @@ pub struct BucketColors {
 /// dark panel themes.
 pub fn default_inner_colors() -> BucketColors {
     BucketColors {
-        normal:   "#3a9d4d".to_string(),
-        warning:  "#f6d32d".to_string(),
+        normal: "#3a9d4d".to_string(),
+        warning: "#f6d32d".to_string(),
         throttled: "#e01b24".to_string(),
     }
 }
@@ -157,7 +158,9 @@ pub fn default_inner_colors() -> BucketColors {
 pub const DEFAULT_OUTER_COLOR: &str = "#3584e4";
 
 impl Default for RingColors {
-    fn default() -> Self { default_ring_colors() }
+    fn default() -> Self {
+        default_ring_colors()
+    }
 }
 
 /// Compile-time default ring colors. Used when config.json omits
@@ -180,11 +183,12 @@ pub fn default_ring_colors() -> RingColors {
 /// Serialized as a tagged enum — `"auth": {"type": "bearer"}` etc.
 /// The runtime is `&'static str` for the header NAME so reqwest can
 /// hold it without a heap allocation per request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthConfig {
     /// `Authorization: Bearer <key>` — the common case
     /// (OpenAI, Anthropic, Mistral, MiniMax, …).
+    #[default]
     Bearer,
 
     /// `<header_name>: <key>` — e.g. `x-api-key`, `x-goog-api-key`.
@@ -202,10 +206,6 @@ pub enum AuthConfig {
     QueryParam { name: String },
 }
 
-impl Default for AuthConfig {
-    fn default() -> Self { AuthConfig::Bearer }
-}
-
 impl AuthConfig {
     /// Build `(header_name, header_value)` for a request. Returns
     /// `("", "")` for `QueryParam` — the caller appends the param
@@ -215,14 +215,10 @@ impl AuthConfig {
     /// `header(name, value)` accepts either `&str` or `String`.
     pub fn build(&self, api_key: &str) -> (String, String) {
         match self {
-            AuthConfig::Bearer =>
-                ("Authorization".to_string(), format!("Bearer {api_key}")),
-            AuthConfig::Header { name } =>
-                (name.clone(), api_key.to_string()),
-            AuthConfig::Custom { name, format } =>
-                (name.clone(), format.replace("{key}", api_key)),
-            AuthConfig::QueryParam { .. } =>
-                (String::new(), String::new()),
+            AuthConfig::Bearer => ("Authorization".to_string(), format!("Bearer {api_key}")),
+            AuthConfig::Header { name } => (name.clone(), api_key.to_string()),
+            AuthConfig::Custom { name, format } => (name.clone(), format.replace("{key}", api_key)),
+            AuthConfig::QueryParam { .. } => (String::new(), String::new()),
         }
     }
 
@@ -376,7 +372,9 @@ pub fn default_shape() -> PlanShape {
 }
 
 impl Default for PlanShape {
-    fn default() -> Self { default_shape() }
+    fn default() -> Self {
+        default_shape()
+    }
 }
 
 // ============================================================================

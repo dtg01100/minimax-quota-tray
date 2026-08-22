@@ -92,9 +92,15 @@ pub const SEP_3_ID: i32 = 305;
 pub const QUIT_ID: i32 = 306;
 
 /// Per-window base id: id, id+1 (bar), id+2 (burn).
-pub fn window_id(idx: usize) -> i32 { 100 + (idx as i32) * 3 }
-pub fn bar_id(idx: usize) -> i32 { 100 + (idx as i32) * 3 + 1 }
-pub fn burn_id(idx: usize) -> i32 { 100 + (idx as i32) * 3 + 2 }
+pub fn window_id(idx: usize) -> i32 {
+    100 + (idx as i32) * 3
+}
+pub fn bar_id(idx: usize) -> i32 {
+    100 + (idx as i32) * 3 + 1
+}
+pub fn burn_id(idx: usize) -> i32 {
+    100 + (idx as i32) * 3 + 2
+}
 
 /// One menu item.
 #[derive(Debug, Clone)]
@@ -165,7 +171,9 @@ pub struct MenuInner {
 }
 
 impl Default for MenuInner {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MenuInner {
@@ -175,38 +183,73 @@ impl MenuInner {
         // Root
         items.insert(ROOT_ID, MenuItem::standard(ROOT_ID, "", true, true));
         // Static items
-        items.insert(HEADER_ID, MenuItem::standard(HEADER_ID, "Plan: …", false, true));
-        items.insert(THROTTLED_ID, MenuItem::standard(THROTTLED_ID, "", false, false));
+        items.insert(
+            HEADER_ID,
+            MenuItem::standard(HEADER_ID, "Plan: …", false, true),
+        );
+        items.insert(
+            THROTTLED_ID,
+            MenuItem::standard(THROTTLED_ID, "", false, false),
+        );
         items.insert(ERROR_ID, MenuItem::standard(ERROR_ID, "", false, false));
         items.insert(SEP_1_ID, MenuItem::separator(SEP_1_ID));
-        items.insert(REFRESH_ID, MenuItem::action(REFRESH_ID, "Refresh now", MenuCommand::Refresh));
+        items.insert(
+            REFRESH_ID,
+            MenuItem::action(REFRESH_ID, "Refresh now", MenuCommand::Refresh),
+        );
         items.insert(SEP_2_ID, MenuItem::separator(SEP_2_ID));
-        items.insert(DASHBOARD_ID, MenuItem::action(DASHBOARD_ID, "Open dashboard", MenuCommand::OpenDashboard));
-        items.insert(SET_KEY_ID, MenuItem::action(SET_KEY_ID, "Set API Key…", MenuCommand::SetApiKey));
+        items.insert(
+            DASHBOARD_ID,
+            MenuItem::action(DASHBOARD_ID, "Open dashboard", MenuCommand::OpenDashboard),
+        );
+        items.insert(
+            SET_KEY_ID,
+            MenuItem::action(SET_KEY_ID, "Set API Key…", MenuCommand::SetApiKey),
+        );
         items.insert(SEP_3_ID, MenuItem::separator(SEP_3_ID));
-        items.insert(QUIT_ID, MenuItem::action(QUIT_ID, "Quit", MenuCommand::Quit));
+        items.insert(
+            QUIT_ID,
+            MenuItem::action(QUIT_ID, "Quit", MenuCommand::Quit),
+        );
         // Initial root children (no window slots yet; rebuild_window_rows grows this).
         let root_children = vec![
             HEADER_ID,
             THROTTLED_ID,
             ERROR_ID,
-            SEP_1_ID, REFRESH_ID, SEP_2_ID, DASHBOARD_ID, SET_KEY_ID,
-            SEP_3_ID, QUIT_ID,
+            SEP_1_ID,
+            REFRESH_ID,
+            SEP_2_ID,
+            DASHBOARD_ID,
+            SET_KEY_ID,
+            SEP_3_ID,
+            QUIT_ID,
         ];
         children_of.insert(ROOT_ID, root_children);
 
-        Self { items, children_of, revision: 1, max_window_slots: 0 }
+        Self {
+            items,
+            children_of,
+            revision: 1,
+            max_window_slots: 0,
+        }
     }
 
     /// Current revision number (incremented on each `bump_revision` call).
-    pub fn revision(&self) -> u32 { self.revision }
+    pub fn revision(&self) -> u32 {
+        self.revision
+    }
 
     /// Bump the revision counter (call after every state change).
-    pub fn bump_revision(&mut self) { self.revision = self.revision.wrapping_add(1); }
+    pub fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
 
     /// Children of `parent_id` in render order.
     pub fn children(&self, parent_id: i32) -> &[i32] {
-        self.children_of.get(&parent_id).map(|v| v.as_slice()).unwrap_or(&[])
+        self.children_of
+            .get(&parent_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Get an item by id.
@@ -226,20 +269,42 @@ impl MenuInner {
 
     /// Update throttled row label and visibility.
     pub fn set_throttled(&mut self, text: &str, visible: bool) {
-        let item = self.items.entry(THROTTLED_ID).or_insert_with(|| MenuItem::standard(THROTTLED_ID, "", false, false));
+        let item = self
+            .items
+            .entry(THROTTLED_ID)
+            .or_insert_with(|| MenuItem::standard(THROTTLED_ID, "", false, false));
         let mut changed = false;
-        if item.label != text { item.label = text.to_string(); changed = true; }
-        if item.visible != visible { item.visible = visible; changed = true; }
-        if changed { self.bump_revision(); }
+        if item.label != text {
+            item.label = text.to_string();
+            changed = true;
+        }
+        if item.visible != visible {
+            item.visible = visible;
+            changed = true;
+        }
+        if changed {
+            self.bump_revision();
+        }
     }
 
     /// Update error row label and visibility.
     pub fn set_error(&mut self, text: &str, visible: bool) {
-        let item = self.items.entry(ERROR_ID).or_insert_with(|| MenuItem::standard(ERROR_ID, "", false, false));
+        let item = self
+            .items
+            .entry(ERROR_ID)
+            .or_insert_with(|| MenuItem::standard(ERROR_ID, "", false, false));
         let mut changed = false;
-        if item.label != text { item.label = text.to_string(); changed = true; }
-        if item.visible != visible { item.visible = visible; changed = true; }
-        if changed { self.bump_revision(); }
+        if item.label != text {
+            item.label = text.to_string();
+            changed = true;
+        }
+        if item.visible != visible {
+            item.visible = visible;
+            changed = true;
+        }
+        if changed {
+            self.bump_revision();
+        }
     }
 
     /// Rebuild the window-row section in place. `labels` are the per-window
@@ -268,9 +333,15 @@ impl MenuInner {
                 let lid = window_id(idx);
                 let bid = bar_id(idx);
                 let bid2 = burn_id(idx);
-                self.items.entry(lid).or_insert_with(|| MenuItem::standard(lid, "", false, false));
-                self.items.entry(bid).or_insert_with(|| MenuItem::standard(bid, "", false, false));
-                self.items.entry(bid2).or_insert_with(|| MenuItem::standard(bid2, "", false, false));
+                self.items
+                    .entry(lid)
+                    .or_insert_with(|| MenuItem::standard(lid, "", false, false));
+                self.items
+                    .entry(bid)
+                    .or_insert_with(|| MenuItem::standard(bid, "", false, false));
+                self.items
+                    .entry(bid2)
+                    .or_insert_with(|| MenuItem::standard(bid2, "", false, false));
             }
             self.max_window_slots = n;
             self.extend_root_children_with_new_slots(self.max_window_slots);
@@ -285,37 +356,73 @@ impl MenuInner {
             let bar_label = bars[idx].clone();
 
             // Label item
-            let label_item = self.items.entry(lid)
+            let label_item = self
+                .items
+                .entry(lid)
                 .or_insert_with(|| MenuItem::standard(lid, "", false, true));
             let mut changed = false;
-            if label_item.label != row_label { label_item.label = row_label; changed = true; }
-            if !label_item.visible { label_item.visible = true; changed = true; }
-            if changed { self.bump_revision(); }
+            if label_item.label != row_label {
+                label_item.label = row_label;
+                changed = true;
+            }
+            if !label_item.visible {
+                label_item.visible = true;
+                changed = true;
+            }
+            if changed {
+                self.bump_revision();
+            }
 
             // Bar item
-            let bar_item = self.items.entry(bid)
+            let bar_item = self
+                .items
+                .entry(bid)
                 .or_insert_with(|| MenuItem::standard(bid, "", false, true));
             let mut changed = false;
-            if bar_item.label != bar_label { bar_item.label = bar_label; changed = true; }
-            if !bar_item.visible { bar_item.visible = true; changed = true; }
-            if changed { self.bump_revision(); }
+            if bar_item.label != bar_label {
+                bar_item.label = bar_label;
+                changed = true;
+            }
+            if !bar_item.visible {
+                bar_item.visible = true;
+                changed = true;
+            }
+            if changed {
+                self.bump_revision();
+            }
 
             // Burn row
             let bid2 = burn_id(idx);
-            let entry = self.items.entry(bid2)
+            let entry = self
+                .items
+                .entry(bid2)
                 .or_insert_with(|| MenuItem::standard(bid2, "", false, false));
             let mut changed = false;
             match burn {
                 Some(text) => {
-                    if entry.label != text { entry.label = text; changed = true; }
-                    if !entry.visible { entry.visible = true; changed = true; }
+                    if entry.label != text {
+                        entry.label = text;
+                        changed = true;
+                    }
+                    if !entry.visible {
+                        entry.visible = true;
+                        changed = true;
+                    }
                 }
                 None => {
-                    if entry.visible { entry.visible = false; changed = true; }
-                    if !entry.label.is_empty() { entry.label = String::new(); changed = true; }
+                    if entry.visible {
+                        entry.visible = false;
+                        changed = true;
+                    }
+                    if !entry.label.is_empty() {
+                        entry.label = String::new();
+                        changed = true;
+                    }
                 }
             }
-            if changed { self.bump_revision(); }
+            if changed {
+                self.bump_revision();
+            }
         }
         // Hide any stale window slots above the current count, but keep
         // them in the children list so the IDs are reserved.
@@ -326,11 +433,19 @@ impl MenuInner {
             let mut changed = false;
             for id in [lid, bid, bid2] {
                 if let Some(it) = self.items.get_mut(&id) {
-                    if it.visible { it.visible = false; changed = true; }
-                    if !it.label.is_empty() { it.label = String::new(); changed = true; }
+                    if it.visible {
+                        it.visible = false;
+                        changed = true;
+                    }
+                    if !it.label.is_empty() {
+                        it.label = String::new();
+                        changed = true;
+                    }
                 }
             }
-            if changed { self.bump_revision(); }
+            if changed {
+                self.bump_revision();
+            }
         }
     }
 
@@ -340,7 +455,11 @@ impl MenuInner {
     fn extend_root_children_with_new_slots(&mut self, total: usize) {
         let root = self.children_of.entry(ROOT_ID).or_default();
         // Find the position to insert (HEADER_ID + 1, before THROTTLED_ID/ERROR_ID).
-        let insert_at = root.iter().position(|&x| x == HEADER_ID).map(|i| i + 1).unwrap_or(0);
+        let insert_at = root
+            .iter()
+            .position(|&x| x == HEADER_ID)
+            .map(|i| i + 1)
+            .unwrap_or(0);
         // Build the new window slots in order.
         let new_slots: Vec<i32> = (0..total)
             .flat_map(|idx| vec![window_id(idx), bar_id(idx), burn_id(idx)])
@@ -366,12 +485,18 @@ pub fn build_properties(item: &MenuItem) -> HashMap<String, OwnedValue> {
         props.insert("enabled".into(), OwnedValue::from(false));
     } else {
         props.insert("type".into(), OwnedValue::from(Str::from("standard")));
-        props.insert("label".into(), OwnedValue::from(Str::from(item.label.as_str())));
+        props.insert(
+            "label".into(),
+            OwnedValue::from(Str::from(item.label.as_str())),
+        );
         props.insert("enabled".into(), OwnedValue::from(item.enabled));
         props.insert("visible".into(), OwnedValue::from(item.visible));
         // children-display = "never" for our leaf items so the panel
         // doesn't render submenu arrows on plain rows.
-        props.insert("children-display".into(), OwnedValue::from(Str::from("never")));
+        props.insert(
+            "children-display".into(),
+            OwnedValue::from(Str::from("never")),
+        );
     }
     props
 }
@@ -380,11 +505,7 @@ pub fn build_properties(item: &MenuItem) -> HashMap<String, OwnedValue> {
 /// wrapped in an `OwnedValue` carrying its `(id, props)` structure.
 /// If `recurse` is true (depth < 0 or depth > 0), descendants' children
 /// are also populated; otherwise children are represented as empty.
-pub fn build_child_variants(
-    state: &MenuInner,
-    parent_id: i32,
-    recurse: bool,
-) -> Vec<OwnedValue> {
+pub fn build_child_variants(state: &MenuInner, parent_id: i32, recurse: bool) -> Vec<OwnedValue> {
     let mut out = Vec::new();
     for &cid in state.children(parent_id) {
         let item = match state.item(cid) {
@@ -397,12 +518,8 @@ pub fn build_child_variants(
             Vec::new()
         };
         let props = build_properties(&item);
-        let layout: (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>) =
-            (item.id, props, grandchildren);
-        let value: Value<'_> = Value::Structure(
-            zbus::zvariant::Structure::try_from(layout)
-                .expect("static item layout"),
-        );
+        let layout: ItemLayout = (item.id, props, grandchildren);
+        let value: Value<'_> = Value::Structure(zbus::zvariant::Structure::from(layout));
         // Convert borrowed Value → owned Value via the inherent
         // `try_to_owned()` (zvariant 5.x — the 3.x `to_owned()`
         // method doesn't exist on this version).
@@ -411,6 +528,15 @@ pub fn build_child_variants(
     out
 }
 
+/// One dbusmenu item as it appears in the wire format: `(id, properties,
+/// children)`. Factored out of the `GetLayout` return type so clippy
+/// doesn't trip on the inline tuple-of-tuple declaration.
+pub type ItemLayout = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
+
+/// Full `GetLayout` response: `(revision, item_layout)`. Mirrors the
+/// signature of `com.canonical.dbusmenu.GetLayout(parentId, ...)`.
+pub type ItemLayoutResponse = (u32, ItemLayout);
+
 /// Build the GetLayout response `(revision, item_layout)` for the
 /// subtree rooted at `parent_id`. `recurse` controls whether children
 /// are populated recursively.
@@ -418,8 +544,10 @@ pub fn build_layout_response(
     state: &MenuInner,
     parent_id: i32,
     recurse: bool,
-) -> (u32, (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>)) {
-    let item = state.item(parent_id).cloned()
+) -> ItemLayoutResponse {
+    let item = state
+        .item(parent_id)
+        .cloned()
         .unwrap_or_else(|| MenuItem::standard(parent_id, "", true, true));
     let props = build_properties(&item);
     let children = build_child_variants(state, parent_id, recurse);
@@ -503,11 +631,7 @@ mod tests {
         assert!(s.item(window_id(1)).unwrap().visible);
 
         // Drop to 1 window
-        s.rebuild_window_rows(
-            &["only".into()],
-            &["bar".into()],
-            &[None],
-        );
+        s.rebuild_window_rows(&["only".into()], &["bar".into()], &[None]);
         assert!(s.item(window_id(0)).unwrap().visible);
         assert!(!s.item(window_id(1)).unwrap().visible);
     }
@@ -515,11 +639,7 @@ mod tests {
     #[test]
     fn burn_row_toggles_visibility() {
         let mut s = MenuInner::new();
-        s.rebuild_window_rows(
-            &["row".into()],
-            &["bar".into()],
-            &[None],
-        );
+        s.rebuild_window_rows(&["row".into()], &["bar".into()], &[None]);
         assert!(!s.item(burn_id(0)).unwrap().visible);
 
         s.rebuild_window_rows(
@@ -530,11 +650,7 @@ mod tests {
         assert!(s.item(burn_id(0)).unwrap().visible);
         assert_eq!(s.item(burn_id(0)).unwrap().label, "  · burn row");
 
-        s.rebuild_window_rows(
-            &["row".into()],
-            &["bar".into()],
-            &[None],
-        );
+        s.rebuild_window_rows(&["row".into()], &["bar".into()], &[None]);
         assert!(!s.item(burn_id(0)).unwrap().visible);
     }
 
@@ -565,9 +681,18 @@ mod tests {
     #[test]
     fn action_items_have_commands() {
         let s = MenuInner::new();
-        assert_eq!(s.item(REFRESH_ID).unwrap().action, Some(MenuCommand::Refresh));
-        assert_eq!(s.item(DASHBOARD_ID).unwrap().action, Some(MenuCommand::OpenDashboard));
-        assert_eq!(s.item(SET_KEY_ID).unwrap().action, Some(MenuCommand::SetApiKey));
+        assert_eq!(
+            s.item(REFRESH_ID).unwrap().action,
+            Some(MenuCommand::Refresh)
+        );
+        assert_eq!(
+            s.item(DASHBOARD_ID).unwrap().action,
+            Some(MenuCommand::OpenDashboard)
+        );
+        assert_eq!(
+            s.item(SET_KEY_ID).unwrap().action,
+            Some(MenuCommand::SetApiKey)
+        );
         assert_eq!(s.item(QUIT_ID).unwrap().action, Some(MenuCommand::Quit));
     }
 
@@ -600,7 +725,16 @@ mod tests {
         assert_eq!(layout.0, REFRESH_ID);
         assert!(layout.1.contains_key("type"));
         assert!(layout.1.contains_key("label"));
-        assert_eq!(layout.1.get("label").unwrap().downcast_ref::<zbus::zvariant::Str>().unwrap().to_string(), "Refresh now");
+        assert_eq!(
+            layout
+                .1
+                .get("label")
+                .unwrap()
+                .downcast_ref::<zbus::zvariant::Str>()
+                .unwrap()
+                .to_string(),
+            "Refresh now"
+        );
     }
 
     #[test]
@@ -610,24 +744,23 @@ mod tests {
         assert_eq!(layout.0, SEP_1_ID);
         assert!(layout.1.contains_key("type"));
         let t = layout.1.get("type").unwrap();
-        assert_eq!(t.downcast_ref::<zbus::zvariant::Str>().unwrap().to_string(), "separator");
+        assert_eq!(
+            t.downcast_ref::<zbus::zvariant::Str>().unwrap().to_string(),
+            "separator"
+        );
     }
 
     #[test]
     fn child_variants_recursive() {
         let mut s = MenuInner::new();
-        s.rebuild_window_rows(
-            &["row".into()],
-            &["bar".into()],
-            &[None],
-        );
+        s.rebuild_window_rows(&["row".into()], &["bar".into()], &[None]);
         let kids = build_child_variants(&s, ROOT_ID, true);
         // HEADER + 3 window items + THROTTLED + ERROR + 3 seps + 4 actions
         // = 13 children
         assert_eq!(kids.len(), 13);
         for v in &kids {
             match &**v {
-                Value::Structure(_) => {},
+                Value::Structure(_) => {}
                 _ => panic!("expected Value::Structure"),
             }
         }

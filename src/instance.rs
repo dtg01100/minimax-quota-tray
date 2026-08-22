@@ -42,27 +42,47 @@ pub fn init() -> &'static str {
 /// Public so tests can exercise the resolution rules without
 /// mutating global state.
 pub fn resolve() -> String {
-    resolve_from_args(std::env::args().skip(1))
+    parse(std::env::args().skip(1)).0
 }
 
-/// Pure-function form: take an iterator of CLI args (everything
-/// after argv[0]) and resolve the instance name.
-pub fn resolve_from_args<I: IntoIterator<Item = String>>(args: I) -> String {
+/// Full CLI parse: instance name + the `--set-key` one-shot flag.
+/// Kept separate from `init()` so tests can exercise both fields
+/// without mutating global state.
+pub fn parse<I: IntoIterator<Item = String>>(args: I) -> (String, bool) {
     let mut iter = args.into_iter();
+    let mut instance = String::new();
+    let mut set_key = false;
     while let Some(arg) = iter.next() {
         if let Some(rest) = arg.strip_prefix("--instance=") {
-            return rest.to_string();
+            instance = rest.to_string();
+            continue;
         }
         if arg == "--instance" {
             if let Some(v) = iter.next() {
-                return v;
+                instance = v;
             }
+            continue;
+        }
+        if arg == "--set-key" || arg == "--set_api_key" {
+            set_key = true;
+            continue;
         }
     }
-    if let Ok(v) = std::env::var("QUOTA_INSTANCE") {
-        return v;
+    if instance.is_empty() {
+        if let Ok(v) = std::env::var("QUOTA_INSTANCE") {
+            instance = v;
+        }
     }
-    String::new()
+    (instance, set_key)
+}
+
+/// True when the user passed `--set-key` on the command line. Used
+/// by `main()` to short-circuit into the one-shot key-entry flow
+/// before any daemon subsystems (lock, SNI, refresh loop) come up.
+pub fn wants_set_key() -> bool {
+    std::env::args()
+        .skip(1)
+        .any(|a| a == "--set-key" || a == "--set_api_key")
 }
 
 /// Look up the instance name. Returns "" for the default instance
@@ -88,8 +108,7 @@ pub fn config_dir_basename() -> String {
 
 /// Per-instance lock file path: `${XDG_RUNTIME_DIR}/<basename>.pid`.
 pub fn lock_path() -> PathBuf {
-    let runtime = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| "/tmp".to_string());
+    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(runtime).join(format!("{}.pid", config_dir_basename()))
 }
 
@@ -105,7 +124,7 @@ mod tests {
     use super::*;
 
     fn resolve(args: &[&str]) -> String {
-        resolve_from_args(args.iter().map(|s| s.to_string()))
+        parse(args.iter().map(|s| s.to_string())).0
     }
 
     #[test]
@@ -113,7 +132,7 @@ mod tests {
         // No CLI flag, no env → empty (default instance).
         // (We can't safely test the env fallback in isolation here
         // because QUOTA_INSTANCE may be set in the test environment.
-        // resolve_from_args alone covers CLI semantics; the env
+        // `parse` alone covers CLI semantics; the env
         // branch is a one-liner that's covered by manual smoke
         // testing.)
         let s = resolve(&[]);

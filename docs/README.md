@@ -12,8 +12,10 @@ deeper reference material.
 | [`config-schema.md`](config-schema.md) | Every field in `config.json` with default, type, and behavior |
 | [`multi-instance.md`](multi-instance.md) | Running multiple trays concurrently — namespace rules, lock files, systemd units |
 | [`troubleshooting.md`](troubleshooting.md) | Common issues + diagnostic walkthroughs (icon missing, keyring, etc.) |
+| [`faq.md`](faq.md) | Common "how do I…" questions — install, auth, config, tray integration, dev |
 | [`../examples/providers/README.md`](../examples/providers/README.md) | Provider template catalog — when to use each shape, how to template a new one |
-| [`../SECURITY.md`](../SECURITY.md) | Reporting vulnerabilities, threat model, hardening checklist |
+| [`../SECURITY.md`](../SECURITY.md) | Vulnerability disclosure policy |
+| [`security-model.md`](security-model.md) | Threat model — assets, trust boundaries, network egress, supply chain, hardening |
 
 ## For developers
 
@@ -27,6 +29,9 @@ deeper reference material.
 | [`freedesktop-integration.md`](freedesktop-integration.md) | Desktop Entry / AppStream / XDG Activation / Portal contracts |
 | [`gjs-parity.md`](gjs-parity.md) | Decisions kept verbatim from the gjs port — load-bearing "don't change this" list |
 | [`port-guide.md`](port-guide.md) | Porting to a new provider — Simple vs Hard tracks, sidecar patterns |
+| [`logging.md`](logging.md) | Per-module log guide, `RUST_LOG` recipes, common diagnostic queries |
+| [`performance.md`](performance.md) | RSS/CPU/polling budgets, scaling with multiple instances, profiling recipes |
+| [`glossary.md`](glossary.md) | Single-page term index (bucket, shape, epoch, sentinel, …) with deep links |
 | [`../RELEASING.md`](../RELEASING.md) | Release process: versioning, CHANGELOG discipline, tag signing, post-release checks |
 
 ## Cross-references

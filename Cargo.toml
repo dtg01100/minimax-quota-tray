@@ -2,8 +2,39 @@
 name = "llm-quota-tray"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.75"  # MSRV: edition 2021 baseline + async-trait / zbus 5 / tokio 1 requirements
 description = "Provider-agnostic tray indicator for LLM API quota — supports any quota API via a config-only port"
 license = "MIT"
+# Canonical repo. Used by crates.io / docs.rs for the "Repository" link
+# and by `cargo install` output. Keep in sync with the `git remote`.
+repository = "https://github.com/dtg01100/minimax-quota-tray"
+# Rendered README on crates.io (the same file shipped at the repo root).
+readme = "README.md"
+# Project homepage (distinct from `repository` — points at the
+# repo's GitHub project page, not the git endpoint).
+homepage = "https://github.com/dtg01100/minimax-quota-tray"
+# Hosted API docs (currently docs.rs, which builds from the crates.io
+# tarball). Switch to a GH-Pages URL if we ever self-host.
+documentation = "https://docs.rs/llm-quota-tray"
+# Keywords are case-insensitive, max 5, comma-separated, lowercase.
+# crates.io uses these for the search index; pick terms users would
+# actually search for.
+keywords = ["tray", "system-tray", "status-notifier-item", "quota", "llm"]
+# crates.io categories: each crate goes in exactly one. `gui` is the
+# closest fit (system tray is GUI-adjacent); the alternative
+# `api-bindings` was considered and rejected because the project
+# *renders* a UI even though it consumes HTTP APIs.
+categories = ["gui"]
+# Excluded packages from the published tarball — purely build-time
+# docs/workflow files that don't belong in `~/.cargo/registry/`.
+exclude = [
+    ".github/*",
+    "docs/*",
+    "examples/*",
+    ".gitignore",
+]
+# Authors and description shown on the crates.io page header.
+authors = ["David Lafreniere <dlafreniere@example.com>"]
 
 [dependencies]
 # StatusNotifierItem over the session D-Bus — pure Rust via zbus.

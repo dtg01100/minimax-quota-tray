@@ -161,6 +161,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   registration; the new daemon's `new_icon` call blocked
   indefinitely). Three unit tests (`emit_signal_with_timeout_*`)
   lock in the contract.
+- **SNI watcher restarts no longer drop the chip.**
+  `Tray::new()` now spawns `spawn_watcher_recovery`, a
+  background task that subscribes to
+  `org.freedesktop.DBus.NameOwnerChanged` with a server-side
+  match rule filtered to
+  `arg0 == "org.kde.StatusNotifierWatcher"`. On each
+  "appeared" event (new owner non-empty), the task re-calls
+  `RegisterStatusNotifierItem` best-effort and re-emits the
+  current chip state (`NewIcon`, `NewTitle`, `NewStatus`,
+  `ItemsUpdated`, `LayoutUpdated`) so the new watcher renders
+  the chip immediately rather than waiting for the next
+  2-min poll cycle. All recovery-time emissions use the same
+  `emit_signal_with_timeout()` guard. Before this fix, the
+  GNOME `appindicator` extension's periodic restarts
+  (extension reload, panel redraw, gnome-shell `r` reset,
+  disable/re-enable) left the daemon's signal subscriptions
+  pointing at a dead peer and every subsequent emission
+  failed with `Broken pipe (os error 32)` — the chip would
+  vanish permanently until the daemon restarted. Manual
+  reproduction recipe is documented in
+  `docs/freedesktop-integration.md` ("SNI watcher restarts
+  are handled in-flight").
 
 ### Added (slice 3: freedesktop-portal migration)
 

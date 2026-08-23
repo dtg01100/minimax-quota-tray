@@ -1,4 +1,39 @@
-//! Formatting helpers shared across modules.
+//! Display / formatting helpers shared across the menu and
+//! scheduler layers.
+//!
+//! Pure functions — no I/O, no logger, no state. Every public
+//! function here renders user-visible text (chip, menu rows,
+//! tooltip strings, log-free status output) from typed inputs.
+//! Kept in one module so the visual language stays consistent:
+//! every "5m", "1h 5m", "$1.23", "20/h" the user sees in the UI
+//! flows through one of these functions and can be tweaked in one
+//! place.
+//!
+//! Grouped by what they format:
+//!
+//! - **Durations** — `fmt_duration()`, `fmt_age()` — used for
+//!   reset countdowns on window labels and "last refresh Xm ago"
+//!   stale annotations. Both round at the minute boundary; the
+//!   rounding direction differs by context (ceil for "resets in"
+//!   to never display "0m", floor for "X ago" to never display
+//!   the next minute prematurely).
+//! - **Rates** — `fmt_rate()` — e.g. "20/h" for burn projections.
+//! - **Currency** — `fmt_cost()` — uses the ISO 4217 code from
+//!   config (`"USD"`, `"EUR"`, `"JPY"`, …) with sensible
+//!   per-currency decimal rules. Falls back to `$` for unknown /
+//!   empty codes so the UI never renders blank.
+//! - **Progress bars** — `bar_markup()` — Pango markup for the
+//!   menu's "burn projected vs budget" progress bar. Two-segment
+//!   (filled + empty) using a Unicode block character so it
+//!   renders in any GTK theme.
+//! - **Menu rows** — `burn_row_label()`, `window_label()` —
+//!   composed strings that combine the above primitives into the
+//!   per-window labels the menu tree displays. The single source
+//!   of truth for "what does a window row look like".
+//!
+//! gjs parity: most of these correspond to `fmt*()` helpers in
+//! `llm-quota-tray.js`. See [`docs/gjs-parity.md`](../../docs/gjs-parity.md)
+//! for the "must not change" decisions each helper encodes.
 
 /// Format a duration in ms as e.g. "5m", "1h 5m", "2d 3h". Used for reset
 /// countdowns (window labels) and "last update Xm ago" stale annotations.

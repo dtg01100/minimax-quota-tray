@@ -23,7 +23,7 @@ gjs commit history is preserved on the `gjs/` branch.
 
 The chip can flip freely from Normal → Warning → Throttled based on
 the remaining%, but **a notification only fires when the bucket rank
-moves up** (`main.rs:511`).
+moves up** (`main.rs`).
 
 ```rust
 if prev_rank != BucketRank::NoData && new_rank > prev_rank { notify }
@@ -35,7 +35,7 @@ way; flipping the polarity would spam the user on every reset.
 
 ### 2. Rate is `max(recent_slope, epoch_average)`
 
-`burn::compute_burn` (`burn.rs:166`) takes the **max** of:
+`burn::compute_burn` (`burn.rs`) takes the **max** of:
 
 - Least-squares slope over the `lookback_ms` window of recent samples
   (default 1h).
@@ -59,7 +59,7 @@ window's remaining_pct drops by 0.01–0.05% per poll, well below the
 1% precision of the integer percent field. The slope over a 1h lookback
 is meaningless on that signal.
 
-The fix (`burn::compute_burn`, `burn.rs:228`, and the unit tests in
+The fix (`burn::compute_burn`, `burn.rs`, and the unit tests in
 `src/burn.rs::tests`):
 
 - A window is `pct-only` when `window.total == 0`.
@@ -86,21 +86,21 @@ or behavior would diverge.
 
 ### 5. Stale PID lock takeover
 
-`Lock::acquire` (`lock.rs:30`) tries O_EXCL create first; if the
+`Lock::acquire` (`lock.rs`) tries O_EXCL create first; if the
 existing PID's `/proc/<pid>` is gone, it replaces. This is the gjs
 behavior — when the daemon crashes hard and systemd restarts it, the
 new process should take over the lock cleanly, not print
 `"already running"` and exit.
 
 The takeover is **best-effort**: if `/proc` is missing or unreadable,
-we treat the lock as stale and replace (`lock.rs:90`). `lock.rs`
+we treat the lock as stale and replace (`lock.rs`). `lock.rs`
 explicitly says: *"we'd rather run two instances than refuse to start."*
 
 ### 6. Bucket-rank enum values match gjs (Normal=0, Warning=1, Throttled=2)
 
 The enum has a sentinel `NoData = -1` that the dedup logic treats as
 "below Normal" — so the first successful fetch never fires a
-notification (`prev_rank == NoData` short-circuits at `main.rs:511`).
+notification (`prev_rank == NoData` short-circuits at `main.rs`).
 This is the gjs behavior; a fresh install should not spam "Normal"
 notifications.
 
@@ -118,7 +118,7 @@ Rust-port fix for a gjs bug where config edits weren't reflected.
 
 ### 8. Keyring write goes through stdin
 
-`keyring.rs:65` spawns `secret-tool store --label … application …
+`keyring.rs` spawns `secret-tool store --label … application …
 -stdin` and pipes the secret to its stdin. The secret **never** appears
 in process argv or `/proc/<pid>/cmdline`. The gjs implementation used
 `secret-service.create_item(..., password)` directly; the subprocess
@@ -128,7 +128,7 @@ tokio-runtime-context panic (see "What changed" below).
 ### 9. Polling jitter
 
 `tokio::time::sleep(sleep_dur)` with `sleep_dur = max(1, wait_ms)`
-(`main.rs:239`) provides 1ms of jitter in the "fire immediately" path
+(`main.rs`) provides 1ms of jitter in the "fire immediately" path
 so two simultaneous launches don't synchronize. The gjs implementation
 applied `0–5s` of jitter; the Rust port keeps the same semantic with a
 smaller jitter window (the secret-tool subprocess adds its own
@@ -182,7 +182,7 @@ written — the user-visible "key doesn't stick" bug. Fix commit:
 `d078df4 fix(keyring): replace secret-service crate with secret-tool subprocess`.
 
 The Rust port pays ~20–50ms per subprocess call, which is well below
-the 120s baseline cadence. Documented in `keyring.rs:13-26`.
+the 120s baseline cadence. Documented in `keyring-26`.
 
 ### 3. tiny-skia renders the ARGB bytes
 
@@ -214,7 +214,7 @@ Rust: keyed by the user-defined `id` field.
 
 Why: positions shift if the user reorders windows in their config or
 adds a new one. The id is stable across restarts (the user picks it
-once). Documented in `main.rs:81-90`. This means **changing the id
+once). Documented in `main-90`. This means **changing the id
 loses accumulated burn history** — README's "Window length is derived
 dynamically" section explicitly calls this out.
 
@@ -232,14 +232,14 @@ affecting the lookback window (480 > 1h × 3600s / 120s = 30).
 
 gjs: `indicator.set_label(label, guide)` with `guide` carrying
 "Coding Plan — 80% left".
-Rust: SNI `ToolTip` description field (`sni.rs:83`).
+Rust: SNI `ToolTip` description field (`sni.rs`).
 
 Why: surface accessibility info to screen readers and panels that
 show hover tooltips. The SNI spec's `ToolTip` property takes a
 3-tuple `(icon_name, (title, description), has_icon)`; the description
 carries the same hint as gjs's `guide` argument. This is a strict
 superset of the gjs behavior — the chip itself never carries a visible
-text label (gjs parity, `sni.rs:14`).
+text label (gjs parity, `sni.rs`).
 
 ### 8. Static-state glyph uses a hand-written BGRA circle routine
 
@@ -273,15 +273,15 @@ context.
 
 | Looks wrong                                                | Actually right because…                                              | Where                  |
 |------------------------------------------------------------|----------------------------------------------------------------------|------------------------|
-| `~/.config/.config/<instance>/key` (doubled `.config/`)     | The legacy plaintext fallback for installs that pre-date the libsecret path; preserved for compat. | `keyring.rs:107`, `keyring.rs:191` |
-| Polling at `refresh_seconds / 2` and `/ 4` is "too fast"   | Peer alignment with gjs; lets a depleting quota catch up before reset. | `scheduler.rs:24`      |
-| Threshold notifications don't fire on rank decrease         | Upward-only is intentional — already-depressed users don't need "good news". | `main.rs:511`          |
-| Two `spawn_blocking` calls per poll (keyring + HTTP)       | Necessary because both `secret-tool` and reqwest are blocking; the tokio reactor must not block on either. | `main.rs:367`, `main.rs:395` |
-| `refresh_min_seconds` is 15 by default                      | Floor on the adaptive cadence; lower → risk of hammer-the-API on a depleting account. | `scheduler.rs:31`      |
-| `BURN_MAX_SAMPLES = 480` looks low                          | At 120s polls it's 16h, far past the 1h lookback; the cap is for memory, not correctness. | `main.rs:60`           |
-| `default_shape()` is a single window with `field_prefix = ""` | Lets the tray boot before any config exists.                          | `provider.rs:309`      |
-| Static SVG files written to `${TMPDIR}`                    | Per-color cache; SNI hosts pick them up via `IconName`. `IconPixmap` is the always-set fallback. | `main.rs:175`, `icon.rs` |
-| First refresh is unconditional (`wait_ms = 0`)             | Without it the user waits `refresh_seconds` (default 120s) before seeing any data. | `main.rs:228`          |
+| `~/.config/.config/<instance>/key` (doubled `.config/`)     | The legacy plaintext fallback for installs that pre-date the libsecret path; preserved for compat. | `keyring.rs`, `keyring.rs` |
+| Polling at `refresh_seconds / 2` and `/ 4` is "too fast"   | Peer alignment with gjs; lets a depleting quota catch up before reset. | `scheduler.rs`      |
+| Threshold notifications don't fire on rank decrease         | Upward-only is intentional — already-depressed users don't need "good news". | `main.rs`          |
+| Two `spawn_blocking` calls per poll (keyring + HTTP)       | Necessary because both `secret-tool` and reqwest are blocking; the tokio reactor must not block on either. | `main.rs`, `main.rs` |
+| `refresh_min_seconds` is 15 by default                      | Floor on the adaptive cadence; lower → risk of hammer-the-API on a depleting account. | `scheduler.rs`      |
+| `BURN_MAX_SAMPLES = 480` looks low                          | At 120s polls it's 16h, far past the 1h lookback; the cap is for memory, not correctness. | `main.rs`           |
+| `default_shape()` is a single window with `field_prefix = ""` | Lets the tray boot before any config exists.                          | `provider.rs`      |
+| Static SVG files written to `${TMPDIR}`                    | Per-color cache; SNI hosts pick them up via `IconName`. `IconPixmap` is the always-set fallback. | `main.rs`, `icon.rs` |
+| First refresh is unconditional (`wait_ms = 0`)             | Without it the user waits `refresh_seconds` (default 120s) before seeing any data. | `main.rs`          |
 
 ## Future directions (NOT yet decisions)
 

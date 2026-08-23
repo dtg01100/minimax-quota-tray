@@ -254,7 +254,7 @@ the user. The sidecar must accept it as a config value.
 
 ### Pattern C — multi-header auth
 
-The `AuthConfig` enum (`provider.rs:185`) handles single-header auth.
+The `AuthConfig` enum (`provider.rs`) handles single-header auth.
 When the provider needs two (Anthropic's `x-api-key` + `anthropic-version`,
 for instance), you have two options:
 
@@ -286,7 +286,7 @@ handle the auth.
 When the chip stays red or the menu shows an error:
 
 1. **Read the stderr.** The tray logs the endpoint, label, and shape at
-   startup (`main.rs:152`) and the fetch error per poll
+   startup (`main.rs`) and the fetch error per poll
    (`fetch::sanitize_error_snippet` redacts the API key before logging).
    `RUST_LOG=debug` shows more.
 
@@ -315,7 +315,7 @@ When the chip stays red or the menu shows an error:
    `*_remaining_percent` as an **integer 0..100**. If your provider
    returns it as a float (`80.5`) the parser truncates to 80. That's
    expected — the chip's percent is integer-precision by design (see
-   `main.rs:74` for the bucket-rank enum that reads it).
+   `main.rs` for the bucket-rank enum that reads it).
 
 6. **For duration-vs-epoch reset fields:** if the menu shows
    `"resets in 1970-01-01"` or `"resets in 50 years"`, your
@@ -331,7 +331,7 @@ When the chip stays red or the menu shows an error:
 8. **If two instances are colliding:** check `$XDG_RUNTIME_DIR/`.
    Each instance has its own PID file (`llm-quota-tray-<name>.pid`).
    A stale PID file whose owning process is gone is taken over by
-   `Lock::acquire` (`lock.rs:30`); a live holder is refused with
+   `Lock::acquire` (`lock.rs`); a live holder is refused with
    `"another instance is already running; exiting"`.
 
 ---
@@ -494,7 +494,7 @@ The parser iterates `windows[]` and emits one `Window` per entry. The
 first window drives the chip percentage; subsequent windows render as
 additional menu rows. There's no fixed limit — three is fine, five is
 fine, ten is fine. Each window gets its own burn-rate history keyed
-by `id` (`main.rs:90`).
+by `id` (`main.rs`).
 
 If your provider returns the windows in a single flat JSON object
 (not an array), point `entries_path` at the object's keys
@@ -514,7 +514,7 @@ Things that look like parser responsibilities but are not:
 - **Caching.** Every poll is a fresh HTTP GET. The tray has no
   client-side cache.
 - **Retry.** One HTTP attempt per poll; backoff is across polls
-  (`scheduler.rs:24`), not within a single poll.
+  (`scheduler.rs`), not within a single poll.
 - **Schema migration.** If your provider changes field names, update
   the config — there's no version negotiation.
 - **Cross-instance deduplication.** Each instance polls independently.

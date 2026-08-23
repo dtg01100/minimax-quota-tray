@@ -15,7 +15,7 @@ and `src/burn.rs`. The schema-drift guard is `provider_templates_deserialize`
 in `src/config.rs::tests` — it walks `examples/providers/*.json` and
 parses each one, so a typo or missing field fails the build.
 
-## `Config` (`config.rs:26`)
+## `Config` (`config.rs`)
 
 Top-level config. All fields except `endpoint`, `dashboard_url`, `label`,
 and one `WindowShape` are optional and have compile-time defaults.
@@ -25,8 +25,8 @@ and one `WindowShape` are optional and have compile-time defaults.
 | `endpoint`                    | string (required)   | —                | `Config::endpoint`  |
 | `dashboard_url`               | string (required)   | —                | `Config::dashboard_url` |
 | `label`                       | string (required)   | —                | `Config::label`     |
-| `shape`                       | `PlanShape`         | see `default_shape` (`provider.rs:309`) | `Config::shape` |
-| `ring_colors`                 | `RingColors`        | see `default_ring_colors` (`provider.rs:165`) | `Config::ring_colors` |
+| `shape`                       | `PlanShape`         | see `default_shape` (`provider.rs`) | `Config::shape` |
+| `ring_colors`                 | `RingColors`        | see `default_ring_colors` (`provider.rs`) | `Config::ring_colors` |
 | `auth`                        | `AuthConfig`        | `Bearer`         | `Config::auth`      |
 | `user_agent`                  | string              | `"llm-quota-tray"` (`DEFAULT_USER_AGENT`) | `Config::user_agent` |
 | `refresh_seconds`             | u64                 | `120`            | `Config::refresh_seconds` |
@@ -39,12 +39,12 @@ and one `WindowShape` are optional and have compile-time defaults.
 `examples/providers/*.json` files use them heavily — copy that
 convention.
 
-## `RingColors` (`provider.rs:80`) — three accepted wire shapes
+## `RingColors` (`provider.rs`) — three accepted wire shapes
 
 `RingColors` is the tray's two-channel color model: an inner dot that
 shows status (normal/warning/throttled) and an outer ring that shows
 remaining quota as an arc. Three wire shapes deserialize, via
-`RingColorsRepr` (`provider.rs:99`):
+`RingColorsRepr` (`provider.rs`):
 
 ### Canonical (preferred)
 
@@ -63,9 +63,9 @@ remaining quota as an arc. Three wire shapes deserialize, via
 
 - `inner.normal` / `warning` / `throttled`: status-bucket colors.
   Three independent `#RRGGBB` strings; each may be omitted and falls
-  back to `default_inner_colors` (`provider.rs:146`).
+  back to `default_inner_colors` (`provider.rs`).
 - `outer`: percentage-arc color, single `#RRGGBB`. Default
-  `DEFAULT_OUTER_COLOR = "#3584e4"` (`provider.rs:157`).
+  `DEFAULT_OUTER_COLOR = "#3584e4"` (`provider.rs`).
 
 ### Legacy flat
 
@@ -84,7 +84,7 @@ For backward compat with pre-split configs:
 Top-level `normal/warning/throttled` map to `inner.*`; `outer` defaults
 to the neutral blue. The deserializer detects this shape by checking
 that `inner` is `None` and any of the legacy fields is `Some`
-(`provider.rs:114`).
+(`provider.rs`).
 
 ### Empty
 
@@ -95,7 +95,7 @@ that `inner` is `None` and any of the legacy fields is `Some`
 Equivalent to omitting the field — both `inner` and `outer` fall back
 to defaults.
 
-## `BucketColors` (`provider.rs:137`)
+## `BucketColors` (`provider.rs`)
 
 ```json
 { "normal": "#RRGGBB", "warning": "#RRGGBB", "throttled": "#RRGGBB" }
@@ -104,13 +104,13 @@ to defaults.
 Used as `RingColors::inner`. All three fields are optional `String`s
 that default to `"#3a9d4d"` / `"#f6d32d"` / `"#e01b24"`. The shape is
 trivial, but the defaults are explicit in `default_inner_colors`
-(`provider.rs:146`) — gjs parity.
+(`provider.rs`) — gjs parity.
 
-## `AuthConfig` (`provider.rs:185`)
+## `AuthConfig` (`provider.rs`)
 
 Tagged enum, serialized as `{"type": "..."}`. The runtime dispatch is
-in `AuthConfig::build` (`provider.rs:216`) and
-`AuthConfig::apply_to_endpoint` (`provider.rs:232`).
+in `AuthConfig::build` (`provider.rs`) and
+`AuthConfig::apply_to_endpoint` (`provider.rs`).
 
 ### `bearer` (default)
 
@@ -137,7 +137,7 @@ Sends `<name>: <key>`. Use for providers that take a custom header
 ```
 
 Sends `<name>: <format>` with `{key}` substituted at request time
-(`provider.rs:223`). Use for auth schemes that don't fit a single
+(`provider.rs`). Use for auth schemes that don't fit a single
 header shape (`Token`, `ApiKey-V1 …`, etc.).
 
 ### `query_param`
@@ -148,9 +148,9 @@ header shape (`Token`, `ApiKey-V1 …`, etc.).
 
 Appends `?<name>=<key>` to the endpoint URL. No header sent. The fetch
 code handles the URL rewriting in `apply_to_endpoint` — see `fetch.rs`
-(`provider.rs:235`).
+(`provider.rs`).
 
-## `PlanShape` (`provider.rs:288`)
+## `PlanShape` (`provider.rs`)
 
 Where to find the entry array and which windows to extract.
 
@@ -170,14 +170,14 @@ Where to find the entry array and which windows to extract.
 | `windows`       | `WindowShape[]`  | yes      | At least one window.                                  |
 | `error_envelope`| `ErrorEnvelope`? | no       | If present, non-success codes return `Err` from the parser. |
 
-### Default shape (`provider.rs:309`)
+### Default shape (`provider.rs`)
 
 `default_shape()` returns a single-window `PlanShape` with
 `entries_path = "/"` and one window of `field_prefix = ""`. The tray
 can boot before a config file exists (it writes `config.example.json`
 on first launch via `config::load_or_init`).
 
-## `WindowShape` (`provider.rs:254`)
+## `WindowShape` (`provider.rs`)
 
 Describes how to extract one quota window from the first entry of
 `entries_path`.
@@ -224,7 +224,7 @@ neither source is available, the chip shows 0% — see `examples/providers/READM
 "When a provider doesn't expose `*_remaining_percent`" section for the
 adapter pattern.
 
-## `ErrorEnvelope` (`provider.rs:299`)
+## `ErrorEnvelope` (`provider.rs`)
 
 ```json
 {
@@ -246,7 +246,7 @@ If omitted, the parser always treats the response as success (the
 status code lives in the HTTP layer, which `fetch_windows_blocking`
 already handles).
 
-## `Thresholds` (`config.rs:75`)
+## `Thresholds` (`config.rs`)
 
 ```json
 { "thresholds": { "yellow": 60, "red": 85 } }
@@ -260,9 +260,9 @@ chip's bucket transitions:
 
 `used` here means `100 - remaining_pct` (the chip label still shows
 **remaining** %). The burn-rate projection can also flip the chip to
-warning independently (see `main.rs:465` and `burn::compute_burn`).
+warning independently (see `main.rs` and `burn::compute_burn`).
 
-## `BurnConfig` (`burn.rs:71`)
+## `BurnConfig` (`burn.rs`)
 
 ```json
 {
@@ -284,7 +284,7 @@ warning independently (see `main.rs:465` and `burn::compute_burn`).
 
 Defaults match the gjs implementation. The pct-only suppression rule
 (burn row hidden when rate = 0 on a Coding Plan-style provider) is
-hard-coded in `burn::decide_burn_row` (`burn.rs:228`) and is not
+hard-coded in `burn::decide_burn_row` (`burn.rs`) and is not
 configurable — it would defeat the purpose to make it optional.
 
 ## Compiled defaults at a glance
@@ -300,7 +300,7 @@ default_ring_colors()    // { inner: default_inner_colors(), outer: DEFAULT_OUTE
 DEFAULT_USER_AGENT       // "llm-quota-tray"
 default_shape()          // { entries_path: "/", windows: [{ id: "", field_prefix: "", start_unit_ms: 1, reset_unit_ms: 1, reset_is_absolute_epoch: false }] }
 default_refresh_min_seconds()  // 15
-Thresholds::default      // { yellow: 60, red: 85 }  — but Config::default uses literal {yellow:60, red:85}, see config.rs:101
+Thresholds::default      // { yellow: 60, red: 85 }  — but Config::default uses literal {yellow:60, red:85}, see config
 BurnConfig::default      // { enabled: true, min_history_ms: 600000, lookback_ms: 3600000, use_epoch_average: true }
 AuthConfig::default      // Bearer
 Config::default          // { endpoint: "", dashboard_url: "", label: "Quota", shape: default_shape(),
@@ -320,7 +320,7 @@ Things that look like they might belong but are hard-coded by design:
   collide.
 - **The lock file path.** Same derivation: `${XDG_RUNTIME_DIR}/<basename>.pid`.
 - **The status-bucket cutoffs.** A fixed `50% remaining` line in
-  `BucketRank::from_remaining` (`main.rs:74`) — configurable thresholds
+  `BucketRank::from_remaining` (`main.rs`) — configurable thresholds
   govern the chip; the rank enum is for notification dedup.
 - **The Notification cooldown / re-arm logic.** `_last_bucket` is in-process
   state (`main.rs::AppState`).

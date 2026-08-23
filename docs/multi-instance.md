@@ -210,7 +210,7 @@ and don't collide.
 ### Stale PID file after a crash
 
 `Lock::acquire` checks `/proc/<pid>` and takes over if the holder
-is dead (`src/lock.rs:90`). On rare systems without `/proc`, the
+is dead (`src/lock`). On rare systems without `/proc`, the
 stale lock persists; `rm` it manually:
 
 ```sh

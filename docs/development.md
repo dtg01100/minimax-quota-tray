@@ -163,9 +163,9 @@ llm-quota-tray --instance=<name> --set-key
 
 This **requires** a code change. Edit `src/provider.rs`:
 
-1. Add a variant to `AuthConfig` (`provider.rs:185`).
-2. Add the dispatch case to `AuthConfig::build` (`provider.rs:216`).
-3. If it needs URL rewriting, add it to `apply_to_endpoint` (`provider.rs:232`).
+1. Add a variant to `AuthConfig` (`provider.rs`).
+2. Add the dispatch case to `AuthConfig::build` (`provider.rs`).
+3. If it needs URL rewriting, add it to `apply_to_endpoint` (`provider.rs`).
 4. Add tests to `src/provider.rs::tests` or the relevant module.
 5. Add an example to `examples/providers/README.md`'s "AuthConfig" section.
 
@@ -186,12 +186,12 @@ entry points:
 
 If you want a different rendering (e.g. solid bar instead of ring),
 add a new module under `src/icon_*.rs` and route from `do_refresh`'s
-icon-selection block (`main.rs:469`).
+icon-selection block (`main.rs`).
 
-The `Bucket` enum (`main.rs:465` call site) decides which rendering
+The `Bucket` enum (`main.rs` call site) decides which rendering
 path to use. Currently `Throttled` uses a static glyph; the other two
 use the live ring render. If your new shape wants to replace this
-distinction, edit `main.rs:469` and add tests to `src/icon.rs::tests`.
+distinction, edit `main.rs` and add tests to `src/icon.rs::tests`.
 
 ## Debugging
 
@@ -207,7 +207,7 @@ RUST_LOG=llm_quota_tray=trace,keyring=debug ./target/debug/llm-quota-tray
 # → just our crate + keyring at trace level
 ```
 
-The default is `info` — set in `main.rs:114`.
+The default is `info` — set in `main.rs`.
 
 ### D-Bus introspection
 

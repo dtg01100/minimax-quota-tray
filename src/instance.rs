@@ -163,21 +163,34 @@ mod tests {
 
     #[test]
     fn config_dir_basename_default() {
-        // Empty name → "llm-quota-tray" (default single-instance).
-        // We can't safely mutate INSTANCE_NAME across tests, but
-        // since the helper derives from `name()` which defaults to
-        // "" when uninitialized, this matches the production
-        // behavior on first launch (before init() is called).
-        // After init() runs the test, this might not hold — but
-        // the helper is a pure function over `name()` so it's
-        // covered by the path test below.
-        let s = if is_default() {
-            "llm-quota-tray".to_string()
+        // The previous version of this test re-implemented the
+        // function inline and asserted the output matched, which is
+        // true by construction but does not actually test anything.
+        // This version calls the real function and asserts exactly:
+        // when the instance name is empty (the default), the basename
+        // is exactly "llm-quota-tray" with no trailing dash or suffix.
+        // INSTANCE_NAME is a OnceLock<String> and other tests in this
+        // module may have set it to something else, so we can only
+        // assert the default case here, not all cases.
+        if is_default() {
+            assert_eq!(
+                config_dir_basename(),
+                "llm-quota-tray",
+                "default instance must produce basename 'llm-quota-tray'"
+            );
         } else {
-            format!("llm-quota-tray-{}", name())
-        };
-        // The test is more meaningful once we've initialized —
-        // covered by the multi-instance doc tests in main.rs.
-        assert!(s == "llm-quota-tray" || s.starts_with("llm-quota-tray-"));
+            // If another test left a non-default name in INSTANCE_NAME,
+            // the helper must produce "llm-quota-tray-<name>".
+            let n = name();
+            assert!(
+                !n.is_empty(),
+                "non-default branch implies name() is non-empty"
+            );
+            assert_eq!(
+                config_dir_basename(),
+                format!("llm-quota-tray-{n}"),
+                "named instance must produce basename 'llm-quota-tray-<name>'"
+            );
+        }
     }
 }

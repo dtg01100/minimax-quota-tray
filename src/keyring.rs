@@ -559,6 +559,7 @@ pub fn secret_to_key(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use crate::instance::is_default;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -638,9 +639,34 @@ mod tests {
 
     #[test]
     fn label_uses_instance_basename() {
+        // The label appears in `seahorse` and `ksecretservice-viewer`
+        // and must uniquely identify the instance. The default
+        // instance label is exactly "llm-quota-tray API Key". The
+        // previous version used .starts_with("llm-quota-tray") which
+        // also passed for "llm-quota-tray-codex API Key" -- too weak
+        // to verify the default case (a regression that incorrectly
+        // appended an empty suffix would have passed).
         let l = label();
-        assert!(l.starts_with("llm-quota-tray"));
-        assert!(l.ends_with(" API Key"));
+        // Strip the suffix " API Key" first so we can assert the
+        // basename portion is exactly "llm-quota-tray" (no trailing
+        // dash, no extra suffix).
+        assert!(
+            l.ends_with(" API Key"),
+            "label must end with ' API Key', got {l:?}"
+        );
+        let basename = &l[..l.len() - " API Key".len()];
+        if is_default() {
+            assert_eq!(
+                basename, "llm-quota-tray",
+                "default instance must have basename exactly 'llm-quota-tray'"
+            );
+        } else {
+            // Named instance: basename must be "llm-quota-tray-<name>"
+            assert!(
+                basename.starts_with("llm-quota-tray-"),
+                "named instance basename must start with 'llm-quota-tray-', got {basename:?}"
+            );
+        }
     }
 
     #[test]

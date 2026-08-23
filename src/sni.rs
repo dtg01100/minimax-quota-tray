@@ -711,10 +711,6 @@ mod tests {
         // (which is also exercised by menu::tests but with a
         // mutation pattern) doesn't silently change the on-the-wire
         // structure the panel receives.
-        use crate::menu::{
-            DASHBOARD_ID, ERROR_ID, HEADER_ID, QUIT_ID, REFRESH_ID, SEP_1_ID, SEP_2_ID,
-            SEP_3_ID, SET_KEY_ID, THROTTLED_ID,
-        };
 
         let menu = MenuInner::new();
         let (revision, layout) = menu::build_layout_response(&menu, ROOT_ID, true);

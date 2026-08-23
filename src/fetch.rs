@@ -123,19 +123,20 @@ fn redact_credential_lines(s: &str) -> String {
     let lower = s.to_ascii_lowercase();
     let mut line_start = 0usize;
     for (i, ch) in s.char_indices() {
-        // Newline ends a line — flush the accumulated line and
-        // reset for the next one. `char_indices` advances past
-        // multi-byte chars safely.
+        // Newline ends a line -- flush the accumulated line, push
+        // the newline so multi-line error bodies (JSON, stack
+        // traces) stay readable, then reset for the next one.
+        // char_indices advances past multi-byte chars safely.
         if ch == '\n' {
             flush_line(&mut out, &s[line_start..i], &lower[line_start..i]);
+            out.push('\n');
             line_start = i + ch.len_utf8();
         }
     }
-    // Tail after the last newline.
+    // Tail after the last newline (no trailing newline).
     flush_line(&mut out, &s[line_start..], &lower[line_start..]);
     out
 }
-
 fn flush_line(out: &mut String, line: &str, lower: &str) {
     if lower.contains(TRIGGER_PATTERNS[0])
         || lower.contains(TRIGGER_PATTERNS[1])
@@ -358,5 +359,141 @@ mod tests {
     #[test]
     fn auth_default_is_bearer() {
         assert!(matches!(AuthConfig::default(), AuthConfig::Bearer));
+    }
+
+    // ---- sanitize_error_snippet ----
+    //
+    // This is the last line of defense for credential redaction --
+    // it runs on the body of every HTTP error before the error
+    // reaches the menu's error row or journald. A regression that
+    // let a credential slip through would surface in user-visible
+    // UI, not in a test failure.
+
+    #[test]
+    fn sanitize_truncates_long_bodies() {
+        // 200-char body → truncated to 80 chars
+        let body = "x".repeat(200);
+        let sanitized = sanitize_error_snippet(&body);
+        assert_eq!(
+            sanitized.chars().count(),
+            80,
+            "snippet must be exactly 80 chars"
+        );
+    }
+
+    #[test]
+    fn sanitize_passes_through_safe_text() {
+        // No credential patterns → unchanged (modulo truncation)
+        let body = "HTTP 404: endpoint not found";
+        assert_eq!(sanitize_error_snippet(body), body);
+    }
+
+    #[test]
+    fn sanitize_redacts_bearer_lines() {
+        // The trigger word `bearer` (case-insensitive) redacts the
+        // entire line. We don't test the exact replacement text --
+        // we test that the credential-bearing substring is gone.
+        let body = "Authorization: Bearer sk-abc123-secret";
+        let sanitized = sanitize_error_snippet(body);
+        assert!(
+            !sanitized.contains("sk-abc123"),
+            "credential value must not appear in sanitized output; got {sanitized:?}"
+        );
+        assert!(
+            sanitized.contains("[redacted line]"),
+            "redacted-line marker must replace the credential line; got {sanitized:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_redacts_authorization_lines() {
+        let body = "X-Auth: authorization: sk-test";
+        let sanitized = sanitize_error_snippet(body);
+        assert!(!sanitized.contains("sk-test"));
+        assert!(sanitized.contains("[redacted line]"));
+    }
+
+    #[test]
+    fn sanitize_redacts_api_key_lines() {
+        // Both spellings: "api-key" (hyphen) and "api_key" (underscore)
+        let body1 = "api-key: abc-def-ghi";
+        let body2 = "x-api_key=secret123";
+        for body in [body1, body2] {
+            let sanitized = sanitize_error_snippet(body);
+            assert!(
+                !sanitized.contains("abc-def") && !sanitized.contains("secret123"),
+                "api-key/api_key lines must be redacted; got {sanitized:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_redacts_token_lines() {
+        let body = "x-auth-token: tok_abc_def_ghi";
+        let sanitized = sanitize_error_snippet(body);
+        assert!(!sanitized.contains("tok_abc"));
+        assert!(sanitized.contains("[redacted line]"));
+    }
+
+    #[test]
+    fn sanitize_redaction_is_case_insensitive() {
+        // The trigger words match in any case. The previous
+        // implementation only matched lowercase -- a regression
+        // would surface as a leaked "Bearer" line in the menu.
+        let body = "BEARER sk-upper";
+        let sanitized = sanitize_error_snippet(body);
+        assert!(!sanitized.contains("sk-upper"));
+    }
+
+    #[test]
+    fn sanitize_preserves_lines_without_triggers() {
+        // Multi-line body: lines without trigger words must pass
+        // through unchanged. A regression that over-redacted (e.g.
+        // redacting any line containing a colon) would break this.
+        let body = "HTTP 503\nService Unavailable\nPlease retry later";
+        let sanitized = sanitize_error_snippet(body);
+        assert_eq!(sanitized, body);
+    }
+
+    #[test]
+    fn sanitize_handles_mixed_lines() {
+        // Mixed: one credential line + two safe lines. Only the
+        // credential line should be redacted.
+        let body = "HTTP 401\nAuthorization: Bearer sk-abc\nPlease authenticate";
+        let sanitized = sanitize_error_snippet(body);
+        assert!(!sanitized.contains("sk-abc"));
+        assert!(sanitized.contains("HTTP 401"));
+        assert!(sanitized.contains("Please authenticate"));
+    }
+
+    #[test]
+    fn sanitize_handles_empty_body() {
+        // Empty body must not panic (some providers return empty
+        // error bodies on network failures).
+        let sanitized = sanitize_error_snippet("");
+        assert_eq!(sanitized, "");
+    }
+
+    #[test]
+    fn sanitize_preserves_unicode_in_safe_text() {
+        // Unicode must survive truncation -- byte-length 80 !=
+        // char-length 80. A regression that used byte slicing
+        // would split multi-byte chars and produce invalid UTF-8.
+        let body = "é".repeat(80); // 240 bytes, 80 chars
+        let sanitized = sanitize_error_snippet(&body);
+        assert_eq!(sanitized.chars().count(), 80);
+        assert!(sanitized.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn sanitize_redacts_partial_word_matches() {
+        // The trigger words must match as substrings, not whole
+        // words. "x-bearer-foo: ..." should still be redacted
+        // because "bearer" appears in the line. (The gjs parity
+        // decision: substring match catches more variants than
+        // whole-word.)
+        let body = "x-bearer-token: sk-test";
+        let sanitized = sanitize_error_snippet(body);
+        assert!(!sanitized.contains("sk-test"));
     }
 }

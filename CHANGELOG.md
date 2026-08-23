@@ -9,12 +9,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added (slice 4: freedesktop.org integration)
 
 - **`packaging/llm-quota-tray.desktop`** — Desktop Entry
-  (Type=Application, Exec=`llm-quota-tray %u`, Icon=llm-quota-tray,
-  Categories=Network, StartupNotify=true, StartupWMClass). Passes
-  `desktop-file-validate`. Provides the shell-launchable identity
-  that the tray has been missing — visible in `gnome-software`,
-  KDE Discover, the autostart dialog, and the file manager's
-  "Open With" menus.
+  (Type=Application, Exec=`llm-quota-tray`, Icon=llm-quota-tray,
+  Categories=Network;Monitor;, StartupNotify=true,
+  StartupWMClass). Passes `desktop-file-validate`. Provides the
+  shell-launchable identity that the tray has been missing —
+  visible in `gnome-software`, KDE Discover, the autostart
+  dialog, and the file manager's "Open With" menus.
 - **`packaging/io.github.dtg01100.llm-quota-tray.metainfo.xml`** —
   AppStream metadata (summary, description, URLs, MIT license,
   Categories, developer, OARS content rating, `launchable` link
@@ -22,10 +22,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `<screenshots>` / `<releases>` blocks — keeping the CHANGELOG
   as the single source of truth for release notes.
 - **`packaging/icons/hicolor/scalable/apps/llm-quota-tray.svg`** —
-  256×256 SVG app icon. A solid circle in the inner-status
-  "throttled" color (`#e01b24`), matching the static chip dot
-  (`icon::write_static_svgs`) so the desktop icon and the red
-  chip look like the same shape at any size.
+  256×256 SVG app icon. A ring with center dot, with the top
+  1/3 missing (120° gap centered at 12 o'clock), in the
+  project's default outer accent color (`#3584e4` / `#1c71d8`).
+  The missing-1/3 silhouette doubles as a quota-meter metaphor
+  and visually distinguishes the launcher entry from the chip
+  itself (the chip is a complete ring at 100%, this icon is
+  always 2/3).
 - **`src/activation.rs`** — new module. Reads the XDG Activation
   token from `--token=<token>` CLI flag or `$XDG_ACTIVATION_TOKEN`
   env var (in that order), stores it in a `OnceLock`, and
@@ -67,6 +70,79 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   / Docker multi-container convention.
 - All 197 unit tests pass (was 188; +9 new for activation
   parsing/resolution).
+
+### Fixed (freedesktop.org integration follow-ups)
+
+- **`packaging/llm-quota-tray.desktop`** — added the missing
+  `Icon=llm-quota-tray` field (the icon was installed but never
+  referenced, so the launcher entry showed the generic
+  placeholder), widened `Categories` from `Network;` to
+  `Network;Monitor;` (one main + one additional, per the Desktop
+  Entry spec), and dropped `%u` from `Exec=` (the binary doesn't
+  accept URL arguments).
+- **`uninstall.sh`** — now removes the three freedesktop metadata
+  files installed by `install.sh` (`.desktop`, `.metainfo.xml`,
+  icon) and reruns `update-desktop-database` /
+  `gtk-update-icon-cache` so stale entries don't linger in the
+  launcher cache after uninstall.
+- **GitHub URL** — the repo URL in `CHANGELOG.md` link
+  references, `README.md` clone command, `RELEASING.md` clone
+  command, and both `<url>` blocks in the metainfo was the stale
+  `dtg01100/llm-quota-tray` name; now points at
+  `dtg01100/minimax-quota-tray` (matching the git remote).
+  `appstreamcli validate` previously warned both URLs as
+  `url-not-reachable`.
+- **App icon palette** — the launcher icon
+  (`packaging/icons/hicolor/scalable/apps/llm-quota-tray.svg`)
+  previously used the throttled-bucket color (`#e01b24`), which
+  reads as "something is wrong" anywhere outside the tray itself
+  (autostart UI, "Open With" menu, app drawer). Replaced with a
+  ring + center dot in the project's default outer accent color
+  (`#3584e4` / `#1c71d8`), with the top 1/3 missing as a
+  quota-meter metaphor — same family as the chip, neutral
+  palette, distinct silhouette.
+- **Launcher icon: SVG → PNG-only install set.** Originally shipped
+  as a single SVG under `scalable/apps/` (the canonical modern
+  best-practice), with three PNG fallbacks. The Icon Theme Spec
+  says the launcher always prefers a scalable variant when one
+  exists, so on hosts without a registered
+  `libpixbufloader-svg.so` (Linuxbrew-based hosts and immutable
+  distros like Bluefin / Fedora Atomic / Silverblue, which ship
+  `librsvg` but not the gdk-pixbuf SVG loader), loading the SVG
+  fails silently and the launcher entry shows blank. The new
+  install set is **PNGs only, at every common launcher size**
+  (16, 22, 24, 32, 48, 64, 96, 128, 256) so the launcher always
+  finds a file the loader can render at the size it asks for.
+  The master SVG moves to `packaging/icons/source/llm-quota-tray.svg`
+  (regeneration source for the PNGs, not installed). Regenerated
+  the PNGs at 8-bit color depth after a first pass produced
+  16-bit/color RGBA — `gdk-pixbuf` caps at 8-bit and silently
+  failed to render the 16-bit variant.
+- **XDG autostart wiring** — `install.sh` now also copies the
+  `.desktop` to `~/.config/autostart/llm-quota-tray.desktop`,
+  wiring up the GNOME Settings "Startup Applications" / KDE
+  Autostart toggle. The systemd user service remains the
+  canonical boot path (gives us `Restart=on-failure` and
+  `After=graphical-session.target`); the autostart entry is a
+  parallel UI affordance. Double-firing at login is safe — the
+  daemon's per-instance PID lock (`src/lock.rs`) detects the
+  live second instance and exits. `uninstall.sh` removes both
+  the autostart copy and the systemd symlink in
+  `default.target.wants/`.
+- **SNI signal emissions are now bounded.** `Tray::update()` and
+  `Tray::apply_menu()` route every D-Bus signal emission
+  (`NewIcon`, `NewTitle`, `NewStatus`, `ItemsUpdated`,
+  `LayoutUpdated`) through a new `emit_signal_with_timeout()`
+  helper with a 5-second budget. The chip state in
+  `SharedState` is updated before the signal fires, so a missed
+  signal only delays the panel's view by one poll cycle — it
+  never deadlocks the daemon. The `RegisterStatusNotifierItem`
+  call at `Tray::new()` time gets the same treatment. Fixes the
+  `render_initial` hang we observed after a back-to-back restart
+  (the watcher was still cleaning up the previous daemon's SNI
+  registration; the new daemon's `new_icon` call blocked
+  indefinitely). Three unit tests (`emit_signal_with_timeout_*`)
+  lock in the contract.
 
 ### Added (slice 3: freedesktop-portal migration)
 
@@ -315,8 +391,8 @@ The conventional-changelog commits across the Rust port era
 (`6f2ecbf` … `c6ecad9`) are listed inline above by short SHA so the
 provenance is traceable without forcing a tag-by-tag breakdown.
 
-[Unreleased]: https://github.com/dtg01100/llm-quota-tray/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/dtg01100/llm-quota-tray/releases/tag/v0.3.0
+[Unreleased]: https://github.com/dtg01100/minimax-quota-tray/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/dtg01100/minimax-quota-tray/releases/tag/v0.3.0
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html

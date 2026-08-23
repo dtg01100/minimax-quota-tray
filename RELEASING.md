@@ -170,7 +170,7 @@ CHANGELOG has been audited against:
 
 ```sh
 # Fresh checkout, from scratch
-git clone https://github.com/dtg01100/llm-quota-tray.git /tmp/release-check
+git clone https://github.com/dtg01100/minimax-quota-tray.git /tmp/release-check
 cd /tmp/release-check
 ./install.sh
 

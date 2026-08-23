@@ -50,6 +50,37 @@ const MENU_PATH: &str = "/Menu";
 const WATCHER_NAME: &str = "org.kde.StatusNotifierWatcher";
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 
+/// Maximum time to wait for a single SNI signal emission before
+/// giving up. Bounds the daemon against a wedged D-Bus watcher or a
+/// stuck connection write. Without this, `render_initial` can hang
+/// forever on the first `new_icon` call when the watcher is in a
+/// bad state (we observed this once after a back-to-back restart —
+/// see `docs/freedesktop-integration.md`). The chip state in
+/// `SharedState` is updated before the signal is emitted, so a
+/// missed signal only delays the panel's view by at most one poll
+/// cycle (`refresh_seconds`).
+const SIGNAL_EMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Emit an SNI signal with a bounded wait. Logs a warning on
+/// timeout or error and continues — never propagates the failure.
+/// Required because `zbus::Connection::emit_signal()` can block
+/// indefinitely when the session bus / watcher is in a degraded
+/// state; without this, a single bad emission wedges the entire
+/// poll loop (and `render_initial` at startup).
+async fn emit_signal_with_timeout<F>(name: &'static str, fut: F)
+where
+    F: std::future::Future<Output = zbus::Result<()>>,
+{
+    match tokio::time::timeout(SIGNAL_EMIT_TIMEOUT, fut).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("SNI signal {name}: emission failed: {e}"),
+        Err(_elapsed) => log::warn!(
+            "SNI signal {name}: emission timed out after {SIGNAL_EMIT_TIMEOUT:?}; \
+             chip state is updated but the host may not refresh until the next poll"
+        ),
+    }
+}
+
 /// Shared state behind both the SNI and dbusmenu interfaces.
 ///
 /// `menu_state` is the full menu tree (the dbusmenu server reads it
@@ -490,15 +521,15 @@ impl Tray {
         }
         *self.shared.tool_tip_desc.lock().await = tool_tip_desc.to_string();
         let emitter = self.iface_ref.signal_emitter();
-        StatusNotifierItem::new_icon(emitter)
-            .await
-            .context("emit NewIcon")?;
-        StatusNotifierItem::new_title(emitter)
-            .await
-            .context("emit NewTitle")?;
-        StatusNotifierItem::new_status(emitter)
-            .await
-            .context("emit NewStatus")?;
+        // SNI signal emissions are best-effort. The shared state above
+        // is already updated, so even if every signal below hangs or
+        // errors, the chip is correct on the next D-Bus property read
+        // by the host. The timeout guards against `render_initial`
+        // deadlocking on a stale watcher (observed once after a
+        // back-to-back restart — see `docs/freedesktop-integration.md`).
+        emit_signal_with_timeout("NewIcon", StatusNotifierItem::new_icon(emitter)).await;
+        emit_signal_with_timeout("NewTitle", StatusNotifierItem::new_title(emitter)).await;
+        emit_signal_with_timeout("NewStatus", StatusNotifierItem::new_status(emitter)).await;
         Ok(())
     }
 
@@ -535,12 +566,20 @@ impl Tray {
         // fail initialization.
         let emitter = self.menu_iface_ref.signal_emitter();
         if new_revision != prev_revision {
-            DBusMenu::items_updated(emitter, new_revision, Vec::new())
-                .await
-                .context("emit ItemsUpdated")?;
-            DBusMenu::layout_updated(emitter, new_revision, ROOT_ID)
-                .await
-                .context("emit LayoutUpdated")?;
+            // Same best-effort contract as `update()`: menu state is
+            // already updated; signals are advisory. A stuck watcher
+            // can delay the panel's view but must not deadlock the
+            // poll loop.
+            emit_signal_with_timeout(
+                "ItemsUpdated",
+                DBusMenu::items_updated(emitter, new_revision, Vec::new()),
+            )
+            .await;
+            emit_signal_with_timeout(
+                "LayoutUpdated",
+                DBusMenu::layout_updated(emitter, new_revision, ROOT_ID),
+            )
+            .await;
         }
         Ok(())
     }
@@ -577,16 +616,30 @@ impl Tray {
 async fn register_with_watcher(conn: &Connection) -> Result<()> {
     let pid = std::process::id();
     let service = format!("org.kde.StatusNotifierItem-{pid}-1");
-    conn.call_method(
-        Some(WATCHER_NAME),
-        WATCHER_PATH,
-        Some("org.kde.StatusNotifierWatcher"),
-        "RegisterStatusNotifierItem",
-        &(service,),
-    )
+    // Same bounded-wait contract as `emit_signal_with_timeout`: a
+    // stuck watcher can hang the registration call indefinitely,
+    // which would deadlock `Tray::new` and prevent the daemon from
+    // ever starting. The registration is best-effort anyway (the
+    // watcher auto-discovers via the bus name per SNI spec), so a
+    // timeout is harmless — we just log and fall through.
+    match tokio::time::timeout(SIGNAL_EMIT_TIMEOUT, async {
+        conn.call_method(
+            Some(WATCHER_NAME),
+            WATCHER_PATH,
+            Some("org.kde.StatusNotifierWatcher"),
+            "RegisterStatusNotifierItem",
+            &(service,),
+        )
+        .await
+    })
     .await
-    .context("call RegisterStatusNotifierItem on watcher")?;
-    Ok(())
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(anyhow::Error::from(e).context("RegisterStatusNotifierItem on watcher")),
+        Err(_elapsed) => Err(anyhow::anyhow!(
+            "RegisterStatusNotifierItem timed out after {SIGNAL_EMIT_TIMEOUT:?}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -686,5 +739,73 @@ mod tests {
         fn _signature_check(_x: (String, (String, String), bool)) {}
         // Compile-time assertion.
         let _ = _signature_check;
+    }
+
+    /// `emit_signal_with_timeout` must swallow both error variants
+    /// and never panic, never hang past the timeout. This is the
+    /// invariant that protects `render_initial` from a wedged
+    /// watcher after a back-to-back restart.
+    #[tokio::test]
+    async fn emit_signal_with_timeout_returns_immediately_on_success() {
+        // Should return quickly (well within the 5s SIGNAL_EMIT_TIMEOUT).
+        let started = std::time::Instant::now();
+        emit_signal_with_timeout(
+            "ok",
+            async { Ok::<(), zbus::Error>(()) },
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "fast Ok should return in <100ms, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_signal_with_timeout_swallows_errors() {
+        let started = std::time::Instant::now();
+        // Future resolves to Err — must not propagate. zbus::Error's
+        // InputOutput variant wraps `Arc<io::Error>` (shared so the
+        // error is cheap to clone across D-Bus boundaries).
+        emit_signal_with_timeout(
+            "err",
+            async {
+                let io = std::io::Error::new(std::io::ErrorKind::Other, "test");
+                Err::<(), zbus::Error>(zbus::Error::InputOutput(std::sync::Arc::new(io)))
+            },
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "fast Err should return in <100ms, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Real-time test (takes ~`SIGNAL_EMIT_TIMEOUT` to run): proves
+    /// the helper aborts a future that would otherwise hang the
+    /// caller forever. We use a real `tokio::time::sleep` past the
+    /// timeout (instead of `start_paused` which would require the
+    /// `test-util` feature flag) — the wall time is bounded by
+    /// `SIGNAL_EMIT_TIMEOUT`.
+    #[tokio::test]
+    async fn emit_signal_with_timeout_aborts_on_hang() {
+        let started = std::time::Instant::now();
+        emit_signal_with_timeout("hang", async move {
+            // Sleep longer than the helper's timeout — proves the
+            // timeout fires first (the future never gets to resolve
+            // with Ok here; the wrapper is just shaped to match
+            // the helper's bound).
+            tokio::time::sleep(SIGNAL_EMIT_TIMEOUT + std::time::Duration::from_secs(1)).await;
+            Ok::<(), zbus::Error>(())
+        })
+        .await;
+        // Must return at or before the timeout, not after the sleep
+        // would naturally resolve. Allow a generous margin for CI jitter.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed <= SIGNAL_EMIT_TIMEOUT + std::time::Duration::from_millis(500),
+            "should abort at SIGNAL_EMIT_TIMEOUT, took {elapsed:?}"
+        );
     }
 }

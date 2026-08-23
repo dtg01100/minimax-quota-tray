@@ -35,8 +35,8 @@
     <keyword>Indicator</keyword>
     <keyword>Status</keyword>
   </keywords>
-  <url type="homepage">https://github.com/dtg01100/llm-quota-tray</url>
-  <url type="bugtracker">https://github.com/dtg01100/llm-quota-tray/issues</url>
+  <url type="homepage">https://github.com/dtg01100/minimax-quota-tray</url>
+  <url type="bugtracker">https://github.com/dtg01100/minimax-quota-tray/issues</url>
   <developer id="io.github.dtg01100">
     <name>David Lafreniere</name>
   </developer>

@@ -102,8 +102,8 @@ the host's panel does all the rendering from the dbusmenu tree.
 ## Install
 
 ```bash
-git clone https://github.com/dtg01100/llm-quota-tray.git
-cd llm-quota-tray
+git clone https://github.com/dtg01100/minimax-quota-tray.git
+cd minimax-quota-tray
 ./install.sh
 ```
 

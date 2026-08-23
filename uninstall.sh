@@ -12,7 +12,41 @@ systemctl --user daemon-reload                   2>/dev/null || true
 # Remove installed files
 rm -f "$HOME/.local/bin/llm-quota-tray"
 rm -f "$HOME/.config/systemd/user/llm-quota-tray.service"
-echo "removed: binary + systemd unit"
+# Drop the XDG autostart copy (so the GNOME Settings toggle
+# reflects "not installed" after uninstall). The systemd symlink
+# in `default.target.wants/` is also a file — remove it explicitly
+# so `disable` warnings don't fire on next login.
+rm -f "$HOME/.config/autostart/llm-quota-tray.desktop"
+rm -f "$HOME/.config/systemd/user/default.target.wants/llm-quota-tray.service"
+echo "removed: binary + systemd unit + autostart entry"
+
+# Remove the freedesktop metadata files installed by install.sh.
+# Same XDG Base Directory defaults as install.sh; XDG_DATA_HOME
+# overrides the data root for both.
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+DESKTOP_DIR="$XDG_DATA_HOME/applications"
+METAINFO_DIR="$XDG_DATA_HOME/appdata"
+ICON_BASE="$XDG_DATA_HOME/icons/hicolor"
+rm -f "$DESKTOP_DIR/llm-quota-tray.desktop"
+rm -f "$METAINFO_DIR/io.github.dtg01100.llm-quota-tray.metainfo.xml"
+# Drop the PNG fallbacks at every size we ship. Same set install.sh
+# writes — keeps uninstall/install in lockstep if the size list ever
+# changes. We also drop any leftover SVG from older installs (the
+# launcher SVG was removed from the install set; this catches the
+# stale file from previous installs).
+for size in 16x16 22x22 24x24 32x32 48x48 64x64 96x96 128x128 256x256; do
+  rm -f "$ICON_BASE/$size/apps/llm-quota-tray.png"
+done
+rm -f "$ICON_BASE/scalable/apps/llm-quota-tray.svg"
+echo "removed: freedesktop metadata (.desktop, metainfo, icons)"
+
+# Refresh the desktop and icon caches so the launcher stops
+# showing the uninstalled entry on the next panel render. Both
+# tools are best-effort, matching install.sh.
+command -v update-desktop-database >/dev/null 2>&1 \
+  && update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 \
+  && gtk-update-icon-cache -f -t "$XDG_DATA_HOME/icons/hicolor" 2>/dev/null || true
 
 # Optionally remove config dir
 if [ -d "$HOME/.config/llm-quota-tray" ]; then

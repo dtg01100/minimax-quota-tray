@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  App icon for the desktop shell (autostart UI, gnome-software,
+  KDE Discover, file manager thumbnails).
+
+  Visual contract: a ring with center dot, missing the top 1/3
+  (120° gap centered at 12 o'clock). Drawn in the project's
+  brand accent color (`#3584e4` / `#1c71d8` = the default outer
+  ring color from `provider::DEFAULT_OUTER_COLOR`) instead of
+  the bucket palette, so the launcher entry reads as identity
+  rather than as an alert.
+
+  Why the gap: the missing-1/3 silhouette doubles as a
+  quota-meter metaphor — a progress arc that never completes —
+  and visually distinguishes this icon from the chip at a
+  glance (the chip is a complete ring at 100%; this icon is
+  always 2/3, by design). The gap is centered at 12 o'clock
+  (the same start position the chip's progress arc uses in
+  `icon::write_ring_svg`), so the family resemblance holds
+  across both.
+
+  Why not the throttled color: an earlier version used the
+  throttled-red `#e01b24`. A solid red dot reads as
+  "something is wrong" anywhere outside the tray itself
+  (autostart UI, "Open With" menu, app drawer). The chip
+  itself carries bucket colors at runtime; this icon
+  doesn't need to.
+
+  Geometry: outer arc at r=88, stroke-width=20, spanning 240°
+  (2/3 of the circle) from 2 o'clock to 10 o'clock with the
+  gap at the top. Inner dot at r=40 in `#1c71d8` (darker
+  shade of the same blue, for depth). Both leave a ~30px
+  margin on every side for the panel's icon-padding
+  convention. Aspect ratios match the chip (ring/inner ratio
+  ≈ 0.45) so the icon and the chip read as the same family
+  at any size.
+
+  Stroke linecap is `butt` (the default) — `round` would
+  extend each end by half the stroke width and visually
+  shrink the gap, defeating the "missing third" proportion.
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="256" height="256" viewBox="0 0 256 256">
+  <!-- Outer arc: 240° from 2 o'clock (330°) to 10 o'clock (210°),
+       sweep=1 (clockwise) and large-arc=1 (240° > 180°).
+       Start/end coordinates: 88·cos/sin at the two angles
+       around the center (128, 128). -->
+  <path d="M 204.21 84 A 88 88 0 1 1 51.79 84"
+        fill="none" stroke="#3584e4" stroke-width="20"/>
+  <!-- Inner dot (darker shade of the same blue, for depth) -->
+  <circle cx="128" cy="128" r="40" fill="#1c71d8"/>
+</svg>

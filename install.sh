@@ -64,6 +64,23 @@ install -d "$HOME/.config/systemd/user"
 install -m 0644 "$ROOT/llm-quota-tray.service" "$SERVICE_DEST"
 echo "installed: $SERVICE_DEST"
 
+# Install the XDG autostart entry. This wires up GNOME Settings'
+# "Startup Applications" / KDE's "Autostart" toggle for the user —
+# toggling "Start Automatically" creates / removes this file
+# (or sets `Hidden=true`). Note: this is in addition to the
+# systemd service above, not a replacement — the systemd service
+# is the canonical boot path (it gives us Restart=on-failure and
+# After=graphical-session.target). The autostart .desktop is here
+# purely so the user-facing toggle in the shell's settings panel
+# is functional. Double-firing at login is safe: the daemon's
+# per-instance PID lock (`src/lock.rs`) detects the live second
+# instance and exits.
+AUTOSTART_DIR="$HOME/.config/autostart"
+AUTOSTART_DEST="$AUTOSTART_DIR/llm-quota-tray.desktop"
+install -d "$AUTOSTART_DIR"
+install -m 0644 "$ROOT/packaging/llm-quota-tray.desktop" "$AUTOSTART_DEST"
+echo "installed: $AUTOSTART_DEST"
+
 # First-run config (don't clobber an existing one)
 if [ ! -f "$CONFIG_DEST" ]; then
   install -d -m 0700 "$CONFIG_DIR"
@@ -92,13 +109,34 @@ if [ -f "$ROOT/packaging/io.github.dtg01100.llm-quota-tray.metainfo.xml" ]; then
     "$METAINFO_DIR/io.github.dtg01100.llm-quota-tray.metainfo.xml"
   echo "installed: $METAINFO_DIR/io.github.dtg01100.llm-quota-tray.metainfo.xml"
 fi
-if [ -f "$ROOT/packaging/icons/hicolor/scalable/apps/llm-quota-tray.svg" ]; then
-  install -d "$ICON_DIR"
-  install -m 0644 \
-    "$ROOT/packaging/icons/hicolor/scalable/apps/llm-quota-tray.svg" \
-    "$ICON_DIR/llm-quota-tray.svg"
-  echo "installed: $ICON_DIR/llm-quota-tray.svg"
-fi
+# Install the hicolor-theme icons. We intentionally ship ONLY PNGs
+# (no SVG under `scalable/`) for the launcher icon, despite the
+# canonical modern best-practice being SVG. Reason: the freedesktop
+# Icon Theme Spec says the launcher always prefers a scalable
+# variant when one exists, and silently uses it; on hosts without a
+# registered `libpixbufloader-svg.so` (notably Linuxbrew-based and
+# immutable distros like Bluefin / Fedora Atomic / Silverblue with
+# an empty `loaders.cache`), loading the SVG fails and the launcher
+# entry shows blank. Shipping PNGs at every common size (16, 22, 24,
+# 32, 48, 64, 96, 128, 256) means there's always a file the loader
+# can render at the size the panel/launcher asks for. The canonical
+# master SVG lives at `packaging/icons/source/llm-quota-tray.svg`
+# and is the regeneration source for the PNGs.
+#
+# `ICON_DIR` (used later in the cache-refresh step) points at the
+# 256x256 directory — any non-empty hicolor subdir works for
+# `gtk-update-icon-cache`.
+ICON_BASE="$XDG_DATA_HOME/icons/hicolor"
+ICON_DIR="$ICON_BASE/256x256/apps"
+for size in 16x16 22x22 24x24 32x32 48x48 64x64 96x96 128x128 256x256; do
+  src="$ROOT/packaging/icons/hicolor/$size/apps/llm-quota-tray.png"
+  if [ -f "$src" ]; then
+    dest="$ICON_BASE/$size/apps"
+    install -d "$dest"
+    install -m 0644 "$src" "$dest/llm-quota-tray.png"
+    echo "installed: $dest/llm-quota-tray.png"
+  fi
+done
 # Refresh the icon and desktop caches so the freshly-installed
 # files become visible to the desktop shell immediately, without
 # requiring a logout. Both `update-desktop-database` and

@@ -24,7 +24,17 @@ Directory locations (defaults shown; `XDG_DATA_HOME` overrides):
 |---|---|---|
 | `packaging/llm-quota-tray.desktop` | `$XDG_DATA_HOME/applications/llm-quota-tray.desktop` | App launcher entry, autostart checkbox in `gnome-control-center`, shell context menu |
 | `packaging/io.github.dtg01100.llm-quota-tray.metainfo.xml` | `$XDG_DATA_HOME/appdata/io.github.dtg01100.llm-quota-tray.metainfo.xml` | AppStream index (`gnome-software`, KDE Discover) |
-| `packaging/icons/hicolor/scalable/apps/llm-quota-tray.svg` | `$XDG_DATA_HOME/icons/hicolor/scalable/apps/llm-quota-tray.svg` | hicolor theme icon (autostart UI, file manager thumbnails) |
+| `packaging/icons/hicolor/16x16/apps/llm-quota-tray.png` | `$XDG_DATA_HOME/icons/hicolor/16x16/apps/llm-quota-tray.png` | hicolor theme icon, 16×16 |
+| `packaging/icons/hicolor/22x22/apps/llm-quota-tray.png` | `$XDG_DATA_HOME/icons/hicolor/22x22/apps/llm-quota-tray.png` | hicolor theme icon, 22×22 (panel size) |
+| `packaging/icons/hicolor/24x24/apps/llm-quota-tray.png` | `$XDG_DATA_HOME/icons/hicolor/24x24/apps/llm-quota-tray.png` | hicolor theme icon, 24×24 (GNOME top bar) |
+| `packaging/icons/hicolor/32x32/apps/llm-quota-tray.png` | `$XDG_DATA_HOME/icons/hicolor/32x32/apps/llm-quota-tray.png` | hicolor theme icon, 32×32 |
+| `packaging/icons/hicolor/48x48/apps/llm-quota-tray.png` | `$XDG_DATA_HOME/icons/hicolor/48x48/apps/llm-quota-tray.png` | hicolor theme icon, 48×48 (app drawer) |
+| `packaging/icons/hicolor/64x64/apps/llm-quota-tray.png` | `$XDG_DATA_HOME/icons/hicolor/64x64/apps/llm-quota-tray.png` | hicolor theme icon, 64×64 |
+| `packaging/icons/hicolor/96x96/apps/llm-quota-tray.png` | `$XDG_DATA_HOME/icons/hicolor/96x96/apps/llm-quota-tray.png` | hicolor theme icon, 96×96 (HiDPI launcher) |
+| `packaging/icons/hicolor/128x128/apps/llm-quota-tray.png` | `$XDG_DATA_HOME/icons/hicolor/128x128/apps/llm-quota-tray.png` | hicolor theme icon, 128×128 (HiDPI launcher) |
+| `packaging/icons/hicolor/256x256/apps/llm-quota-tray.png` | `$XDG_DATA_HOME/icons/hicolor/256x256/apps/llm-quota-tray.png` | hicolor theme icon, 256×256 (large launcher / Settings) |
+| `packaging/icons/source/llm-quota-tray.svg` | *(not installed)* | Master SVG; regeneration source for the PNGs |
+| `packaging/llm-quota-tray.desktop` | `$HOME/.config/autostart/llm-quota-tray.desktop` | XDG autostart entry — wires up GNOME Settings' "Startup Applications" / KDE Autostart toggle. Parallel to the systemd user service above (the service is the canonical boot path; this entry exists so the user-facing toggle in the shell is functional). Double-firing at login is deduped by the daemon's PID lock (`src/lock.rs`). |
 
 `update-desktop-database` and `gtk-update-icon-cache` are invoked
 best-effort after install so the new files become visible to the
@@ -129,3 +139,28 @@ Each can be revisited when there's a concrete need (Flathub
 packaging would justify the flatpak manifest + screenshots;
 flatpak sandboxing would justify the `org.freedesktop.Application`
 interface; etc.).
+
+## Operating notes
+
+### D-Bus signal emissions are bounded
+
+Every SNI signal emitted by the daemon
+(`NewIcon`/`NewTitle`/`NewStatus` for the chip,
+`ItemsUpdated`/`LayoutUpdated` for the menu) is wrapped in
+`emit_signal_with_timeout()` (`src/sni.rs`) with a 5-second
+budget, and the explicit `RegisterStatusNotifierItem` call at
+startup gets the same treatment. The chip state in
+`SharedState` is updated **before** the signal is fired, so a
+missed signal only delays the panel's view by one poll cycle
+(`refresh_seconds`) — it can never deadlock the daemon.
+
+We observed the original bug exactly once: after a back-to-back
+restart (SIGTERM the old daemon, start the new one within a few
+seconds), the new daemon hung in `render_initial` because the
+SNI watcher was still cleaning up the previous daemon's
+registration and `Connection::emit_signal()` blocked indefinitely
+against it. The daemon never logged the third "started; refresh
+every" line and the chip stayed at its initial fallback icon
+(`dialog-information-symbolic`) forever. Recovery required a
+clean `systemctl --user stop` + `sleep 3` + `start`. The fix
+removes that whole failure mode.

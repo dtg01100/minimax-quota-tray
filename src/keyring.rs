@@ -520,6 +520,13 @@ async fn wait_for_prompt(conn: &Connection, prompt: &OwnedObjectPath) -> Result<
         .receive_signal("Completed")
         .await
         .context("subscribe to Completed")?;
+    // Loop is just a structured-await for the first signal: the
+    // body returns on the first iteration, so clippy flags this
+    // as `never_loop`. We keep the `while let` so the
+    // cancellation path (stream ends before Completed) still
+    // falls through to the `bail!` below — a bare `.next().await`
+    // would lose that error path. The clippy suppression is the
+    // honest tradeoff.
     #[allow(clippy::never_loop)]
     while let Some(signal) = stream.next().await {
         let body = signal.body();

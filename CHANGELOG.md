@@ -59,6 +59,72 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   each documented as a future-work item with the trigger that
   would justify adding it.
 
+### Documentation (post-slice-4 sweep)
+
+The "fully documented" goal landed across four commits
+(`ccfd748`, `3b93584`, `6b3a002`, `1c7227f`). Nothing here is
+user-visible behavior — it's a docs-only round covering five
+new reference docs, rustdoc hygiene, CONTRIBUTING.md, and
+expanded `///` coverage on every public API. Project charter
+unchanged; no code paths changed.
+
+- **Five new reference docs** in `docs/`:
+  - `glossary.md` — single-page term index (bucket, shape,
+    epoch, sentinel, sidecar, …) with deep links to where
+    each term is fully explained.
+  - `logging.md` — per-module log guide, `RUST_LOG` recipes,
+    common diagnostic queries, what does NOT get logged for
+    safety.
+  - `performance.md` — RSS/CPU/polling budgets, scaling
+    with multiple instances, profiling recipes.
+  - `faq.md` — common "how do I…" questions that don't fit
+    symptom-driven troubleshooting.
+  - `security-model.md` — threat model (assets, trust
+    boundaries, network egress, supply chain, hardening
+    checklist, explicit non-defenses).
+- **CHANGELOG entry for the SNI watcher-restart fix** that
+  landed in commit `2573b68` (was missing from this file).
+- **Cargo.toml package metadata** — added `repository`,
+  `homepage`, `documentation`, `readme`, `keywords`,
+  `categories`, `authors`, `rust-version`, and `exclude` so
+  the crates.io and docs.rs pages render correctly. Only
+  `description` and `license` were set before.
+- **`src/util.rs`** module header expanded from one line to
+  36 lines describing the function groupings.
+- **Rustdoc hygiene** — 9 pre-existing warnings fixed
+  (bare URLs → `<…>` wrapped, unclosed HTML tags backtick-
+  quoted, one unresolved intra-doc link rephrased). Net
+  `cargo doc --no-deps --release` warnings: 9 → 0.
+- **`///` docs on public APIs** — 5 previously-undocumented
+  public items now documented (`icon::Bucket`,
+  `icon::ring_svg_path`, `menu::bar_id` / `burn_id`,
+  `menu::MenuInner::new`); 11 `pub const` items in `menu.rs`
+  documented (every dbusmenu item id now explains the row it
+  belongs to); `fetch::HttpClient` re-export and
+  `config::CONFIG_FILENAME` documented.
+- **`# Errors` sections** on 5 Result-returning public APIs
+  (`fetch::build_client`, `keyring::set`, `keyring::clear`,
+  `network::spawn_watcher`, `portal_openuri::open`).
+- **Doc-examples** in `///` blocks for the user-facing
+  format helpers in `src/util.rs` (`fmt_duration`,
+  `fmt_age`, `fmt_rate`, `bar_markup`, `fmt_cost`) and
+  `icon::Bucket`. Rendered as `text` blocks on docs.rs
+  (binary-only crate, so `cargo test --doc` has no library
+  target — code is shown but not compiled).
+- **Two new top-level READMEs** — `CONTRIBUTING.md`
+  (build/test/lint cheat-sheet, project conventions,
+  commit-message style, PR checklist) and
+  `examples/systemd/README.md` (per-instance systemd
+  units).
+- **`packaging/icons/source/README.md`** — the master
+  SVG's regeneration procedure, prerequisites, verification
+  step, and known pitfalls (16-bit PNGs, orientation-
+  anchor parity with the tray chip).
+- **`docs/modules.md` LOC refresh** — the at-a-glance
+  table of 19 modules was 3 commits stale; all line
+  counts updated to current `wc -l` output. Intro
+  "Roughly 10,000 lines" → "Roughly 11,000 lines".
+
 ### Notes (slice 4)
 - **Lightweight charter preserved.** The activation-token plumbing
   adds ~130 lines to the codebase (one new module + two

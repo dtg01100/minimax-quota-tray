@@ -75,6 +75,24 @@ const TRACK_OPACITY: f32 = 0.25;
 /// Ranks are `Ord`-ordered by significance so the worst window's
 /// bucket can be selected with `.max()`. See [`bucket_for`] for the
 /// selection rule.
+///
+/// # Examples
+///
+/// ```text
+/// use crate::icon::Bucket;
+///
+/// // Pick the worst across multiple windows — that's what the
+/// // chip color reflects.
+/// let worst = [Bucket::Normal, Bucket::Warning, Bucket::Normal]
+///     .into_iter()
+///     .max()
+///     .unwrap();
+/// assert_eq!(worst, Bucket::Warning);
+///
+/// // `Throttled` > `Warning` > `Normal` in rank.
+/// assert!(Bucket::Throttled > Bucket::Warning);
+/// assert!(Bucket::Warning > Bucket::Normal);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bucket {
     Normal,

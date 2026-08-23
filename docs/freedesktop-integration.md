@@ -164,3 +164,47 @@ every" line and the chip stayed at its initial fallback icon
 (`dialog-information-symbolic`) forever. Recovery required a
 clean `systemctl --user stop` + `sleep 3` + `start`. The fix
 removes that whole failure mode.
+
+### SNI watcher restarts are handled in-flight
+
+The GNOME `appindicator` extension restarts its
+`org.kde.StatusNotifierWatcher` periodically (extension reload,
+shell redraw, gnome-shell `r` reset, disable/re-enable of the
+extension). When the watcher's bus name disappears and a new
+owner claims it, our daemon's previously-good signal
+subscriptions still point at the dead peer — every subsequent
+`NewIcon` / `NewTitle` / `NewStatus` emission would fail with
+`Broken pipe (os error 32)` and the chip would vanish
+permanently until the daemon restarted. This shows up in the
+journal as a steady stream of
+`SNI signal NewIcon: emission failed: I/O error: Broken pipe`
+warnings every refresh cycle.
+
+The fix lives in `spawn_watcher_recovery()` (`src/sni.rs`):
+spawned at the end of `Tray::new`, this task subscribes to
+`org.freedesktop.DBus.NameOwnerChanged` with a server-side
+match rule filtering to `arg0 == "org.kde.StatusNotifierWatcher"`.
+On each "appeared" event (new owner non-empty), it
+re-calls `register_with_watcher()` best-effort and re-emits
+`NewIcon` / `NewTitle` / `NewStatus` / `ItemsUpdated` /
+`LayoutUpdated` so the new watcher renders the current chip
+state immediately rather than waiting for the next 2-min
+poll cycle.
+
+All recovery-time signals are also wrapped in
+`emit_signal_with_timeout()` so a stuck new watcher can't
+wedge the recovery task the same way the original bug could
+wedge `render_initial`. The manual reproduction (and
+verification of the fix) is:
+
+```sh
+# disable + re-enable the extension; this fully tears down
+# and rebuilds the watcher's dbus name ownership
+gnome-extensions disable appindicatorsupport@rgcjonas.gmail.com
+gnome-extensions enable  appindicatorsupport@rgcjonas.gmail.com
+
+# daemon should log:
+journalctl --user -u llm-quota-tray.service -f | grep "watcher re-appeared"
+# llm-quota-tray[…]: SNI watcher re-appeared on :1.N (was "…");
+#   re-registering and re-emitting state
+```

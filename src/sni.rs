@@ -480,6 +480,20 @@ impl Tray {
             );
         }
 
+        // Spawn the watcher-recovery task. The GNOME `appindicator`
+        // extension restarts its `org.kde.StatusNotifierWatcher`
+        // periodically (extension reload, shell redraw, gnome-shell
+        // `r` reset, …). When the watcher's bus name disappears and a
+        // new owner claims it, our daemon's previously-good signal
+        // subscriptions now point at a dead peer — every subsequent
+        // `NewIcon` / `NewTitle` / `NewStatus` emission then fails
+        // with `Broken pipe (os error 32)` and the chip vanishes
+        // permanently until the daemon restarts. This task
+        // re-registers + re-emits the current state whenever the
+        // watcher (re)appears, so the chip is resilient to
+        // extension restarts. See `docs/freedesktop-integration.md`.
+        spawn_watcher_recovery(conn.clone(), Arc::clone(&shared), iface_ref.clone(), menu_iface_ref.clone());
+
         Ok(Self {
             shared,
             iface_ref,
@@ -640,6 +654,138 @@ async fn register_with_watcher(conn: &Connection) -> Result<()> {
             "RegisterStatusNotifierItem timed out after {SIGNAL_EMIT_TIMEOUT:?}"
         )),
     }
+}
+
+/// Spawn a background task that listens for the SNI watcher
+/// (`org.kde.StatusNotifierWatcher`) re-appearing on the session
+/// bus and re-registers + re-emits the current chip state on each
+/// appearance. Cloned refs to the connection, shared state, and
+/// interface refs must outlive the task — caller (Tray::new)
+/// keeps them alive via the `Tray` returned from that fn.
+///
+/// The subscription is server-side-filtered by the bus name
+/// (`org.kde.DBus.NameOwnerChanged` match rule with `arg0 ==
+/// WATCHER_NAME`) so we don't see every name change in the
+/// session — just the ones for our watched name. The first
+/// explicit registration in `Tray::new` still runs at startup;
+/// this task only handles appearances *after* that point.
+fn spawn_watcher_recovery(
+    conn: Connection,
+    shared: Arc<SharedState>,
+    iface_ref: InterfaceRef<StatusNotifierItem>,
+    menu_iface_ref: InterfaceRef<DBusMenu>,
+) {
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        use zbus::fdo::DBusProxy;
+
+        let dbus = match DBusProxy::new(&conn).await {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("SNI watcher recovery: DBusProxy::new failed: {e}");
+                return;
+            }
+        };
+        // Server-side match rule: arg0 (the `name` argument of
+        // NameOwnerChanged) == WATCHER_NAME. Reduces per-session
+        // signal volume from "every bus name change" to just the
+        // ones we care about.
+        let mut stream = match dbus
+            .receive_name_owner_changed_with_args(&[(0u8, WATCHER_NAME)])
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!(
+                    "SNI watcher recovery: failed to subscribe to NameOwnerChanged: {e}"
+                );
+                return;
+            }
+        };
+        log::debug!(
+            "SNI watcher recovery: subscribed to NameOwnerChanged for {WATCHER_NAME}"
+        );
+        while let Some(signal) = stream.next().await {
+            let args = match signal.args() {
+                Ok(a) => a,
+                Err(e) => {
+                    log::debug!("SNI watcher recovery: bad signal args: {e}");
+                    continue;
+                }
+            };
+            // "Appeared" = a new owner now holds the name. We
+            // trigger on either a fresh appearance (old_owner empty)
+            // or an owner change (old_owner non-empty but the name
+            // transitioned to a different unique name) — both mean
+            // the previous watcher peer is gone and we must
+            // re-register against whoever owns the name now.
+            // `new_owner()` returns `&Optional<UniqueName<'_>>` (the
+            // zbus DBus type for an optional string); auto-deref to
+            // `Option<&UniqueName>` via `.as_ref()`.
+            let Some(new_owner) = args.new_owner().as_ref() else {
+                continue;
+            };
+            let old_owner_str = args
+                .old_owner()
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            log::info!(
+                "SNI watcher re-appeared on {new_owner} (was {old_owner_str:?}); \
+                 re-registering and re-emitting state"
+            );
+            // Best-effort explicit registration. The watcher
+            // auto-discovers us via our `org.kde.StatusNotifierItem-*`
+            // bus name anyway, but some hosts (older AppIndicator
+            // implementations, valgrind'd watchers, etc.) are more
+            // reliable with an explicit call. Failure is fine —
+            // auto-discovery still applies.
+            if let Err(e) = register_with_watcher(&conn).await {
+                log::debug!(
+                    "SNI watcher re-registration failed (auto-discovery still applies): {e}"
+                );
+            }
+            // Re-emit the current chip state so the new watcher
+            // renders the icon, title, status, and menu
+            // immediately — without this, the chip stays on the
+            // watcher's empty placeholder until our next 2-min
+            // poll cycle fires. Emitting unconditionally is safe
+            // (the dbusmenu client treats these as cache
+            // invalidation hints and idempotently re-fetches).
+            let sni_emitter = iface_ref.signal_emitter();
+            emit_signal_with_timeout(
+                "NewIcon (recovery)",
+                StatusNotifierItem::new_icon(sni_emitter),
+            )
+            .await;
+            emit_signal_with_timeout(
+                "NewTitle (recovery)",
+                StatusNotifierItem::new_title(sni_emitter),
+            )
+            .await;
+            emit_signal_with_timeout(
+                "NewStatus (recovery)",
+                StatusNotifierItem::new_status(sni_emitter),
+            )
+            .await;
+            let menu_emitter = menu_iface_ref.signal_emitter();
+            let revision = *shared.menu_revision.lock().await;
+            emit_signal_with_timeout(
+                "ItemsUpdated (recovery)",
+                DBusMenu::items_updated(menu_emitter, revision, Vec::new()),
+            )
+            .await;
+            emit_signal_with_timeout(
+                "LayoutUpdated (recovery)",
+                DBusMenu::layout_updated(menu_emitter, revision, ROOT_ID),
+            )
+            .await;
+        }
+        // Stream ending means the connection is gone (daemon
+        // shutting down). No recovery needed — the next
+        // `Tray::new` will re-subscribe.
+        log::debug!("SNI watcher recovery: NameOwnerChanged stream ended");
+    });
 }
 
 #[cfg(test)]

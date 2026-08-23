@@ -26,9 +26,10 @@ libc + libsecret + libdbus).
 
 ## Tests
 
-The test surface is **~212 unit tests across 19 modules** (was 155
-after the gjs-to-Rust port; +57 added across the slices 1-4 work
-tracked in CHANGELOG.md), plus 2 ignored integration tests. Run them all:
+The test surface is **261 unit tests across 19 modules** (was 212 at
+the previous audit; +49 added across the SNI-recovery + doc-tests +
+clippy-hardening rounds since), plus 2 ignored integration tests. Run
+them all:
 
 ```sh
 cargo test                             # unit tests only — fast, no D-Bus needed
@@ -41,26 +42,26 @@ cargo test config::tests::provider_templates_deserialize  # the schema-drift gua
 
 | Module              | Tests | Notes                                            |
 |---------------------|-------|--------------------------------------------------|
+| `main.rs`           | 30    | Bucket rank transitions, AppState, do_refresh branching, env-var precedence |
 | `icon.rs`           | 28    | Ring rendering, ARGB pixmap, bucket selectors, SVG caching |
-| `util.rs`           | 25    | Time + format helpers (the menu label formatters) |
-| `main.rs`           | 20    | Bucket rank transitions, AppState, do_refresh branching |
+| `fetch.rs`          | 26    | Auth dispatch, query-param rewriting, error sanitization, header-builder matrix |
+| `util.rs`           | 25    | Time + format helpers (the menu label formatters) + 5 `///` doc-examples |
 | `burn.rs`           | 18    | `slope_per_hour`, `compute_burn`, `decide_burn_row`, pct-only suppression |
-| `fetch.rs`          | 14    | Auth dispatch, query-param rewriting, error sanitization |
-| `parse.rs`          | 14    | `parse_plan` against canonical + legacy shapes + count_unit/currency/pricing_model_path |
+| `provider.rs`       | 17    | `AuthConfig::apply_to_endpoint`, default schemas, RingColors / PlanShape / AuthConfig builders |
 | `pricing.rs`        | 14    | Per-model price lookup, `cost_per_hour` formatting |
+| `parse.rs`          | 14    | `parse_plan` against canonical + legacy shapes + count_unit/currency/pricing_model_path |
 | `config.rs`         | 13    | Includes the schema-drift guard for `examples/providers/*.json` |
 | `menu.rs`           | 13    | dbusmenu tree construction, MenuCommand dispatch |
 | `keyring.rs`        | 11    | `secret_to_key` trimming, env-var precedence + 2 ignored D-Bus tests |
+| `sni.rs`            | 10    | SNI property dispatch + watcher-recovery task + emit_signal_with_timeout contract |
 | `activation.rs`     | 9     | CLI parsing (`--token=`, `--token <v>`, empty, absent, mixed), precedence |
 | `scheduler.rs`      | 8     | `next_interval` adaptive + backoff                |
+| `notify.rs`         | 7     | Urgency byte mapping + Send + Sync + portal vs fallback dispatch |
 | `instance.rs`       | 6     | CLI flag resolution, basename derivation         |
-| `provider.rs`       | 5     | `AuthConfig::apply_to_endpoint` URL encoding (logic lives in `parse.rs`/`fetch.rs`/`config.rs`) |
-| `sni.rs`            | 5     | SNI property dispatch                             |
-| `notify.rs`         | 3     | Urgency byte mapping + Send + Sync                |
-| `lock.rs`           | 2     | Acquire + stale takeover (uses isolated `XDG_RUNTIME_DIR`) |
-| `portal_openuri.rs` | 2     | Spec constants + signature pin                    |
-| `network.rs`        | 1     | NetEvent equality                                 |
-| **Total**            | **212** | (was 155 at the gjs port; +57 across slices 1-4) |
+| `portal_openuri.rs` | 6     | Spec constants + signature pin + portal vs fallback selection |
+| `lock.rs`           | 5     | Acquire + stale takeover + Drop + cross-process PID validation |
+| `network.rs`        | 5     | NetEvent equality + StateChanged → NetEvent mapping |
+| **Total**            | **261** | (was 212 at the previous audit; +49 since)        |
 
 ### Integration tests (`tests/integration.rs`)
 
@@ -117,7 +118,7 @@ ls "$XDG_RUNTIME_DIR/llm-quota-tray.pid"  # → file gone
 ### Pre-commit checklist
 
 1. `cargo build --release` succeeds (no new warnings).
-2. `cargo test` green (~155 tests).
+2. `cargo test` green (~261 tests).
 3. `cargo test -- --ignored` green if you changed the integration tests.
 4. If you touched `examples/providers/*.json`, `cargo test config::tests::provider_templates_deserialize` green.
 5. If you added a config field with a non-default default, add a
@@ -168,7 +169,7 @@ variant.
 
 ## How to add a new icon shape
 
-The icon is rendered by `src/icon.rs` (1,057 lines, 28 tests). Three
+The icon is rendered by `src/icon.rs` (1,189 lines, 28 tests). Three
 entry points:
 
 - `icon::render_pixmap(pct, bucket, &ring_colors)` — returns the live

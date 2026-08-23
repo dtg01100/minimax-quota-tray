@@ -134,7 +134,7 @@ provider.
 
 ## Tests
 
-The Rust port carries **~212 unit tests across 19 modules**, plus two
+The Rust port carries **261 unit tests across 19 modules**, plus two
 ignored integration tests that need a session D-Bus.
 
 ```bash

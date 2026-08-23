@@ -17,17 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system deps
-        # libsecret-1-dev + libdbus-1-dev are required by the build
-        # script's pkg-config probes; without them `cargo build` fails
-        # with "could not find system library `secret-1`".
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libsecret-1-dev \
-            libdbus-1-dev \
-            pkg-config
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

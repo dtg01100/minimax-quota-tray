@@ -706,12 +706,48 @@ mod tests {
     /// panic on a real bus).
     #[tokio::test]
     async fn get_layout_response_for_empty_menu() {
-        // We can't easily spin up a real bus here, but the menu
-        // helper functions are exercised by menu::tests. This just
-        // makes sure we can construct the response shape without
-        // a bus.
+        // The full GetLayout response shape for a freshly-constructed
+        // menu -- pinned so a regression in build_layout_response
+        // (which is also exercised by menu::tests but with a
+        // mutation pattern) doesn't silently change the on-the-wire
+        // structure the panel receives.
+        use crate::menu::{
+            DASHBOARD_ID, ERROR_ID, HEADER_ID, QUIT_ID, REFRESH_ID, SEP_1_ID, SEP_2_ID,
+            SEP_3_ID, SET_KEY_ID, THROTTLED_ID,
+        };
+
         let menu = MenuInner::new();
-        let (_rev, _layout) = menu::build_layout_response(&menu, ROOT_ID, true);
+        let (revision, layout) = menu::build_layout_response(&menu, ROOT_ID, true);
+
+        // Revision starts at 1 (matches MenuInner::new in menu.rs).
+        assert_eq!(revision, 1, "new MenuInner must start at revision 1");
+
+        // Layout shape: (id, properties, children).
+        let (id, props, children) = layout;
+        assert_eq!(id, ROOT_ID, "root item id must be ROOT_ID (0)");
+
+        // Properties must include the required dbusmenu fields.
+        // For non-separator items (the root), build_properties sets:
+        // "type", "label", "enabled", "visible", "children-display".
+        for required_key in ["type", "label", "enabled", "visible", "children-display"] {
+            assert!(
+                props.contains_key(required_key),
+                "missing required dbusmenu property {required_key:?}"
+            );
+        }
+
+        // Children must include every static action item the menu
+        // ships by default. The exact order matches
+        // MenuInner::new's initial root_children list.
+        assert_eq!(
+            children.len(),
+            10,
+            "default menu must have 10 root children (1 header + 1 throttled + 1 error + 3 separators + 4 actions)"
+        );
+        // Each child is a zvariant::Value::Structure wrapping an ItemLayout;
+        // we don't introspect the deep structure here -- menu::tests
+        // exercises that exhaustively. We just confirm the count is
+        // stable so a regression in MenuInner::new surfaces.
     }
 
     #[test]

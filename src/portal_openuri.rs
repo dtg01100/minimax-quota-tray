@@ -99,14 +99,7 @@ pub async fn open(uri: &str, activation_token: Option<&str>) -> Result<()> {
     // https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.OpenURI.html
     // (OpenURI portal v4+). When present, the portal uses it to
     // animate the chooser dialog from the originating click.
-    let mut options: std::collections::HashMap<String, zbus::zvariant::Value<'_>> =
-        std::collections::HashMap::new();
-    if let Some(tok) = activation_token {
-        options.insert(
-            "activation_token".to_string(),
-            zbus::zvariant::Value::Str(tok.into()),
-        );
-    }
+    let options = build_open_uri_options(activation_token);
 
     // `parent_window` is "" for apps without a toplevel window —
     // we're a tray icon, no parent.
@@ -122,6 +115,39 @@ pub async fn open(uri: &str, activation_token: Option<&str>) -> Result<()> {
     // link simply doesn't open, which is the same observable
     // outcome as `xdg-open` failing silently.
     Ok(())
+}
+
+
+
+/// Build the `a{sv}` options vardict for the `OpenURI` portal call.
+///
+/// Extracted from `open()` so the activation_token insertion logic
+/// can be unit-tested without a session D-Bus.
+///
+/// Per the OpenURI portal spec
+/// (<https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.OpenURI.html>):
+///
+/// - `ask` (b) — when true, forces a chooser dialog every time.
+///   We leave it unset so the portal uses its remembered default
+///   handler (matches xdg-open's behavior on a desktop with a
+///   configured default browser).
+/// - `activation_token` (s) — OpenURI portal v4+. When present,
+///   the portal uses it to animate the chooser dialog from the
+///   originating click. Pass `None` to omit.
+///
+/// Returns an empty HashMap when `activation_token` is `None`
+/// (the common case for menu clicks fired long after startup, when
+/// the launch-context token has expired).
+pub(crate) fn build_open_uri_options<'a>(
+    activation_token: Option<&'a str>,
+) -> std::collections::HashMap<String, zbus::zvariant::Value<'a>> {
+    use std::collections::HashMap;
+    use zbus::zvariant::Value;
+    let mut options: HashMap<String, Value<'a>> = HashMap::new();
+    if let Some(tok) = activation_token {
+        options.insert("activation_token".to_string(), Value::Str(tok.into()));
+    }
+    options
 }
 
 /// Marker that keeps the lazy `OnceCell` import reachable during
@@ -156,6 +182,67 @@ mod tests {
         // to the arg tuple surfaces as a compile failure rather
         // than a runtime panic at the portal boundary.
         let _ = std::marker::PhantomData::<fn(&str, &str) -> ()>;
+    }
+
+    #[test]
+    fn build_options_empty_when_no_activation_token() {
+        // The common case: a menu click fired long after startup,
+        // when the launch-context XDG Activation token has expired.
+        // The options vardict must be empty so the portal doesn't
+        // see a stale token (or an empty string).
+        let opts = build_open_uri_options(None);
+        assert!(opts.is_empty());
+    }
+
+    #[test]
+    fn build_options_inserts_activation_token_when_present() {
+        // The token must land in the vardict under the spec-pinned
+        // key "activation_token" (not e.g. "activationToken" or
+        // "xdg_activation_token" -- the spec is case-sensitive and
+        // the backend looks for the exact key).
+        let opts = build_open_uri_options(Some("launch-xyz"));
+        assert_eq!(opts.len(), 1, "exactly one key when token is set");
+        let val = opts.get("activation_token").expect("activation_token key present");
+        // The value must be a zbus::zvariant::Value::Str -- not
+        // an OwnedStr or a different encoding that wouldn't survive
+        // a round-trip through the D-Bus type system.
+        match val {
+            zbus::zvariant::Value::Str(s) => assert_eq!(s.as_str(), "launch-xyz"),
+            other => panic!("expected Value::Str, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_options_distinguishes_empty_string_from_none() {
+        // Per the XDG Activation spec, an empty token is equivalent
+        // to no token. The helper must NOT insert an empty key when
+        // Some("") is passed -- the caller is supposed to convert
+        // empty strings to None before calling. Pin this contract so
+        // a future change to silently strip empties doesn't quietly
+        // diverge.
+        let opts = build_open_uri_options(Some(""));
+        assert_eq!(
+            opts.len(),
+            1,
+            "empty Some is still Some -- helper preserves caller intent"
+        );
+        match opts.get("activation_token").unwrap() {
+            zbus::zvariant::Value::Str(s) => assert_eq!(s.as_str(), ""),
+            other => panic!("expected Value::Str, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_options_token_with_special_chars_preserved() {
+        // The token may contain URL-safe but non-alphanumeric chars
+        // (e.g. base64 with +/=). The helper must not URL-encode or
+        // otherwise mangle them -- the portal expects the raw token.
+        let opts = build_open_uri_options(Some("aA0-_~.=+/"));
+        let val = opts.get("activation_token").unwrap();
+        match val {
+            zbus::zvariant::Value::Str(s) => assert_eq!(s.as_str(), "aA0-_~.=+/"),
+            other => panic!("expected Value::Str, got {other:?}"),
+        }
     }
 }
 

@@ -116,6 +116,18 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         isolated_lock_path();
         let lock = Lock::acquire().expect("acquire").expect("not held");
+        // Verify the lockfile actually contains our PID (not just
+        // that acquire returned Some). Guards against a regression
+        // where Lock::acquire's success path forgets to write the
+        // pid bytes.
+        let path = crate::instance::lock_path();
+        let contents = std::fs::read_to_string(&path).expect("read lockfile");
+        let my_pid = std::process::id();
+        let expected = my_pid.to_string();
+        assert_eq!(
+            contents, expected,
+            "lockfile should contain current PID after acquire"
+        );
         // Second acquire should refuse.
         let second = Lock::acquire().expect("acquire2");
         assert!(
@@ -123,6 +135,12 @@ mod tests {
             "second acquire should fail while first holds"
         );
         lock.release();
+        // After release the lockfile should be gone (Lock::Drop
+        // also releases — explicit release() is idempotent).
+        assert!(
+            !path.exists(),
+            "lockfile should be removed after release(); still exists"
+        );
         // Now third acquire should succeed.
         let third = Lock::acquire().expect("acquire3").expect("free");
         third.release();
@@ -132,11 +150,75 @@ mod tests {
     fn take_over_stale_lock() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         isolated_lock_path();
-        // Write a fake stale PID (1 is init — usually alive, so use
-        // a very high number that's definitely dead).
+        // Write a fake stale PID. 1 is init (usually alive), so use
+        // a very high number that's definitely dead - /proc/9999999
+        // does not exist on any sane system.
         let path = crate::instance::lock_path();
         std::fs::write(&path, "9999999").unwrap();
         let lock = Lock::acquire().expect("acquire").expect("stale takeover");
+        // Verify the stale PID was actually replaced with our PID
+        // (otherwise this test would pass even if the takeover
+        // branch were a no-op).
+        let contents = std::fs::read_to_string(&path).expect("read lockfile");
+        let my_pid = std::process::id();
+        let expected = my_pid.to_string();
+        assert_eq!(
+            contents, expected,
+            "stale PID 9999999 should be replaced with current PID"
+        );
         lock.release();
     }
-}
+
+    #[test]
+    fn drop_releases_lock() {
+        // RAII safety net: Lock::Drop must remove the lockfile so
+        // a panic in the middle of a session does not leave a stale
+        // lock that the next launch would have to take over.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        isolated_lock_path();
+        let path = crate::instance::lock_path();
+        {
+            let _lock = Lock::acquire().expect("acquire").expect("not held");
+            assert!(path.exists(), "lockfile should exist while held");
+        } // _lock drops here
+        assert!(
+            !path.exists(),
+            "lockfile should be removed by Lock::Drop"
+        );
+    }
+
+    #[test]
+    fn release_is_idempotent() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        isolated_lock_path();
+        let lock = Lock::acquire().expect("acquire").expect("not held");
+        lock.release();
+        // Second release must not error (file is already gone).
+        lock.release();
+        // Third acquire must succeed - if release had somehow
+        // re-created the file with garbage, this would fail.
+        let third = Lock::acquire().expect("acquire-after-double-release").expect("free");
+        third.release();
+    }
+
+    #[test]
+    fn malformed_lockfile_is_treated_as_stale() {
+        // A lockfile containing non-numeric garbage (e.g. truncated
+        // write, or a process that wrote a name instead of a PID)
+        // should not deadlock the next launch. The spec says
+        // /proc/<pid> liveness is the gate; non-numeric values parse
+        // as 0 which fails the > 0 check, so the takeover branch
+        // runs.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        isolated_lock_path();
+        let path = crate::instance::lock_path();
+        std::fs::write(&path, "not-a-pid\n").unwrap();
+        let lock = Lock::acquire()
+            .expect("acquire despite garbage lockfile")
+            .expect("malformed lockfile must be treated as stale");
+        // Verify our PID is now in the lockfile.
+        let contents = std::fs::read_to_string(&path).expect("read lockfile");
+        let my_pid = std::process::id();
+        assert_eq!(contents, my_pid.to_string());
+        lock.release();
+    }}

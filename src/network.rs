@@ -117,4 +117,59 @@ mod tests {
         assert_ne!(NetEvent::Connectivity(true), NetEvent::Connectivity(false));
         assert_eq!(NetEvent::ForceRefresh, NetEvent::ForceRefresh);
     }
+
+    #[test]
+    fn net_event_variants_are_distinct() {
+        // Different variants must never compare equal -- the orchestrator
+        // uses PartialEq to dedupe redundant events. If ForceRefresh and
+        // Connectivity(true) compared equal, the orchestrator would drop
+        // ForceRefresh events on the floor when a Connectivity(true)
+        // came in first.
+        assert_ne!(
+            NetEvent::Connectivity(true),
+            NetEvent::ForceRefresh,
+        );
+        assert_ne!(
+            NetEvent::Connectivity(false),
+            NetEvent::ForceRefresh,
+        );
+        assert_ne!(
+            NetEvent::Connectivity(true),
+            NetEvent::Connectivity(false),
+        );
+    }
+
+    #[test]
+    fn net_event_clone_preserves_variant() {
+        // The orchestrator clones events into mpsc sends. A regression
+        // that broke Clone (e.g. by adding a non-Clone field) would
+        // fail at compile time, but pinning the behavior in a test
+        // documents the intent.
+        let a = NetEvent::Connectivity(true);
+        let b = a.clone();
+        assert_eq!(a, b);
+
+        let c = NetEvent::ForceRefresh;
+        let d = c.clone();
+        assert_eq!(c, d);
+    }
+
+    #[test]
+    fn net_event_debug_is_human_readable() {
+        // Debug format appears in log lines. A refactor that changed
+        // the enum name would silently break log parsers.
+        assert_eq!(format!("{:?}", NetEvent::Connectivity(true)), "Connectivity(true)");
+        assert_eq!(format!("{:?}", NetEvent::Connectivity(false)), "Connectivity(false)");
+        assert_eq!(format!("{:?}", NetEvent::ForceRefresh), "ForceRefresh");
+    }
+
+    #[test]
+    fn net_event_is_send_and_sync() {
+        // Events cross tokio task boundaries via mpsc::Sender. Send +
+        // Sync is required for the cross-task send. Compile-time check.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NetEvent>();
+    }
+
+
 }

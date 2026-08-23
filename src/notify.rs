@@ -309,4 +309,35 @@ mod tests {
         fn assert_send<T: Send + Sync>() {}
         assert_send::<Urgency>();
     }
+
+    #[test]
+    fn urgency_priority_mapping_for_portal() {
+        assert_eq!(Urgency::Low.to_priority(), "low");
+        assert_eq!(Urgency::Normal.to_priority(), "normal");
+        assert_eq!(Urgency::Critical.to_priority(), "urgent");
+    }
+
+    #[test]
+    fn urgency_priority_and_byte_are_consistent() {
+        assert_ne!(Urgency::Normal.to_priority(), Urgency::Critical.to_priority());
+        assert_ne!(Urgency::Normal.to_byte(), Urgency::Critical.to_byte());
+    }
+
+    #[test]
+    fn urgency_priority_strings_are_lowercase() {
+        for u in [Urgency::Low, Urgency::Normal, Urgency::Critical] {
+            let p = u.to_priority();
+            assert!(p.chars().all(|c| !c.is_uppercase()), "portal priority must be lowercase, got {p:?}");
+            assert!(!p.is_empty(), "portal priority must be non-empty");
+        }
+    }
+
+    #[test]
+    fn urgency_debug_format_is_stable() {
+        assert_eq!(format!("{:?}", Urgency::Low), "Low");
+        assert_eq!(format!("{:?}", Urgency::Normal), "Normal");
+        assert_eq!(format!("{:?}", Urgency::Critical), "Critical");
+    }
+
+
 }

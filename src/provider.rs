@@ -333,6 +333,143 @@ mod tests {
     fn percent_encode_query_value_empty() {
         assert_eq!(percent_encode_query_value(""), "");
     }
+
+    // ---- AuthConfig::apply_to_endpoint for non-QueryParam variants ----
+    //
+    // The fetch.rs tests cover QueryParam (which mutates the URL) but
+    // not the no-op cases. A regression that returned an empty string
+    // for Bearer would still pass the QueryParam test, so the
+    // no-op variants get their own assertions here.
+
+    #[test]
+    fn auth_bearer_apply_to_endpoint_is_noop() {
+        let cfg = AuthConfig::Bearer;
+        assert_eq!(
+            cfg.apply_to_endpoint("https://api.example.com/v1/usage", "sk-test"),
+            "https://api.example.com/v1/usage"
+        );
+        assert_eq!(
+            cfg.apply_to_endpoint("https://api.example.com/v1?foo=bar", "sk-?&=abc"),
+            "https://api.example.com/v1?foo=bar"
+        );
+    }
+
+    #[test]
+    fn auth_header_apply_to_endpoint_is_noop() {
+        let cfg = AuthConfig::Header {
+            name: "x-api-key".to_string(),
+        };
+        assert_eq!(
+            cfg.apply_to_endpoint("https://api.example.com/v1/usage", "sk-test"),
+            "https://api.example.com/v1/usage"
+        );
+    }
+
+    #[test]
+    fn auth_custom_apply_to_endpoint_is_noop() {
+        let cfg = AuthConfig::Custom {
+            name: "Authorization".to_string(),
+            format: "Token {key}".to_string(),
+        };
+        assert_eq!(
+            cfg.apply_to_endpoint("https://api.example.com/v1/usage", "sk-test"),
+            "https://api.example.com/v1/usage"
+        );
+    }
+
+    #[test]
+    fn auth_query_param_build_returns_empty_header() {
+        let cfg = AuthConfig::QueryParam {
+            name: "key".to_string(),
+        };
+        let (name, value) = cfg.build("sk-test");
+        assert_eq!(name, "", "QueryParam must not produce a header name");
+        assert_eq!(value, "", "QueryParam must not produce a header value");
+    }
+
+    #[test]
+    fn default_inner_colors_are_gjs_parity() {
+        let c = default_inner_colors();
+        assert_eq!(c.normal, "#3a9d4d");
+        assert_eq!(c.warning, "#f6d32d");
+        assert_eq!(c.throttled, "#e01b24");
+    }
+
+    #[test]
+    fn default_outer_color_is_gnome_blue() {
+        assert_eq!(DEFAULT_OUTER_COLOR, "#3584e4");
+    }
+
+    #[test]
+    fn default_ring_colors_matches_components() {
+        let rc = default_ring_colors();
+        assert_eq!(rc.inner.normal, default_inner_colors().normal);
+        assert_eq!(rc.inner.warning, default_inner_colors().warning);
+        assert_eq!(rc.inner.throttled, default_inner_colors().throttled);
+        assert_eq!(rc.outer, DEFAULT_OUTER_COLOR);
+    }
+
+    #[test]
+    fn ring_colors_default_impl_matches_helper() {
+        let a = RingColors::default();
+        let b = default_ring_colors();
+        assert_eq!(a.inner.normal, b.inner.normal);
+        assert_eq!(a.inner.warning, b.inner.warning);
+        assert_eq!(a.inner.throttled, b.inner.throttled);
+        assert_eq!(a.outer, b.outer);
+    }
+
+    #[test]
+    fn colors_hash_is_deterministic() {
+        let inner = default_inner_colors();
+        let outer = DEFAULT_OUTER_COLOR.to_string();
+        let h1 = RingColorsRepr::hash(&inner, &outer);
+        let h2 = RingColorsRepr::hash(&inner, &outer);
+        assert_eq!(h1, h2, "same colors must produce same hash");
+    }
+
+    #[test]
+    fn colors_hash_distinguishes_inner_palette() {
+        let inner_a = BucketColors {
+            normal: "#000000".to_string(),
+            warning: "#000000".to_string(),
+            throttled: "#000000".to_string(),
+        };
+        let inner_b = BucketColors {
+            normal: "#ffffff".to_string(),
+            warning: "#000000".to_string(),
+            throttled: "#000000".to_string(),
+        };
+        let h_a = RingColorsRepr::hash(&inner_a, "#000000");
+        let h_b = RingColorsRepr::hash(&inner_b, "#000000");
+        assert_ne!(h_a, h_b, "different inner colors must produce different hashes");
+    }
+
+    #[test]
+    fn colors_hash_distinguishes_outer_color() {
+        let inner = default_inner_colors();
+        let h_a = RingColorsRepr::hash(&inner, "#000000");
+        let h_b = RingColorsRepr::hash(&inner, "#ffffff");
+        assert_ne!(h_a, h_b, "different outer colors must produce different hashes");
+    }
+
+    #[test]
+    fn auth_config_roundtrips_through_serde() {
+        let variants = vec![
+            AuthConfig::Bearer,
+            AuthConfig::Header { name: "x-api-key".to_string() },
+            AuthConfig::Custom { name: "Authorization".to_string(), format: "Token {key}".to_string() },
+            AuthConfig::QueryParam { name: "key".to_string() },
+        ];
+        for cfg in variants {
+            let json = serde_json::to_string(&cfg).expect("serialize");
+            let back: AuthConfig = serde_json::from_str(&json).expect("deserialize");
+            let json2 = serde_json::to_string(&back).expect("re-serialize");
+            assert_eq!(json, json2, "round-trip must be lossless");
+        }
+    }
+
+
 }
 
 // ============================================================================

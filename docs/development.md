@@ -14,7 +14,7 @@ Defined in `Cargo.toml`:
 | `dev`             | Default debug                                        | Day-to-day `cargo test` work        |
 
 ```sh
-cargo build --release                  # ~5.5 MB stripped binary
+cargo build --release                  # ~4.4 MB stripped binary
 cargo build --profile release-debug    # bigger but with symbols for `addr2line`
 cargo build                            # debug; fastest to compile
 ```

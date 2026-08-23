@@ -45,7 +45,7 @@ jobs:
         # The two integration tests in tests/integration.rs are
         # `#[ignore]` because they need a session D-Bus and a writable
         # HOME; CI containers have neither. Default `cargo test` runs
-        # the ~155 unit tests, including the schema-drift guard that
+        # the 261 unit tests, including the schema-drift guard that
         # parses every file in examples/providers/.
         run: cargo test --verbose
 
@@ -66,7 +66,7 @@ jobs:
           strip target/release/llm-quota-tray -o /tmp/llm-quota-tray.stripped
           size=$(stat -c%s /tmp/llm-quota-tray.stripped)
           echo "release binary size: ${size} bytes"
-          # 8 MB ceiling — well above the ~5.5 MB reported size, gives
+          # 8 MB ceiling — well above the ~4.4 MB reported size, gives
           # headroom for dep updates without hiding real regressions.
           test "$size" -lt 8388608 || (echo "release binary exceeded 8 MB ceiling" && exit 1)
 

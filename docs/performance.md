@@ -140,7 +140,7 @@ journalctl --user -u llm-quota-tray.service --since "10 minutes ago" \
 
 ## Comparison to alternatives
 
-The project's README claims ~12–15 MB RSS at idle; that
+The project's README claims ~6 MB RSS at idle; that
 number is vs. the original gjs + GTK3 + libappindicator build
 which was ~25 MB. The 10 MB delta is from dropping the GTK
 runtime (libgtk-3, libgdk, libpango, libcairo) and the

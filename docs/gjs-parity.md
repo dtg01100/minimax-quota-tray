@@ -161,7 +161,7 @@ check-then-write is atomic. The gjs implementation did the same with
 gjs: GNOME Shell + libappindicator + libgtk.
 Rust: zbus + tiny-skia (ARGB pixmap) + `std::fs::write` (SVG cache).
 
-Why: 5.5 MB stripped ELF, ~10 MB RSS, no GUI library at all. The host
+Why: ~4.4 MB stripped ELF, ~6 MB RSS, no GUI library at all. The host
 panel does all rendering from the SNI properties + dbusmenu tree.
 This is the primary motivation for the port — see README's intro.
 

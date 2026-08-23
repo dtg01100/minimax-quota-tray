@@ -20,7 +20,7 @@ the host's panel does all the rendering from the dbusmenu tree.
 
 > The gjs implementation has been retired. The Rust port is the
 > only supported implementation on `main`. (~5000 LOC across 14
-> modules, 150+ unit tests, ~5.5 MB release binary, ~10 MB RSS.) No GUI
+> modules, 261 unit tests, ~4.4 MB release binary, ~6 MB RSS.) No GUI
 > library at all — talks to D-Bus directly and renders the icon as ARGB
 > bytes via `tiny-skia` (or a raw BGRA circle routine for the static
 > states). No `~/.so` link deps beyond libc + libsecret + libdbus;
@@ -375,7 +375,7 @@ to render a native menu.
 
 ```
    ┌──────────────────────────┐
-   │   llm-quota-tray         │   ~5.2 MB ELF, no GUI library;
+   │   llm-quota-tray         │   ~4.4 MB ELF, no GUI library;
    │                          │   links libc + libsecret + libdbus only
    └────────────┬─────────────┘
                 │
@@ -392,7 +392,7 @@ to render a native menu.
 The Rust port doesn't draw anything itself — the host's panel reads the
 SNI properties and renders an icon, and walks the dbusmenu tree to
 build a native menu (a KDE Plasma `KMenu`, a Waybar menu, etc.). This
-is why the Rust binary is ~5.2 MB instead of the 25+ MB you'd get with
+is why the Rust binary is ~4.4 MB instead of the 25+ MB you'd get with
 a linked-in GTK.
 
 The keyring read/write goes through the `secret-service` crate

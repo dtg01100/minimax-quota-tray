@@ -27,7 +27,7 @@
 //! ## Spec compliance
 //!
 //! Targets the canonical freedesktop.org Secret Service spec at
-//! https://specifications.freedesktop.org/secret-service/latest/.
+//! <https://specifications.freedesktop.org/secret-service/latest/>.
 //!
 //! - **Service interface**: `OpenSession`, `SearchItems`, `Unlock`,
 //!   `GetSecrets` (plural legacy; see `read_secret` for the

@@ -3,9 +3,9 @@
 //! The Rust tray builds a `com.canonical.dbusmenu` tree that mirrors the
 //! gjs version's Gtk.Menu:
 //!
-//!   Plan: <plan label>           (disabled, informational header)
-//!     <window 0>: X% left · resets in Y    (disabled)
-//!       [████░░░░░░░░░░░░░░░░░░░]          (disabled, ASCII bar)
+//!   Plan: `<plan label>`          (disabled, informational header)
+//!     `<window 0>`: X% left · resets in Y    (disabled)
+//!       `[████░░░░░░░░░░░░░░░░░░░]`           (disabled, ASCII bar)
 //!       · on pace to have ~N% left at reset (rate/h)   (optional, burn row)
 //!     <window 1>: X% left · resets in Y    (disabled)
 //!       [████████████████████████]          (disabled, ASCII bar)
@@ -17,9 +17,9 @@
 //!   Open dashboard                (action → MenuCommand::OpenDashboard)
 //!   Set API Key…                  (action → MenuCommand::SetApiKey)
 //!   ───
-//!   Quit                          (action → MenuCommand::Quit)
+//!   Quit                            (action → MenuCommand::Quit)
 //!
-//! The state is held in a Mutex<MenuInner>; the dbusmenu server reads
+//! The state is held in a `Mutex<MenuInner>`; the dbusmenu server reads
 //! from it for `GetLayout`/`GetGroupProperties`/`GetProperty`. Menu
 //! actions are dispatched via an `mpsc::Sender<MenuCommand>` set at
 //! construction time — clicking an action item sends the command to

@@ -1,7 +1,7 @@
 //! Threshold notifications via the freedesktop Notification
 //! portal, with a direct `org.freedesktop.Notifications` fallback.
 //!
-//! Targets https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Notification.html
+//! Targets <https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Notification.html>
 //! (v2). The portal's `AddNotification(id, vardict)` carries a
 //! caller-supplied `id` the server uses to *replace* in-flight
 //! notifications of the same kind instead of stacking them —
@@ -38,8 +38,8 @@
 //! Matches the gjs `notify()` helper. Fires on upward bucket-rank
 //! transitions only:
 //!
-//!   normal   → warning   ("<plan> — running low")  urgency: normal
-//!   warning  → throttled ("<plan> — throttled")     urgency: critical
+//!   normal   → warning   (`<plan>` — running low)  urgency: normal
+//!   warning  → throttled (`<plan>` — throttled)     urgency: critical
 //!   * → normal — NOT notified (only worse states trigger)
 //!
 //! Deduplication is the caller's job (track `_last_bucket` between
@@ -140,7 +140,7 @@ pub async fn send(
 ///
 /// `activation_token` is forwarded as the `activation_token`
 /// vardict key (Notification portal v2+, see
-/// https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Notification.html).
+/// <https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Notification.html>).
 /// Stale tokens (None, expired) are simply omitted — the portal
 /// shows the notification without a launch animation.
 async fn send_portal(
@@ -248,7 +248,7 @@ impl Urgency {
     }
 
     /// Notification portal's `priority` field, per
-    /// https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Notification.html
+    /// <https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Notification.html>
     /// (one of `low` / `normal` / `high` / `urgent`). Maps the
     /// libnotify-shaped `Urgency` onto the portal's priority
     /// vocabulary.

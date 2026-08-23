@@ -42,6 +42,20 @@
 /// Note the gjs `fmtReset()` uses ceil-minutes ("4h" for 3h59m left), but
 /// `fmtAge()` uses floor — they're separate helpers. Here we pick the
 /// appropriate rounding via the `floor` flag at the call site.
+///
+/// # Examples
+///
+/// ```text
+/// use crate::util::fmt_duration;
+///
+/// // "resets in" label — ceil so a 3h59m40s countdown shows "4h", not "3h".
+/// assert_eq!(fmt_duration(3 * 3_600_000 + 59 * 60_000 + 40_000, false), "4h");
+/// assert_eq!(fmt_duration(90 * 60_000, false), "2h");        // ceil 1h30m → 2h
+///
+/// // "X ago" label — floor so 1m29s reads as "1m", not "2m".
+/// assert_eq!(fmt_duration(90 * 60_000, true), "1h");
+/// assert_eq!(fmt_duration(45 * 60_000, true), "45m");
+/// ```
 pub fn fmt_duration(ms: i64, floor: bool) -> String {
     let abs = ms.max(0);
     let mins = if floor {
@@ -72,6 +86,16 @@ pub fn fmt_duration(ms: i64, floor: bool) -> String {
 
 /// Format a duration in ms as e.g. "30s", "5m", "2h". Used for the
 /// compact "since last update" label (floor — gjs `fmtAge()`).
+///
+/// # Examples
+///
+/// ```text
+/// use crate::util::fmt_age;
+///
+/// assert_eq!(fmt_age(45 * 1000), "45s");
+/// assert_eq!(fmt_age(2 * 60_000), "2m");
+/// assert_eq!(fmt_age(3 * 3_600_000 + 5 * 60_000), "3h");
+/// ```
 pub fn fmt_age(ms: i64) -> String {
     let abs = ms.max(0);
     let s = abs / 1000;
@@ -91,6 +115,17 @@ pub fn fmt_age(ms: i64) -> String {
 /// the decimal range (`1.0k` → `1k`) but the integer range is preserved
 /// so a 12,000/h rate reads "12k" not "1.2k" — same readability rule
 /// as the gjs label.
+///
+/// # Examples
+///
+/// ```text
+/// use crate::util::fmt_rate;
+///
+/// assert_eq!(fmt_rate(0.0), "0");
+/// assert_eq!(fmt_rate(850.0), "850");
+/// assert_eq!(fmt_rate(1_200.0), "1.2k");
+/// assert_eq!(fmt_rate(12_000.0), "12k"); // integer range, NOT "1.2k"
+/// ```
 pub fn fmt_rate(rate: f64) -> String {
     if !rate.is_finite() || rate <= 0.0 {
         return "0".to_string();
@@ -122,6 +157,20 @@ pub fn fmt_rate(rate: f64) -> String {
 /// supported block characters U+2588 (full) + U+2591 (light shade);
 /// gjs explicitly avoids Pango markup because some SNI menu
 /// renderers don't support it.
+///
+/// # Examples
+///
+/// ```text
+/// use crate::util::bar_markup;
+///
+/// assert_eq!(bar_markup(0),   "  [\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}]");
+/// assert_eq!(bar_markup(50),  "  [\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}]");
+/// assert_eq!(bar_markup(100), "  [\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}]");
+///
+/// // Out-of-range values are clamped, not errored.
+/// assert_eq!(bar_markup(-10), bar_markup(0));
+/// assert_eq!(bar_markup(150), bar_markup(100));
+/// ```
 pub fn bar_markup(fraction_pct: i64) -> String {
     const W: i64 = 22;
     let clamped = fraction_pct.clamp(0, 100);
@@ -163,6 +212,30 @@ pub fn bar_markup(fraction_pct: i64) -> String {
 ///
 /// Non-finite or negative rates return `"$0"` (or the equivalent in
 /// the configured currency).
+///
+/// # Examples
+///
+/// ```text
+/// use crate::util::fmt_cost;
+///
+/// // 0.4 cents/h = $0.004 → "$0.004" (4 decimals tier)
+/// assert_eq!(fmt_cost(0.4, Some("USD")), "$0.004");
+///
+/// // 40 cents/h = $0.40 → "$0.40" (3 decimals, trailing 0 stripped
+/// // by display logic — see implementation for the exact rule)
+/// assert_eq!(fmt_cost(40.0, Some("USD")), "$0.4");
+///
+/// // 523 cents/h = $5.23 → "$5.23" (2 decimals tier)
+/// assert_eq!(fmt_cost(523.0, Some("USD")), "$5.23");
+///
+/// // 12300 cents/h = $123 → "$123" (integer tier)
+/// assert_eq!(fmt_cost(12_300.0, Some("USD")), "$123");
+///
+/// // Unknown / empty currency → "$" fallback.
+/// assert_eq!(fmt_cost(523.0, Some("FOO")), "$5.23");
+/// assert_eq!(fmt_cost(523.0, None),       "$5.23");
+/// assert_eq!(fmt_cost(-1.0, Some("USD")), "$0");
+/// ```
 pub fn fmt_cost(cents_per_hour: f64, currency: Option<&str>) -> String {
     let symbol = currency_symbol(currency);
     let zero = format!("{symbol}0");

@@ -1,30 +1,30 @@
 # Module reference
 
 Every Rust source file in `src/`, what it owns, what it exposes, and
-where to look first when something breaks. Roughly 10,000 lines
+where to look first when something breaks. Roughly 11,000 lines
 across 19 modules — start here before grepping.
 
 ## At-a-glance ownership map
 
 | Concern | Module | Lines |
 |---|---|---|
-| Entry point + subsystem wiring | [`main.rs`](#mainrs) | 1560 |
-| StatusNotifierItem + dbusmenu over D-Bus | [`sni.rs`](#snirs) | 811 |
+| Entry point + subsystem wiring | [`main.rs`](#mainrs) | 1784 |
+| StatusNotifierItem + dbusmenu over D-Bus | [`sni.rs`](#snirs) | 989 |
 | Menu tree state + dbusmenu wire format | [`menu.rs`](#menurs) | 768 |
 | Burn-rate projection math | [`burn.rs`](#burnrs) | 789 |
-| Secret Service (libsecret) wrapper | [`keyring.rs`](#keyringrs) | 774 |
+| Secret Service (libsecret) wrapper | [`keyring.rs`](#keyringrs) | 800 |
 | Icon rasterizer (tiny-skia) | [`icon.rs`](#iconrs) | 1147 |
-| Per-instance namespace (CLI/env) | [`instance.rs`](#instancers) | 183 |
-| Provider-agnostic types | [`provider.rs`](#providerrs) | 486 |
+| Per-instance namespace (CLI/env) | [`instance.rs`](#instancers) | 196 |
+| Provider-agnostic types | [`provider.rs`](#providerrs) | 623 |
 | Per-instance config loader | [`config.rs`](#configrs) | 568 |
-| HTTP fetch + auth dispatch | [`fetch.rs`](#fetchrs) | 362 |
+| HTTP fetch + auth dispatch | [`fetch.rs`](#fetchrs) | 499 |
 | JSON → `Vec<Window>` parser | [`parse.rs`](#parsers) | 588 |
 | Adaptive polling scheduler | [`scheduler.rs`](#schedulerrs) | 114 |
-| Single-instance PID lock | [`lock.rs`](#lockrs) | 142 |
-| NetworkManager watcher | [`network.rs`](#networkrs) | 120 |
-| Threshold notifications | [`notify.rs`](#notifyrs) | 312 |
-| Desktop Portal OpenURI | [`portal_openuri.rs`](#portal_openurirs) | 161 |
-| Formatting helpers | [`util.rs`](#utilrs) | 554 |
+| Single-instance PID lock | [`lock.rs`](#lockrs) | 224 |
+| NetworkManager watcher | [`network.rs`](#networkrs) | 175 |
+| Threshold notifications | [`notify.rs`](#notifyrs) | 343 |
+| Desktop Portal OpenURI | [`portal_openuri.rs`](#portal_openurirs) | 248 |
+| Formatting helpers | [`util.rs`](#utilrs) | 589 |
 | Per-model pricing lookup | [`pricing.rs`](#pricingrs) | 425 |
 | XDG Activation token plumbing | [`activation.rs`](#activationrs) | 190 |
 

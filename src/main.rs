@@ -100,8 +100,9 @@ type Histories = std::collections::HashMap<String, Vec<Sample>>;
 struct AppState {
     /// Per-window burn-rate sample history (see `Histories`).
     histories: Histories,
-    /// Most recent successful fetch, in display order (windows[0]
-    /// is the primary). `None` until the first fetch completes.
+    /// Most recent successful fetch, in display order. The first
+    /// window in the vector is the primary window. `None` until the
+    /// first fetch completes.
     last_good: Option<Vec<Window>>,
     last_good_at: i64,
     fail_streak: u32,

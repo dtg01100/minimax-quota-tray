@@ -26,8 +26,9 @@ libc + libsecret + libdbus).
 
 ## Tests
 
-The test surface after the gjs-to-Rust port is ~155 unit tests
-across 16 modules, plus 2 ignored integration tests. Run them all:
+The test surface is **~212 unit tests across 19 modules** (was 155
+after the gjs-to-Rust port; +57 added across the slices 1-4 work
+tracked in CHANGELOG.md), plus 2 ignored integration tests. Run them all:
 
 ```sh
 cargo test                             # unit tests only — fast, no D-Bus needed
@@ -38,25 +39,28 @@ cargo test config::tests::provider_templates_deserialize  # the schema-drift gua
 
 ### Test counts per module (current)
 
-| Module        | Tests | Notes                                            |
-|---------------|-------|--------------------------------------------------|
-| `icon.rs`     | 28    | Most coverage: ring rendering, ARGB pixmap, bucket selectors, SVG caching |
-| `main.rs`     | 20    | Bucket rank transitions, AppState, do_refresh branching |
-| `burn.rs`     | 18    | `slope_per_hour`, `compute_burn`, `decide_burn_row`, pct-only suppression |
-| `menu.rs`     | 13    | dbusmenu tree construction, MenuCommand dispatch |
-| `fetch.rs`    | 13    | Auth dispatch, query-param rewriting, error sanitization |
-| `config.rs`   | 13    | Includes the schema-drift guard for `examples/providers/*.json` |
-| `parse.rs`    | 9     | `parse_plan` against canonical + legacy shapes    |
-| `keyring.rs`  | 9     | `secret_to_key` trimming, env-var precedence     |
-| `util.rs`     | 8     | Time + format helpers                            |
-| `scheduler.rs`| 8     | `next_interval` adaptive + backoff                |
-| `instance.rs` | 6     | CLI flag resolution, basename derivation         |
-| `sni.rs`      | 5     | SNI property dispatch                             |
-| `lock.rs`     | 2     | Acquire + stale takeover (uses isolated `XDG_RUNTIME_DIR`) |
-| `notify.rs`   | 2     | DBus call formatting                              |
-| `network.rs`  | 1     | NetEvent equality                                 |
-| `provider.rs` | 0     | Type definitions only; logic lives in `parse.rs`/`fetch.rs`/`config.rs` |
-| **Total**     | **155** |                                                  |
+| Module              | Tests | Notes                                            |
+|---------------------|-------|--------------------------------------------------|
+| `icon.rs`           | 28    | Ring rendering, ARGB pixmap, bucket selectors, SVG caching |
+| `util.rs`           | 25    | Time + format helpers (the menu label formatters) |
+| `main.rs`           | 20    | Bucket rank transitions, AppState, do_refresh branching |
+| `burn.rs`           | 18    | `slope_per_hour`, `compute_burn`, `decide_burn_row`, pct-only suppression |
+| `fetch.rs`          | 14    | Auth dispatch, query-param rewriting, error sanitization |
+| `parse.rs`          | 14    | `parse_plan` against canonical + legacy shapes + count_unit/currency/pricing_model_path |
+| `pricing.rs`        | 14    | Per-model price lookup, `cost_per_hour` formatting |
+| `config.rs`         | 13    | Includes the schema-drift guard for `examples/providers/*.json` |
+| `menu.rs`           | 13    | dbusmenu tree construction, MenuCommand dispatch |
+| `keyring.rs`        | 11    | `secret_to_key` trimming, env-var precedence + 2 ignored D-Bus tests |
+| `activation.rs`     | 9     | CLI parsing (`--token=`, `--token <v>`, empty, absent, mixed), precedence |
+| `scheduler.rs`      | 8     | `next_interval` adaptive + backoff                |
+| `instance.rs`       | 6     | CLI flag resolution, basename derivation         |
+| `provider.rs`       | 5     | `AuthConfig::apply_to_endpoint` URL encoding (logic lives in `parse.rs`/`fetch.rs`/`config.rs`) |
+| `sni.rs`            | 5     | SNI property dispatch                             |
+| `notify.rs`         | 3     | Urgency byte mapping + Send + Sync                |
+| `lock.rs`           | 2     | Acquire + stale takeover (uses isolated `XDG_RUNTIME_DIR`) |
+| `portal_openuri.rs` | 2     | Spec constants + signature pin                    |
+| `network.rs`        | 1     | NetEvent equality                                 |
+| **Total**            | **212** | (was 155 at the gjs port; +57 across slices 1-4) |
 
 ### Integration tests (`tests/integration.rs`)
 
@@ -283,4 +287,5 @@ If you're hunting for a piece of behavior:
 | Small helpers                           | `util.rs`                                              |
 
 See [`docs/architecture.md`](architecture.md) for the call graph
-between these.
+between these. For a per-module reference (purpose, public API, key
+behaviors of each `src/*.rs`), see [`docs/modules.md`](modules.md).

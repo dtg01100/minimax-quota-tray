@@ -134,7 +134,7 @@ provider.
 
 ## Tests
 
-The Rust port carries **~155 unit tests across 16 modules**, plus two
+The Rust port carries **~212 unit tests across 19 modules**, plus two
 ignored integration tests that need a session D-Bus.
 
 ```bash
@@ -185,6 +185,11 @@ backtraces), and how to add new tests / provider templates, see
 [`docs/development.md`](docs/development.md). For the architecture map
 and call graph, see [`docs/architecture.md`](docs/architecture.md). For
 the full config schema, see [`docs/config-schema.md`](docs/config-schema.md).
+For the per-module reference and what each Rust file owns, see
+[`docs/modules.md`](docs/modules.md). For CLI flags and env vars, see
+[`docs/cli.md`](docs/cli.md). For the burn-rate math deep-dive, see
+[`docs/burn-rate.md`](docs/burn-rate.md). For the full troubleshooting
+walkthrough, see [`docs/troubleshooting.md`](docs/troubleshooting.md).
 
 ## Configuration
 
@@ -436,6 +441,8 @@ compatibility with libsecret versions that misbehave on
 
 For more troubleshooting + the full diagnostic checklist when the chip
 stays red after a port, see [`docs/port-guide.md`](docs/port-guide.md#diagnostic-checklist).
+For a comprehensive walkthrough (keyring, SNI, panel hosts, RSS, etc.),
+see [`docs/troubleshooting.md`](docs/troubleshooting.md).
 
 ## Porting to another provider
 

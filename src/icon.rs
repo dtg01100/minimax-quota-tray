@@ -68,9 +68,11 @@ const TRACK_OPACITY: f32 = 0.25;
 /// - `Warning` — yellow ring, fired when `remaining_pct` falls below
 ///   `Thresholds.yellow` OR the burn projection says we'll run out
 ///   before the window resets.
-/// - `Throttled` — red ring, fired when the provider's API marks the
-///   window as throttled OR `remaining_pct` falls below
-///   `Thresholds.throttled` (which defaults to 0 — i.e. "exhausted").
+/// - `Throttled` — red ring, fired when the provider's API marks
+///   the window as throttled OR `remaining_pct <= 0` (i.e. quota
+///   entirely exhausted). `Thresholds.red` is **not** read by
+///   `bucket_for` — it's used by `main.rs`'s notification dispatcher
+///   to gate the threshold-warning toast.
 ///
 /// Ranks are `Ord`-ordered by significance so the worst window's
 /// bucket can be selected with `.max()`. See [`bucket_for`] for the

@@ -25,6 +25,16 @@ use crate::provider::{AuthConfig, PlanShape};
 pub use reqwest::blocking::Client as HttpClient;
 
 /// Build a shared blocking reqwest client. TLS via rustls.
+///
+/// # Errors
+///
+/// Returns `Err` only if the underlying TLS backend (rustls) fails
+/// to initialize its process-wide state. In practice this never
+/// fails on a sane Linux system — reqwest would log a warning
+/// during build if rustls had a fundamental incompatibility with
+/// the target. Surface area is intentionally tiny: this is the
+/// one place we want the error to bubble up rather than be
+/// silently retried.
 pub fn build_client(user_agent_prefix: &str) -> Result<Client> {
     let user_agent = format!("{}/{}", user_agent_prefix, env!("CARGO_PKG_VERSION"));
     Client::builder()

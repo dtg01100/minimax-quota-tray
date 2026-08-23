@@ -61,6 +61,20 @@ const INNER_DOT_RADIUS: f32 = 3.5;
 /// separate dark grey that fights the panel theme.
 const TRACK_OPACITY: f32 = 0.25;
 
+/// The color category a quota window falls into, driving the chip
+/// and menu-row palette. Worst window's bucket wins for the chip.
+///
+/// - `Normal` — plenty of quota remaining (default green ring).
+/// - `Warning` — yellow ring, fired when `remaining_pct` falls below
+///   `Thresholds.yellow` OR the burn projection says we'll run out
+///   before the window resets.
+/// - `Throttled` — red ring, fired when the provider's API marks the
+///   window as throttled OR `remaining_pct` falls below
+///   `Thresholds.throttled` (which defaults to 0 — i.e. "exhausted").
+///
+/// Ranks are `Ord`-ordered by significance so the worst window's
+/// bucket can be selected with `.max()`. See [`bucket_for`] for the
+/// selection rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bucket {
     Normal,
@@ -201,6 +215,16 @@ fn temp_dir() -> std::path::PathBuf {
         .clone()
 }
 
+/// Filesystem path the SNI host should read to load the ring SVG
+/// for a given `pct`. Hosts that understand SVG (KDE/QtSvg, GNOME
+/// with `libpixbufloader-svg.so` registered) render natively at the
+/// panel's target size; hosts without SVG support fall through to
+/// the ARGB bytes in `IconPixmap` (rendered via Cogl).
+///
+/// `pct` is clamped to `[0, 100]`; out-of-range values are
+/// silently saturated. `colors` is mixed into the path so different
+/// palettes cache separately — no need to invalidate TMPDIR when
+/// the user changes ring colors.
 pub fn ring_svg_path(pct: i64, colors: &RingColors) -> std::path::PathBuf {
     let clamped = pct.clamp(0, 100);
     let hash = colors_hash(colors);

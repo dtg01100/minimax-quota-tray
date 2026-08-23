@@ -78,9 +78,22 @@ async fn session_bus() -> zbus::Result<&'static Connection> {
 ///
 /// Returns `Ok(())` on a successful synchronous dispatch to the
 /// portal (the portal then handles the handler-selection UI in
-/// the background). Portal errors (no daemon, user cancelled,
-/// bad URI) surface as `Err`; the caller falls through to
-/// `xdg-open`.
+/// the background).
+///
+/// # Errors
+///
+/// Returns `Err` if any of:
+/// - the session D-Bus connection fails (rare; we usually
+///   already have one from the SNI module — see [`crate::sni`])
+/// - the portal itself returns a non-success `Response` from
+///   `OpenURI()` (no `xdg-desktop-portal` running, the user
+///   cancelled the handler-selection dialog, the URI scheme has
+///   no handler)
+/// - the URI string is rejected by the portal as malformed
+///
+/// The caller (menu handler) is expected to fall through to
+/// `xdg-open` on any error so the user always gets *something*
+/// when they click "Open dashboard".
 pub async fn open(uri: &str, activation_token: Option<&str>) -> Result<()> {
     let conn = session_bus()
         .await

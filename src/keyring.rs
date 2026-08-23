@@ -173,6 +173,15 @@ pub async fn get() -> Option<String> {
 /// `application` attribute name. If a legacy-attribute item
 /// exists in the same collection, it's deleted so the next
 /// reload doesn't see both.
+///
+/// # Errors
+///
+/// Returns `Err` if `secret-tool store` exits non-zero (no
+/// `libsecret-tools` package, no Secret Service daemon, user
+/// cancelled the unlock prompt, collection locked). The error
+/// chains the underlying `secret-tool` stderr so the journal log
+/// is actionable — see `keyring.rs::dbus_set` for the exact
+/// command shape.
 pub async fn set(value: &str) -> Result<()> {
     dbus_set(value.as_bytes()).await
 }
@@ -181,6 +190,12 @@ pub async fn set(value: &str) -> Result<()> {
 /// current-attribute and legacy-attribute items so users with
 /// old installations don't see the key reappear after an
 /// attribute-name migration.
+///
+/// # Errors
+///
+/// Returns `Err` if `secret-tool clear` exits non-zero. Same
+/// failure modes as [`set`]. If neither item exists,
+/// the function is a no-op and returns `Ok(())`.
 #[allow(dead_code)] // exposed for future "Clear stored key" menu item
 pub async fn clear() -> Result<()> {
     dbus_clear().await

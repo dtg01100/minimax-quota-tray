@@ -39,6 +39,17 @@ pub enum NetEvent {
 /// events to `tx`. The task lives for the duration of the program;
 /// if NM isn't available it exits silently (graceful degradation
 /// — gjs does the same).
+///
+/// # Errors
+///
+/// Returns `Err` if connecting to the **system** D-Bus fails
+/// (no system bus on this host). Note the session bus is not
+/// used here even though the rest of the daemon lives on it —
+/// NetworkManager is intentionally on the system bus so an
+/// unprivileged user can detect connectivity without root.
+/// Returns `Ok(())` once the watcher is registered; if NM is
+/// absent on the bus, the task ends silently and `tx` is
+/// never used.
 pub async fn spawn_watcher(tx: mpsc::Sender<NetEvent>) -> Result<()> {
     let conn = match ConnectionBuilder::system()
         .context("connecting to system D-Bus")?

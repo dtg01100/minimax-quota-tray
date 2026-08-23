@@ -95,9 +95,13 @@ pub const QUIT_ID: i32 = 306;
 pub fn window_id(idx: usize) -> i32 {
     100 + (idx as i32) * 3
 }
+/// dbusmenu item id for the progress-bar sub-item of window `idx`.
+/// Returns `window_id(idx) + 1`.
 pub fn bar_id(idx: usize) -> i32 {
     100 + (idx as i32) * 3 + 1
 }
+/// dbusmenu item id for the burn-rate sub-item of window `idx`.
+/// Returns `window_id(idx) + 2`.
 pub fn burn_id(idx: usize) -> i32 {
     100 + (idx as i32) * 3 + 2
 }
@@ -177,6 +181,11 @@ impl Default for MenuInner {
 }
 
 impl MenuInner {
+    /// Build an empty `MenuInner` populated with the static menu
+    /// items (header, separators, refresh, set-key, quit). Per-window
+    /// rows are inserted later by the polling loop via
+    /// [`Self::rebuild_window_rows`] — at construction time we don't
+    /// know how many windows the provider will return.
     pub fn new() -> Self {
         let mut items = HashMap::new();
         let mut children_of: HashMap<i32, Vec<i32>> = HashMap::new();

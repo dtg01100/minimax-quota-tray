@@ -79,16 +79,44 @@ pub enum MenuCommand {
 /// The 100+3i/3i+1/3i+2 layout gives us three IDs per window; we
 /// don't need a hash map keyed on window.id at the menu level (the
 /// caller passes `&[Window]` in order).
+/// dbusmenu item id for the menu root. Every menu the daemon
+/// exposes has `ROOT_ID` as the top-level container; per-window
+/// rows hang off it via `children_of[ROOT_ID]`.
 pub const ROOT_ID: i32 = 0;
+/// dbusmenu item id for the static "Plan: …" header row at the
+/// top of the menu (disabled, informational).
 pub const HEADER_ID: i32 = 1;
+/// dbusmenu item id for the row shown when the worst window is
+/// in the `Throttled` bucket. Hidden by default; visible only
+/// during a throttling event. The label carries the provider's
+/// throttle message when applicable.
 pub const THROTTLED_ID: i32 = 200;
+/// dbusmenu item id for the row shown when the last fetch
+/// failed (network error, parse error, 5xx, etc.). Hidden
+/// while fetches are succeeding; the label carries the
+/// sanitizer-stripped error snippet.
 pub const ERROR_ID: i32 = 210;
+/// dbusmenu item id for the separator between the per-window
+/// rows and the static-action block (Refresh / Dashboard / etc.).
 pub const SEP_1_ID: i32 = 300;
+/// dbusmenu item id for the "Refresh now" action — clicking it
+/// sends `MenuCommand::Refresh` to the daemon's main loop.
 pub const REFRESH_ID: i32 = 301;
+/// dbusmenu item id for the separator between Refresh and
+/// Open-Dashboard.
 pub const SEP_2_ID: i32 = 302;
+/// dbusmenu item id for the "Open dashboard" action — clicking
+/// it fires the OpenURI portal with the per-instance dashboard
+/// URL (`xdg-open` fallback on portal failure).
 pub const DASHBOARD_ID: i32 = 303;
+/// dbusmenu item id for the "Set API Key…" action — clicking it
+/// invokes `secret-tool` (zenity / kdialog / terminal prompt).
 pub const SET_KEY_ID: i32 = 304;
+/// dbusmenu item id for the separator between Set-Key and Quit.
 pub const SEP_3_ID: i32 = 305;
+/// dbusmenu item id for the "Quit" action — clicking it sends
+/// `MenuCommand::Quit`, the daemon's orchestrator tears down,
+/// and the systemd user unit restarts on next session.
 pub const QUIT_ID: i32 = 306;
 
 /// Per-window base id: id, id+1 (bar), id+2 (burn).

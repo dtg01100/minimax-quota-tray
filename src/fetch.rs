@@ -21,7 +21,11 @@ use crate::burn::Window;
 use crate::parse::parse_plan;
 use crate::provider::{AuthConfig, PlanShape};
 
-// Re-export so callers can refer to `fetch::Client` without importing reqwest.
+/// Re-export of `reqwest::blocking::Client` so callers can refer
+/// to `fetch::HttpClient` without depending on `reqwest` directly.
+/// Used by [`build_client`] (constructor), [`fetch_windows_blocking`]
+/// (per-refresh GET), and [`crate::pricing::fetch_pricing_blocking`]
+/// (periodic pricing-table refresh).
 pub use reqwest::blocking::Client as HttpClient;
 
 /// Build a shared blocking reqwest client. TLS via rustls.

@@ -19,6 +19,11 @@ use crate::provider::{
 /// provider name baked in. Per-instance names append `-<name>`:
 /// `llm-quota-tray-coding`, `llm-quota-tray-openai`, etc.
 pub const CONFIG_DIR_BASE: &str = "llm-quota-tray";
+/// Filename used for the per-instance config inside
+/// [`CONFIG_DIR_BASE`] (or `CONFIG_DIR_BASE-<name>` for named
+/// instances). Read by [`load_for`] / [`load_or_init`] and
+/// written by the `--set-key` interactive flow when no config
+/// exists yet.
 pub const CONFIG_FILENAME: &str = "config.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

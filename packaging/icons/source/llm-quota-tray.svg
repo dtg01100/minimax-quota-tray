@@ -3,21 +3,25 @@
   App icon for the desktop shell (autostart UI, gnome-software,
   KDE Discover, file manager thumbnails).
 
-  Visual contract: a ring with center dot, missing the top 1/3
-  (120° gap centered at 12 o'clock). Drawn in the project's
-  brand accent color (`#3584e4` / `#1c71d8` = the default outer
-  ring color from `provider::DEFAULT_OUTER_COLOR`) instead of
-  the bucket palette, so the launcher entry reads as identity
-  rather than as an alert.
+  Visual contract: a ring with center dot, anchored at 12 o'clock
+  and spanning 240° clockwise to 8 o'clock — the same 12-o'clock
+  start the chip uses (`icon::write_ring_svg`'s
+  `transform="rotate(-90 11 11)"`), so launcher and chip read as
+  the same family at every size: the chip is a "live" version of
+  this static silhouette, with the progress arc growing out of
+  12 o'clock.
 
-  Why the gap: the missing-1/3 silhouette doubles as a
-  quota-meter metaphor — a progress arc that never completes —
-  and visually distinguishes this icon from the chip at a
-  glance (the chip is a complete ring at 100%; this icon is
-  always 2/3, by design). The gap is centered at 12 o'clock
-  (the same start position the chip's progress arc uses in
-  `icon::write_ring_svg`), so the family resemblance holds
-  across both.
+  The 120° gap sits in the upper-left quadrant (between the arc's
+  8-o'clock terminus and the 12-o'clock start). The launcher's
+  silhouette is "always 2/3" by design — the missing-third arc
+  doubles as a quota-meter metaphor that never completes, and
+  distinguishes the launcher entry from the chip (the chip is a
+  complete ring at 100%; this icon is always 2/3).
+
+  Drawn in the project's brand accent color
+  (`#3584e4` / `#1c71d8` = the default outer ring color from
+  `provider::DEFAULT_OUTER_COLOR`) instead of the bucket palette,
+  so the launcher entry reads as identity rather than as an alert.
 
   Why not the throttled color: an earlier version used the
   throttled-red `#e01b24`. A solid red dot reads as
@@ -26,26 +30,35 @@
   itself carries bucket colors at runtime; this icon
   doesn't need to.
 
-  Geometry: outer arc at r=88, stroke-width=20, spanning 240°
-  (2/3 of the circle) from 2 o'clock to 10 o'clock with the
-  gap at the top. Inner dot at r=40 in `#1c71d8` (darker
-  shade of the same blue, for depth). Both leave a ~30px
-  margin on every side for the panel's icon-padding
-  convention. Aspect ratios match the chip (ring/inner ratio
-  ≈ 0.45) so the icon and the chip read as the same family
-  at any size.
+  Geometry: outer arc at r=88, stroke-width=20, sweeping from
+  12 o'clock `(128, 40)` clockwise 240° to 8 o'clock
+  `(51.79, 172)` (the start/end coordinates are 88·cos/sin at
+  the two angles around the center (128, 128), with y flipped
+  per SVG convention). Inner dot at r=40 in `#1c71d8` (darker
+  shade of the same blue, for depth). Both leave a ~30px margin
+  on every side for the panel's icon-padding convention. Aspect
+  ratios match the chip (ring/inner ratio ≈ 0.45) so the icon
+  and the chip read as the same family at any size.
 
-  Stroke linecap is `butt` (the default) — `round` would
-  extend each end by half the stroke width and visually
-  shrink the gap, defeating the "missing third" proportion.
+  Stroke linecap is `butt` (the default). The chip itself uses
+  `round` linecaps because its progress arc is rendered via
+  `stroke-dasharray` (where round caps are required to keep the
+  rounded terminus from looking like a flat dasharray cut). The
+  launcher is a single explicit path with butt caps so the
+  120° gap renders exactly 120° — matching the "missing third"
+  proportion in the design rationale below. Switching to
+  `round` here would extend each end by half a stroke width
+  (~6.5° at r=88 / stroke=20) and shrink the visible gap to
+  ~107°, defeating the missing-third proportion.
 -->
 <svg xmlns="http://www.w3.org/2000/svg"
      width="256" height="256" viewBox="0 0 256 256">
-  <!-- Outer arc: 240° from 2 o'clock (330°) to 10 o'clock (210°),
-       sweep=1 (clockwise) and large-arc=1 (240° > 180°).
-       Start/end coordinates: 88·cos/sin at the two angles
-       around the center (128, 128). -->
-  <path d="M 204.21 84 A 88 88 0 1 1 51.79 84"
+  <!-- Outer arc: 240° clockwise starting from 12 o'clock (top).
+       Start (128, 40) = 88·sin(0°), -88·cos(0°) offset from
+       center (128, 128) in SVG coords (y-down). End
+       (51.79, 172) = 88·sin(240°), -88·cos(240°). sweep=1
+       (clockwise) and large-arc=1 (240° > 180°). -->
+  <path d="M 128 40 A 88 88 0 1 1 51.79 172"
         fill="none" stroke="#3584e4" stroke-width="20"/>
   <!-- Inner dot (darker shade of the same blue, for depth) -->
   <circle cx="128" cy="128" r="40" fill="#1c71d8"/>

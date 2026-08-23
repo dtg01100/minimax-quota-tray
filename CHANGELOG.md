@@ -21,14 +21,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to the `.desktop` file). Passes `appstreamcli validate`. No
   `<screenshots>` / `<releases>` blocks — keeping the CHANGELOG
   as the single source of truth for release notes.
-- **`packaging/icons/hicolor/scalable/apps/llm-quota-tray.svg`** —
-  256×256 SVG app icon. A ring with center dot, with the top
-  1/3 missing (120° gap centered at 12 o'clock), in the
-  project's default outer accent color (`#3584e4` / `#1c71d8`).
-  The missing-1/3 silhouette doubles as a quota-meter metaphor
-  and visually distinguishes the launcher entry from the chip
-  itself (the chip is a complete ring at 100%, this icon is
-  always 2/3).
+- **`packaging/icons/source/llm-quota-tray.svg`** — master SVG
+  (256×256 viewBox); not installed directly but is the
+  regeneration source for every hicolor PNG. A ring with center
+  dot, anchored at 12 o'clock and sweeping 240° clockwise to
+  8 o'clock — the same 12-o'clock start the chip uses
+  (`icon::write_ring_svg`'s `transform="rotate(-90 11 11)"`),
+  so launcher and chip read as the same family at every size.
+  The 120° gap sits in the upper-left quadrant. Drawn in the
+  project's default outer accent color (`#3584e4` / `#1c71d8`);
+  the missing-third silhouette doubles as a quota-meter metaphor
+  that distinguishes the launcher (always 2/3 by design) from
+  the chip (a complete ring at 100%).
 - **`src/activation.rs`** — new module. Reads the XDG Activation
   token from `--token=<token>` CLI flag or `$XDG_ACTIVATION_TOKEN`
   env var (in that order), stores it in a `OnceLock`, and
@@ -70,6 +74,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   / Docker multi-container convention.
 - All 197 unit tests pass (was 188; +9 new for activation
   parsing/resolution).
+
+### Changed
+
+- **Launcher icon orientation** — rotated the static arc to
+  anchor at 12 o'clock and grow clockwise 240° to 8 o'clock,
+  the same geometry the tray chip uses (`icon::write_ring_svg`'s
+  `transform="rotate(-90 11 11)"`). The 120° gap now sits in
+  the upper-left quadrant between the arc's 8-o'clock terminus
+  and the 12-o'clock start. Launcher and chip now read as the
+  same family at every size — the launcher silhouette is "always
+  2/3 fill" by design, the chip is its "live" version with the
+  progress arc growing out of 12 o'clock. Source:
+  `packaging/icons/source/llm-quota-tray.svg`, all nine hicolor
+  PNGs regenerated.
 
 ### Fixed (freedesktop.org integration follow-ups)
 

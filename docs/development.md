@@ -91,14 +91,19 @@ maps to the **Rust** `#[test]` functions in `src/burn.rs` and
 
 | Old gjs test     | Where it lives now                                                |
 |------------------|-------------------------------------------------------------------|
-| T18              | `src/burn.rs::tests::rate_is_computed_from_window_specific_samples` (in the burn tests module) |
-| T19              | `src/burn.rs::tests::weekly_history_survives_5h_rollover`          |
-| T21              | `src/burn.rs::tests::pct_only_window_with_no_signal_suppresses_row`|
-| `regression-scheduler.test.js` Part A/B | `src/main.rs::tests` (orchestrator + scheduler tests under a stubbed clock) |
+| T18 (weekly rate from weekly samples) | `src/burn.rs::tests` — see `slope_linear_ramp_per_hour` for the slope-from-samples math that powers it |
+| T19 (5h rollover doesn't clear weekly history) | `src/burn.rs::tests::new_epoch_uses_fresh_history` (closest semantic match) |
+| T21 (pct-only suppression) | `src/burn.rs::tests::pct_only_weekly_with_flat_data_is_suppressed` |
+| `regression-scheduler.test.js` Part A/B | `src/main.rs::tests` (orchestrator + scheduler tests under a stubbed clock — see `compute_next_interval_*` for the backoff / jitter / floor semantics) |
 
-If you're looking for a particular gjs test and can't find it,
-grep `cargo test -- --list` and check the Rust test names — many were
-preserved with the same intent.
+**Note on test names:** the Rust ports are not always a one-to-one
+rename of the gjs test names — the Rust code is structured
+differently (`compute_burn` returns a single `BurnResult` rather
+than gjs's three separate "is warning / what label / what rate"
+helpers, so the test boundaries shift). Use `cargo test -- --list`
+to find the current Rust test for a specific gjs behavior. The
+table above maps gjs intent → closest Rust test name as of this
+audit.
 
 ### Manual smoke test
 

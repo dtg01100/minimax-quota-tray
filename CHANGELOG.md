@@ -4,7 +4,7 @@ All notable changes to `llm-quota-tray` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-08-24
 
 ### Added (slice 4: freedesktop.org integration)
 
@@ -497,7 +497,8 @@ The conventional-changelog commits across the Rust port era
 (`6f2ecbf` … `c6ecad9`) are listed inline above by short SHA so the
 provenance is traceable without forcing a tag-by-tag breakdown.
 
-[Unreleased]: https://github.com/dtg01100/minimax-quota-tray/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/dtg01100/minimax-quota-tray/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/dtg01100/minimax-quota-tray/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/dtg01100/minimax-quota-tray/releases/tag/v0.3.0
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/

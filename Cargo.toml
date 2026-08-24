@@ -1,6 +1,6 @@
 [package]
 name = "llm-quota-tray"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75"  # MSRV: edition 2021 baseline + async-trait / zbus 5 / tokio 1 requirements
 description = "Provider-agnostic tray indicator for LLM API quota — supports any quota API via a config-only port"

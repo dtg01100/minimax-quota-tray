@@ -79,7 +79,6 @@ use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tokio::sync::OnceCell;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::zvariant::Type;
 use zbus::{Connection, Proxy};
@@ -126,14 +125,25 @@ fn label() -> String {
     format!("{} API Key", crate::instance::config_dir_basename())
 }
 
-/// Session-bus connection, opened lazily on first use. Reused
-/// across calls so the D-Bus handshake (and any `XAUTHORITY`
-/// cookie processing) runs at most once per process.
-static SESSION_BUS: OnceCell<Connection> = OnceCell::const_new();
-
-async fn session_bus() -> Result<&'static Connection> {
-    SESSION_BUS
-        .get_or_try_init(|| async { Connection::session().await.map_err(anyhow::Error::from) })
+/// Open a fresh session-bus connection for a single keyring probe.
+///
+/// **Why per-call and not cached**: the previous implementation
+/// cached a single `Connection` in a `OnceCell` for the lifetime
+/// of the daemon. That long-lived connection can be left in a
+/// half-closed state by transient bus reconnects — and once
+/// stale, every subsequent method call returned an error that we
+/// had logged at `debug!` (effectively invisible). Worse, on cold
+/// boot `Secret Service` had not finished activating its
+/// `/run/user/<uid>/keyring/control` socket before the daemon
+/// registered its first `NameOwnerChanged` listener, so the
+/// cached connection was poisoned for the rest of the session.
+///
+/// Local AF_UNIX SOCKET handshake is well under 1 ms, so the
+/// per-120-s polling cadence can't tell the difference between a
+/// cached and a fresh connection. Trading 1 ms/call for
+/// "the bus connection can never go stale" is a clear win.
+async fn session_bus() -> Result<Connection> {
+    Connection::session()
         .await
         .map_err(|e| anyhow!("connecting to session D-Bus: {e}"))
 }
@@ -157,8 +167,15 @@ async fn ss_proxy<'a>(
 ///      `application` attribute, see module docs).
 ///   2. `LLM_API_KEY` env var (systemd escape hatch).
 ///
-/// Returns `None` if both miss. Failures from (1) are logged at
-/// debug level and treated as a miss.
+/// Returns `None` if both miss.
+///
+/// **Boot-race handling**: `dbus_get` itself blocks on
+/// `org.freedesktop.DBus.NameOwnerChanged` for the Secret Service
+/// bus name, so a cold-boot run where the daemon starts before
+/// Secret Service is fully up just waits — no timeout, no retry.
+/// The caller wraps the whole call in `tokio::time::timeout` as
+/// a hard upper bound; in practice the wait resolves within
+/// milliseconds once the keyring daemon claims its bus name.
 pub async fn get() -> Option<String> {
     if let Some(s) = dbus_get().await {
         return secret_to_key(s.as_bytes());
@@ -206,11 +223,35 @@ pub async fn clear() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn dbus_get() -> Option<String> {
-    let conn = session_bus().await.ok()?;
-    let svc = match ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await {
+    let conn = match session_bus().await {
+        Ok(c) => c,
+        Err(e) => {
+            // Visible at default RUST_LOG=info — this used to be
+            // swallowed at debug level, which is how a bad bus
+            // connection survived for hours on a cold-boot
+            // session before anyone noticed.
+            log::warn!("Secret Service: session bus unavailable: {e:#}");
+            return None;
+        }
+    };
+
+    // Block until `org.freedesktop.secrets` has an owner on the
+    // session bus. Closes the boot-time race between this
+    // daemon starting and `gnome-keyring-daemon` activating the
+    // Secret Service: we either find the name present already
+    // (the happy case — no waiting) or await the next appearing
+    // NameOwnerChanged transition (cold-boot case). The caller
+    // wraps the whole call in `tokio::time::timeout` if it
+    // needs a hard upper bound.
+    if let Err(e) = wait_for_name_owner(&conn, SS_BUS).await {
+        log::warn!("Secret Service: {e}");
+        return None;
+    }
+
+    let svc = match ss_proxy(&conn, SS_SERVICE_PATH, SERVICE_IFACE).await {
         Ok(p) => p,
         Err(e) => {
-            log::debug!("Secret Service: cannot build service proxy: {e}");
+            log::warn!("Secret Service: cannot build service proxy: {e}");
             return None;
         }
     };
@@ -220,20 +261,23 @@ async fn dbus_get() -> Option<String> {
     //    item AND not a current-attribute one, we read the legacy
     //    item and signal to the caller that a migration is
     //    overdue (via the return tuple).
-    let current = match search_items(conn, &svc, &current_attrs()).await {
+    let current = match search_items(&conn, &svc, &current_attrs()).await {
         Ok(v) => v,
         Err(e) => {
-            log::debug!("Secret Service: SearchItems (current) failed: {e:#}");
+            log::warn!(
+                "Secret Service: SearchItems (application={}) failed: {e:#}",
+                current_application()
+            );
             Vec::new()
         }
     };
     let legacy = if current.is_empty() {
         // Only fall back to legacy if there's no current-attribute
         // hit — otherwise we'd return two keys and have to dedupe.
-        match search_items(conn, &svc, &legacy_attrs()).await {
+        match search_items(&conn, &svc, &legacy_attrs()).await {
             Ok(v) => v,
             Err(e) => {
-                log::debug!("Secret Service: SearchItems (legacy) failed: {e:#}");
+                log::warn!("Secret Service: SearchItems (legacy) failed: {e:#}");
                 Vec::new()
             }
         }
@@ -242,14 +286,23 @@ async fn dbus_get() -> Option<String> {
     };
 
     if current.is_empty() && legacy.is_empty() {
+        // Genuine "no key for this instance" — not a transport
+        // error. Debug-level so the journal doesn't spam every
+        // poll cycle for someone who just hasn't called
+        // `llm-quota-tray --set-key` yet.
+        log::debug!(
+            "Secret Service: no items for application={} (legacy={})",
+            current_application(),
+            legacy_application()
+        );
         return None;
     }
 
     // 2. Open a "plain" session for the read.
-    let session = match open_session(conn, &svc).await {
+    let session = match open_session(&conn, &svc).await {
         Ok(s) => s,
         Err(e) => {
-            log::debug!("Secret Service: OpenSession failed: {e:#}");
+            log::warn!("Secret Service: OpenSession failed: {e:#}");
             return None;
         }
     };
@@ -261,8 +314,8 @@ async fn dbus_get() -> Option<String> {
     let mut all_items: Vec<OwnedObjectPath> = current.to_vec();
     all_items.extend(legacy.iter().cloned());
     if !all_items.is_empty() {
-        if let Err(e) = unlock_items(conn, &svc, all_items).await {
-            log::debug!("Secret Service: Unlock failed: {e:#}");
+        if let Err(e) = unlock_items(&conn, &svc, all_items).await {
+            log::warn!("Secret Service: Unlock failed: {e:#}");
             return None;
         }
     }
@@ -275,10 +328,10 @@ async fn dbus_get() -> Option<String> {
         .or(legacy.first())
         .cloned()
         .expect("non-empty by branch above");
-    let bytes = match read_secret(conn, &item, &session).await {
+    let bytes = match read_secret(&conn, &item, &session).await {
         Ok(b) => b,
         Err(e) => {
-            log::debug!("Secret Service: Item.GetSecret failed: {e:#}");
+            log::warn!("Secret Service: Item.GetSecret failed: {e:#}");
             return None;
         }
     };
@@ -305,10 +358,10 @@ async fn dbus_get() -> Option<String> {
 
 async fn dbus_set(value: &[u8]) -> Result<()> {
     let conn = session_bus().await?;
-    let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
+    let svc = ss_proxy(&conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
 
     // 1. Open session.
-    let session = open_session(conn, &svc).await?;
+    let session = open_session(&conn, &svc).await?;
     let session_ref = session.as_str();
 
     // 2. Resolve default collection via ReadAlias.
@@ -329,7 +382,7 @@ async fn dbus_set(value: &[u8]) -> Result<()> {
     );
     properties.insert(
         "org.freedesktop.Secret.Item.Type",
-        Value::Str("org.freedesktop.Secret.Generic".into()),
+        Value::Str("org.freadesktop.Secret.Generic".into()),
     );
 
     let session_op = zbus::zvariant::ObjectPath::from_str_unchecked(session_ref);
@@ -340,7 +393,7 @@ async fn dbus_set(value: &[u8]) -> Result<()> {
         content_type: "text/plain".to_string(), // per spec convention
     };
 
-    let coll = ss_proxy(conn, collection.as_str(), COLLECTION_IFACE).await?;
+    let coll = ss_proxy(&conn, collection.as_str(), COLLECTION_IFACE).await?;
     let (item, prompt): (OwnedObjectPath, OwnedObjectPath) = coll
         .call(
             "CreateItem",
@@ -349,7 +402,7 @@ async fn dbus_set(value: &[u8]) -> Result<()> {
         .await
         .context("CreateItem")?;
     if prompt.as_str() != "/" {
-        let ok = wait_for_prompt(conn, &prompt).await?;
+        let ok = wait_for_prompt(&conn, &prompt).await?;
         if !ok {
             anyhow::bail!("CreateItem prompt dismissed");
         }
@@ -359,7 +412,7 @@ async fn dbus_set(value: &[u8]) -> Result<()> {
     //    spec deliberately keeps attributes off the CreateItem
     //    signature — they're a property of the item, not the
     //    creation call.
-    let item_proxy = ss_proxy(conn, item.as_str(), ITEM_IFACE).await?;
+    let item_proxy = ss_proxy(&conn, item.as_str(), ITEM_IFACE).await?;
     item_proxy
         .set_property("Attributes", current_attrs())
         .await
@@ -368,9 +421,9 @@ async fn dbus_set(value: &[u8]) -> Result<()> {
     // 5. Migration: if a legacy-attribute item exists, delete it.
     //    Best-effort — a delete failure here shouldn't fail the
     //    whole set; the user can re-run set or use clear().
-    if let Ok(legacy_items) = search_items(conn, &svc, &legacy_attrs()).await {
+    if let Ok(legacy_items) = search_items(&conn, &svc, &legacy_attrs()).await {
         for legacy_item in legacy_items {
-            let p = ss_proxy(conn, legacy_item.as_str(), ITEM_IFACE).await?;
+            let p = ss_proxy(&conn, legacy_item.as_str(), ITEM_IFACE).await?;
             let prompt: OwnedObjectPath = p.call("Delete", &()).await?;
             if prompt.as_str() != "/" {
                 log::debug!("legacy Delete returned prompt {}; skipping wait", prompt);
@@ -388,7 +441,7 @@ async fn dbus_set(value: &[u8]) -> Result<()> {
 #[allow(dead_code)] // see `clear()`
 async fn dbus_clear() -> Result<()> {
     let conn = session_bus().await?;
-    let svc = ss_proxy(conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
+    let svc = ss_proxy(&conn, SS_SERVICE_PATH, SERVICE_IFACE).await?;
 
     let mut all_items = Vec::new();
     for attrs in [current_attrs(), legacy_attrs()] {
@@ -401,7 +454,7 @@ async fn dbus_clear() -> Result<()> {
     }
 
     for item in all_items {
-        let item_proxy = ss_proxy(conn, item.as_str(), ITEM_IFACE).await?;
+        let item_proxy = ss_proxy(&conn, item.as_str(), ITEM_IFACE).await?;
         let prompt: OwnedObjectPath = item_proxy
             .call("Delete", &())
             .await
@@ -426,6 +479,73 @@ fn legacy_attrs() -> HashMap<String, String> {
         ATTR_APP_CURRENT.to_string(),
         legacy_application().to_string(),
     )])
+}
+
+/// Wait until a well-known bus name has an owner on the
+/// session bus, or return `Err` if `conn` is closed before that.
+///
+/// Uses the standard D-Bus pattern:
+///   1. Subscribe to `org.freedesktop.DBus.NameOwnerChanged`
+///      with an arg filter on the well-known name. **Subscribe
+///      before** the synchronous check so we can't miss a
+///      transition that happens between the two.
+///   2. `NameHasOwner` probe — fast-path for the already-present
+///      case.
+///   3. Otherwise await the next `NameOwnerChanged` signal where
+///      the new owner is non-empty.
+///
+/// `zbus::fdo::DBusProxy` is the same typed wrapper
+/// `sni.rs::spawn_watcher_recovery` uses for the SNI watcher;
+/// reusing it here keeps the codebase on a single,
+/// IDE-checked D-Bus facade rather than scattering string-typed
+/// `call_method("NameHasOwner", ...)` sites around.
+async fn wait_for_name_owner(conn: &Connection, name: &'static str) -> Result<()> {
+    use zbus::fdo::DBusProxy;
+    use zbus::names::BusName;
+
+    let dbus = DBusProxy::new(conn)
+        .await
+        .context("DBusProxy::new on session bus")?;
+    let bus_name: BusName = name
+        .try_into()
+        .map_err(|e| anyhow!("invalid bus name {name:?}: {e}"))?;
+
+    // (1) Subscribe FIRST so we don't miss an appearing
+    // transition that happens between the check and the
+    // subscription.
+    let mut stream = dbus
+        .receive_name_owner_changed_with_args(&[(0u8, bus_name.as_str())])
+        .await
+        .context("subscribe to NameOwnerChanged")?;
+
+    // (2) Synchronous fast-path.
+    if dbus
+        .name_has_owner(bus_name)
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    // (3) Wait for the appearing transition. The filter on the
+    // subscription already restricts to our well-known name, so
+    // every signal we see is either our name appearing or
+    // disappearing.
+    while let Some(signal) = stream.next().await {
+        let args = match signal.args() {
+            Ok(a) => a,
+            Err(e) => {
+                log::debug!("NameOwnerChanged: bad signal args: {e}");
+                continue;
+            }
+        };
+        // Appearing = new_owner is some(...). Disappearing =
+        // new_owner is None.
+        if args.new_owner().is_some() {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("NameOwnerChanged stream ended before {name} appeared");
 }
 
 async fn open_session(_conn: &Connection, svc: &Proxy<'_>) -> Result<OwnedObjectPath> {
@@ -484,7 +604,7 @@ async fn unlock_items(
     let (unlocked, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
         svc.call("Unlock", &(locked,)).await.context("Unlock")?;
     if prompt.as_str() != "/" {
-        let ok = wait_for_prompt(conn, &prompt).await?;
+        let ok = wait_for_prompt(&conn, &prompt).await?;
         if !ok {
             anyhow::bail!("Unlock prompt dismissed by user");
         }
@@ -742,10 +862,10 @@ mod tests {
             super::clear().await.ok();
 
             let conn = super::session_bus().await.expect("session bus");
-            let svc = super::ss_proxy(conn, super::SS_SERVICE_PATH, super::SERVICE_IFACE)
+            let svc = super::ss_proxy(&conn, super::SS_SERVICE_PATH, super::SERVICE_IFACE)
                 .await
                 .expect("service proxy");
-            let session = super::open_session(conn, &svc).await.expect("open session");
+            let session = super::open_session(&conn, &svc).await.expect("open session");
             let collection: OwnedObjectPath = svc
                 .call("ReadAlias", &(super::DEFAULT_ALIAS,))
                 .await
@@ -764,7 +884,7 @@ mod tests {
                 value: probe.as_bytes().to_vec(),
                 content_type: "text/plain".to_string(),
             };
-            let coll = super::ss_proxy(conn, collection.as_str(), super::COLLECTION_IFACE)
+            let coll = super::ss_proxy(&conn, collection.as_str(), super::COLLECTION_IFACE)
                 .await
                 .expect("coll proxy");
             let (item, prompt): (OwnedObjectPath, OwnedObjectPath) = coll
@@ -772,9 +892,9 @@ mod tests {
                 .await
                 .expect("create item");
             if prompt.as_str() != "/" {
-                let _ = super::wait_for_prompt(conn, &prompt).await;
+                let _ = super::wait_for_prompt(&conn, &prompt).await;
             }
-            let item_proxy = super::ss_proxy(conn, item.as_str(), super::ITEM_IFACE)
+            let item_proxy = super::ss_proxy(&conn, item.as_str(), super::ITEM_IFACE)
                 .await
                 .expect("item proxy");
             item_proxy

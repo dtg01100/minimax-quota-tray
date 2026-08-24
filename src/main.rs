@@ -474,12 +474,40 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
     // connection is cached in `keyring` (see OnceCell there), and
     // zbus's `Proxy::call` is async-native so it integrates with
     // the tokio runtime without blocking.
-    let api_key = match keyring::get().await {
-        Some(k) => k,
-        None => {
+    //
+    // Bound the probe: at session boot the Secret Service and its
+    // `/run/user/<uid>/keyring/control` socket are still waking up,
+    // and `keyring::get()` blocks indefinitely waiting for the
+    // collection to unlock — which leaves this `do_refresh` call
+    // stuck, the select! sleep arm unable to make progress (the
+    // orchestrator's only tick path runs through here), and the
+    // chip permanently showing the static-fallback SVG with no
+    // real quota data. A 2s ceiling mirrors `render_initial`'s
+    // probe budget; on a warm session it's sub-millisecond, and
+    // on cold boots it self-heals on the next 120s tick.
+    let api_key = match tokio::time::timeout(Duration::from_secs(2), keyring::get()).await {
+        Ok(Some(k)) => k,
+        Ok(None) => {
             // gjs parity: "No API key configured" (the full message)
             // in the menu's error row, not just "No API key".
             render_error(tray, cfg, "No API key configured").await;
+            return cfg.refresh_seconds * 1000;
+        }
+        Err(_) => {
+            // Boot-time race: Secret Service unavailable right now.
+            // Log at warn so the journal captures the cause, render a
+            // distinct chip message so the user knows it's transient
+            // (vs. the "no key configured" path which is a real key
+            // setup issue requiring `llm-quota-tray --set-key`).
+            // The next 120s tick will retry when Secret Service is
+            // almost certainly up.
+            log::warn!("keyring probe timed out — Secret Service unavailable");
+            render_error(
+                tray,
+                cfg,
+                "Secret Service unavailable (keyring not ready) — will retry next refresh",
+            )
+            .await;
             return cfg.refresh_seconds * 1000;
         }
     };
@@ -758,7 +786,23 @@ async fn render_initial(tray: &Arc<Tray>, cfg: &Config) {
     // Probe the keyring once so the absence of an API key shows up
     // in the log (and the menu's error row carries it). The chip
     // itself is just the icon — empty title (gjs parity).
-    let _has_key = keyring::get().await.is_some();
+    //
+    // Bound the probe: at session boot the Secret Service and its
+    // `/run/user/<uid>/keyring/control` socket are still waking up,
+    // and `keyring::get()` then blocks indefinitely waiting for the
+    // collection to unlock — which leaves `tray.update(...)` below
+    // never called, the SNI `Status` stuck at the placeholder
+    // `"Passive"` default, and the panel slot blank until the user
+    // manually restarts us. A 2s ceiling is generous on warm
+    // sessions (sub-millisecond in practice) and short enough that
+    // even on cold boots render_initial completes well before the
+    // first 120s refresh tick. The `do_refresh` cycle re-probes
+    // the keyring per-poll, so a transient "no key" here
+    // self-heals on the next tick once Secret Service is up.
+    let _has_key = matches!(
+        tokio::time::timeout(Duration::from_secs(2), keyring::get()).await,
+        Ok(Some(_))
+    );
     // No data yet — empty tooltip (gjs's "no data" case uses just the
     // plan label, not a detailed percentage; with empty data we
     // don't have a percentage to put in the desc).

@@ -51,7 +51,7 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 
 # Async / HTTP / JSON
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["default-tls", "json", "blocking"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
 # StreamExt::next() for consuming zbus::proxy::SignalStream (the
 # Stream trait isn't in scope by default; futures-util provides it).

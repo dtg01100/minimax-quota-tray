@@ -109,12 +109,6 @@ struct AppState {
     http_client: Option<fetch::HttpClient>,
     /// Connectivity state — false = offline, skip polling.
     offline: bool,
-    /// Pending refresh requested (reserved for future
-    /// single-flight queueing — currently unused, the menu
-    /// Refresh command is dispatched straight to the
-    /// orchestrator via the mpsc channel).
-    #[allow(dead_code)]
-    pending_force_refresh: bool,
 
     /// Cached per-model price table (see `pricing.rs`). Populated
     /// at startup when `Config::pricing_endpoint` is `Some`;
@@ -693,7 +687,11 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
                     notify::send(
                         "warning",
                         &format!("{plan_label} — running low", plan_label = cfg.label),
-                        &format!("Remaining dropped below {}%.", 100 - cfg.thresholds.yellow),
+                        &format!(
+                            "Usage reached {}% (threshold: {}%).",
+                            100 - cfg.thresholds.yellow,
+                            cfg.thresholds.yellow
+                        ),
                         notify::Urgency::Normal,
                         crate::activation::get(),
                     )

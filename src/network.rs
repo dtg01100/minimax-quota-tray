@@ -35,6 +35,11 @@ pub enum NetEvent {
     ForceRefresh,
 }
 
+/// NetworkManager state constant: fully connected to the internet.
+/// Per the NM spec, `NM_STATE_CONNECTED_GLOBAL` (70) indicates the
+/// machine has global network connectivity.
+const NM_STATE_CONNECTED_GLOBAL: u32 = 70;
+
 /// Spawn a tokio task that watches NetworkManager and feeds
 /// events to `tx`. The task lives for the duration of the program;
 /// if NM isn't available it exits silently (graceful degradation
@@ -83,8 +88,8 @@ async fn run_watcher(conn: zbus::Connection, tx: mpsc::Sender<NetEvent>) -> Resu
     .context("create NM proxy")?;
 
     // NM_STATE_CONNECTED_GLOBAL (70) = fully online.
-    let initial_state: u32 = nm_proxy.get_property("State").await.unwrap_or(70);
-    let initially_online = initial_state == 70;
+    let initial_state: u32 = nm_proxy.get_property("State").await.unwrap_or(NM_STATE_CONNECTED_GLOBAL);
+    let initially_online = initial_state == NM_STATE_CONNECTED_GLOBAL;
     if !initially_online {
         let _ = tx.send(NetEvent::Connectivity(false)).await;
     }
@@ -109,7 +114,7 @@ async fn run_watcher(conn: zbus::Connection, tx: mpsc::Sender<NetEvent>) -> Resu
             continue;
         }
         last_state = new_state;
-        let online = new_state == 70;
+        let online = new_state == NM_STATE_CONNECTED_GLOBAL;
         let _ = tx.send(NetEvent::Connectivity(online)).await;
         if online {
             let _ = tx.send(NetEvent::ForceRefresh).await;

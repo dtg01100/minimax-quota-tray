@@ -6,76 +6,61 @@
 //! Two concurrent instances have different lock paths so they don't
 //! conflict — each has its own `pid` file in its own slot.
 //!
-//! gjs parity: matches `acquireSingleInstanceLock()` /
-//! `releaseSingleInstanceLock()`. Uses O_EXCL semantics for
-//! first-time creation (atomic check-then-write) and takes over
-//! stale locks whose owner process has died.
+//! Uses `flock(2)` with `LOCK_EX | LOCK_NB` for atomic exclusive
+//! locking — no TOCTOU race between check-and-write. The PID is
+//! written to the file so stale locks can be identified by readers,
+//! but the kernel flock is the source of truth for ownership.
 //!
-//! On platforms without `/proc` (rare — gjs handles it gracefully
-//! too), the lock is best-effort: we'd rather run two instances
-//! than refuse to start.
+//! On platforms without `flock` (non-Unix), the lock is best-effort:
+//! we'd rather run two instances than refuse to start.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use std::fs::File;
 use std::path::PathBuf;
 
-/// Acquired lock state; holds the path so we can release on exit.
+/// Acquired lock state; holds the file handle so the flock is released
+/// on drop, and the path for cleanup.
 pub struct Lock {
     path: PathBuf,
+    file: File,
 }
 
 impl Lock {
     /// Try to acquire the lock. Returns `Ok(Some(Lock))` on success,
     /// `Ok(None)` if another live instance holds it, `Err` if the
-    /// lock file is malformed (e.g. non-numeric contents).
+    /// lock file cannot be created or opened.
     pub fn acquire() -> Result<Option<Self>> {
         let path = crate::instance::lock_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let pid_str = std::process::id().to_string();
 
-        // Try O_EXCL create first.
-        match std::fs::OpenOptions::new()
+        // Open (creating if needed) — the file must exist for flock.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                use std::io::Write;
-                let _ = f.write_all(pid_str.as_bytes());
-                return Ok(Some(Self { path }));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Lock exists — check whether the holder is alive.
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "create lock file at {}: {e}",
-                    path.display()
-                ));
-            }
-        }
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
 
-        // Read the existing PID; if its /proc/<pid> is gone, take
-        // over.
-        let existing_pid: i64 = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-
-        if existing_pid > 0 && process_alive(existing_pid) {
-            // Live holder — refuse to start.
+        // Try to acquire an exclusive, non-blocking lock. This is
+        // atomic: either we get the lock or we don't — no race.
+        if !try_lock_exclusive(&file)? {
             return Ok(None);
         }
 
-        // Stale lock: replace.
-        std::fs::write(&path, &pid_str)
-            .with_context(|| format!("replacing stale lock at {}", path.display()))?;
-        Ok(Some(Self { path }))
+        // Write our PID for diagnostics / stale identification.
+        let pid_str = std::process::id().to_string();
+        use std::io::Write;
+        let _ = file.set_len(0);
+        let _ = file.write_all(pid_str.as_bytes());
+
+        Ok(Some(Self { path, file }))
     }
 
     /// Release the lock (best-effort). Idempotent.
     pub fn release(&self) {
+        let _ = unlock_file(&self.file);
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -86,11 +71,50 @@ impl Drop for Lock {
     }
 }
 
-/// True iff `/proc/<pid>` exists — the cheap-and-cheerful
-/// liveness signal on Linux. Returns false on platforms without
-/// `/proc` (caller treats as "stale" → takeover).
-fn process_alive(pid: i64) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+/// Try to acquire an exclusive non-blocking lock on `file`.
+/// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if
+/// another process holds it, or `Err` on a system error.
+#[cfg(unix)]
+fn try_lock_exclusive(file: &File) -> Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    // LOCK_EX | LOCK_NB: exclusive, non-blocking. Returns 0 on
+    // success, -1 with EWOULDBLOCK if already locked.
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        Ok(true)
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(false)
+        } else {
+            Err(err.into())
+        }
+    }
+}
+
+/// Release a flock on `file`. Best-effort.
+#[cfg(unix)]
+fn unlock_file(file: &File) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_UN) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+/// Non-Unix fallback: no locking. Always succeeds.
+#[cfg(not(unix))]
+fn try_lock_exclusive(_file: &File) -> Result<bool> {
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn unlock_file(_file: &File) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -151,8 +175,7 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         isolated_lock_path();
         // Write a fake stale PID. 1 is init (usually alive), so use
-        // a very high number that's definitely dead - /proc/9999999
-        // does not exist on any sane system.
+        // a very high number that's definitely dead.
         let path = crate::instance::lock_path();
         std::fs::write(&path, "9999999").unwrap();
         let lock = Lock::acquire().expect("acquire").expect("stale takeover");
@@ -171,7 +194,7 @@ mod tests {
 
     #[test]
     fn drop_releases_lock() {
-        // RAII safety net: Lock::Drop must remove the lockfile so
+        // RAII safety net: Lock::Drop must release the flock so
         // a panic in the middle of a session does not leave a stale
         // lock that the next launch would have to take over.
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -181,10 +204,13 @@ mod tests {
             let _lock = Lock::acquire().expect("acquire").expect("not held");
             assert!(path.exists(), "lockfile should exist while held");
         } // _lock drops here
+        // After drop, a new acquire should succeed (flock released).
+        let second = Lock::acquire().expect("acquire-after-drop");
         assert!(
-            !path.exists(),
-            "lockfile should be removed by Lock::Drop"
+            second.is_some(),
+            "lock should be releasable after Drop"
         );
+        second.unwrap().release();
     }
 
     #[test]
@@ -205,10 +231,9 @@ mod tests {
     fn malformed_lockfile_is_treated_as_stale() {
         // A lockfile containing non-numeric garbage (e.g. truncated
         // write, or a process that wrote a name instead of a PID)
-        // should not deadlock the next launch. The spec says
-        // /proc/<pid> liveness is the gate; non-numeric values parse
-        // as 0 which fails the > 0 check, so the takeover branch
-        // runs.
+        // should not deadlock the next launch. With flock, the
+        // previous holder has already exited (no live flock), so
+        // we can take over.
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         isolated_lock_path();
         let path = crate::instance::lock_path();
@@ -221,4 +246,5 @@ mod tests {
         let my_pid = std::process::id();
         assert_eq!(contents, my_pid.to_string());
         lock.release();
-    }}
+    }
+}

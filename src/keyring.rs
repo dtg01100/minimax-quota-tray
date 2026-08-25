@@ -261,7 +261,7 @@ async fn dbus_get() -> Option<String> {
     //    item AND not a current-attribute one, we read the legacy
     //    item and signal to the caller that a migration is
     //    overdue (via the return tuple).
-    let current = match search_items(&conn, &svc, &current_attrs()).await {
+    let current = match search_items(&svc, &current_attrs()).await {
         Ok(v) => v,
         Err(e) => {
             log::warn!(
@@ -274,7 +274,7 @@ async fn dbus_get() -> Option<String> {
     let legacy = if current.is_empty() {
         // Only fall back to legacy if there's no current-attribute
         // hit — otherwise we'd return two keys and have to dedupe.
-        match search_items(&conn, &svc, &legacy_attrs()).await {
+        match search_items(&svc, &legacy_attrs()).await {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("Secret Service: SearchItems (legacy) failed: {e:#}");
@@ -382,7 +382,7 @@ async fn dbus_set(value: &[u8]) -> Result<()> {
     );
     properties.insert(
         "org.freedesktop.Secret.Item.Type",
-        Value::Str("org.freadesktop.Secret.Generic".into()),
+        Value::Str("org.freedesktop.Secret.Generic".into()),
     );
 
     let session_op = zbus::zvariant::ObjectPath::from_str_unchecked(session_ref);
@@ -421,7 +421,7 @@ async fn dbus_set(value: &[u8]) -> Result<()> {
     // 5. Migration: if a legacy-attribute item exists, delete it.
     //    Best-effort — a delete failure here shouldn't fail the
     //    whole set; the user can re-run set or use clear().
-    if let Ok(legacy_items) = search_items(&conn, &svc, &legacy_attrs()).await {
+    if let Ok(legacy_items) = search_items(&svc, &legacy_attrs()).await {
         for legacy_item in legacy_items {
             let p = ss_proxy(&conn, legacy_item.as_str(), ITEM_IFACE).await?;
             let prompt: OwnedObjectPath = p.call("Delete", &()).await?;
@@ -564,7 +564,6 @@ async fn open_session(_conn: &Connection, svc: &Proxy<'_>) -> Result<OwnedObject
 }
 
 async fn search_items(
-    conn: &Connection,
     svc: &Proxy<'_>,
     attrs: &HashMap<String, String>,
 ) -> Result<Vec<OwnedObjectPath>> {
@@ -580,16 +579,7 @@ async fn search_items(
         .context("SearchItems")?;
     let mut all = unlocked;
     all.extend(locked);
-    let _ = conn; // unused; reserved for future per-collection search
     Ok(all)
-}
-
-async fn _is_item_locked_unused(_conn: &Connection, _item: &OwnedObjectPath) -> bool {
-    // The locked-counting in search_items() is informational; we
-    // call Unlock unconditionally below. Kept as a stub for the
-    // future optimization of skipping the Unlock round-trip when
-    // nothing is locked.
-    false
 }
 
 async fn unlock_items(
@@ -604,7 +594,7 @@ async fn unlock_items(
     let (unlocked, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
         svc.call("Unlock", &(locked,)).await.context("Unlock")?;
     if prompt.as_str() != "/" {
-        let ok = wait_for_prompt(&conn, &prompt).await?;
+        let ok = wait_for_prompt(conn, &prompt).await?;
         if !ok {
             anyhow::bail!("Unlock prompt dismissed by user");
         }

@@ -948,7 +948,7 @@ mod tests {
         emit_signal_with_timeout(
             "err",
             async {
-                let io = std::io::Error::new(std::io::ErrorKind::Other, "test");
+                let io = std::io::Error::other("test");
                 Err::<(), zbus::Error>(zbus::Error::InputOutput(std::sync::Arc::new(io)))
             },
         )

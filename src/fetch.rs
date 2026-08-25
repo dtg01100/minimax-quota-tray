@@ -152,12 +152,7 @@ fn redact_credential_lines(s: &str) -> String {
     out
 }
 fn flush_line(out: &mut String, line: &str, lower: &str) {
-    if lower.contains(TRIGGER_PATTERNS[0])
-        || lower.contains(TRIGGER_PATTERNS[1])
-        || lower.contains(TRIGGER_PATTERNS[2])
-        || lower.contains(TRIGGER_PATTERNS[3])
-        || lower.contains(TRIGGER_PATTERNS[4])
-    {
+    if TRIGGER_PATTERNS.iter().any(|p| lower.contains(p)) {
         out.push_str("[redacted line]");
     } else {
         out.push_str(line);

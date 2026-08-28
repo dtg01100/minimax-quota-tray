@@ -496,6 +496,55 @@ async fn orchestrator(
     }
 }
 
+/// Pure gate predicates and state mutations shared by `do_refresh`
+/// and `force_refresh_now`. Extracted (rather than inlined) so the
+/// invariants below can be unit-tested without constructing a
+/// `Tray` (which requires a live D-Bus session). The functions are
+/// trivially small — the point is the *name + contract*, not the
+/// line count.
+///
+/// `true` iff the screen-lock short-circuit should fire for this
+/// state. While the screen is locked there is nobody to read the
+/// tray icon, so `do_refresh` skips the fetch (preserving the
+/// last-known-good icon) and returns the normal cadence interval.
+/// This helper is pure (read-only); the actual early-return lives
+/// in `do_refresh` because that path also needs to drop the mutex
+/// lock before returning.
+fn is_screen_locked(state: &AppState) -> bool {
+    state.screen_locked
+}
+
+/// The interval `do_refresh`'s short-circuit gates return. Distinct
+/// from `compute_next_interval` (which applies backoff / adaptive
+/// cut) because the gates must NOT adjust cadence — locked or
+/// offline, the schedule stays aligned with `refresh_seconds` so the
+/// next cadence tick (or the unlock / reconnect event) is the only
+/// behavior change.
+fn short_circuit_interval(cfg: &Config) -> u64 {
+    cfg.refresh_seconds * 1000
+}
+
+/// Mutate the per-state fields that every "force refresh" trigger
+/// is required to clear before `do_refresh` runs: `fail_streak` (so
+/// the next fetch skips backoff) and `offline` (so a cached
+/// "we're down" opinion doesn't override a stronger "user clicked
+/// Refresh" or "NM reconnected" signal).
+///
+/// IMPORTANT: this helper deliberately does NOT touch
+/// `state.screen_locked`. The lock flag is owned by the
+/// `screenlock` module's event stream — clearing it here would
+/// race the screenlock watcher's own transitions. If the screen is
+/// locked at the moment a force-refresh fires, `do_refresh`'s
+/// screen-lock gate will short-circuit anyway, so there's no need
+/// to second-guess the lock state here.
+///
+/// Pinned by tests in `tests::*` — a regression that adds or
+/// removes a field from the clear-list will fail loud.
+fn clear_force_refresh_state(state: &mut AppState) {
+    state.fail_streak = 0;
+    state.offline = false;
+}
+
 /// Force a refresh now. Shared by every "force" trigger — menu
 /// Refresh, NetEvent::ForceRefresh (NM reconnect, etc.), and
 /// LockEvent::ForceRefresh (screen unlock). Clears `fail_streak` and
@@ -511,8 +560,7 @@ async fn force_refresh_now(
 ) -> u64 {
     {
         let mut s = state.lock().await;
-        s.fail_streak = 0;
-        s.offline = false;
+        clear_force_refresh_state(&mut s);
     }
     let returned_ms = do_refresh(cfg, state, tray).await;
     returned_ms
@@ -528,7 +576,7 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
         if s.offline {
             drop(s);
             render_out_of_menu(tray, cfg, true).await;
-            return cfg.refresh_seconds * 1000;
+            return short_circuit_interval(cfg);
         }
     }
 
@@ -537,12 +585,15 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
     // next cadence tick (or the unlock event) drive the next attempt.
     // Returning the normal interval keeps the schedule aligned with
     // what we *would* have polled, so unlock-time ForceRefresh is the
-    // only behavior change.
+    // only behavior change. Note: unlike the offline gate, this
+    // path does NOT call `render_out_of_menu` — the last-known-good
+    // icon is preserved (matches gjs `refresh(true)` semantics on
+    // unlock).
     {
         let s = state.lock().await;
-        if s.screen_locked {
+        if is_screen_locked(&s) {
             drop(s);
-            return cfg.refresh_seconds * 1000;
+            return short_circuit_interval(cfg);
         }
     }
 
@@ -1904,5 +1955,242 @@ mod tests {
             );
         }
         assert_eq!(h.len(), BURN_MAX_SAMPLES);
+    }
+
+    // ------------------------------------------------------------------
+    // Gate-helper tests (commit 4ee12be coverage).
+    //
+    // `is_screen_locked`, `short_circuit_interval`, and
+    // `clear_force_refresh_state` are pure helpers extracted from
+    // `do_refresh` / `force_refresh_now` so the gate contracts can be
+    // unit-tested without constructing a `Tray` (which requires a
+    // live D-Bus session). These tests pin the invariants the
+    // 2026-08-28 code review flagged as regression risks:
+    //   1. `AppState::default().screen_locked` must be `false` so the
+    //      graceful-degradation path (ScreenSaver daemon absent)
+    //      polls normally.
+    //   2. `is_screen_locked` must be pure (read-only) — the gate
+    //      must not mutate state.
+    //   3. `short_circuit_interval` must return `refresh_seconds *
+    //      1000`, NOT `compute_next_interval(...)` — the gates
+    //      deliberately do not apply backoff so the cadence stays
+    //      aligned across a lock window.
+    //   4. `clear_force_refresh_state` must zero `fail_streak` AND
+    //      clear `offline` (the two-field invariant all three
+    //      force-refresh call sites depend on).
+    //   5. `clear_force_refresh_state` must NOT touch
+    //      `screen_locked` — the screenlock watcher owns that flag.
+    //   6. `clear_force_refresh_state` must be idempotent.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn app_state_default_has_screen_locked_false() {
+        // Graceful-degradation invariant: when the ScreenSaver daemon
+        // is absent (headless CI, Wayland-without-lock-daemon), the
+        // watcher task exits without ever sending a LockEvent, so
+        // `state.screen_locked` stays at its Default value forever.
+        // If that default were ever `true`, polling would never
+        // happen on such hosts. Pinned here so a future refactor
+        // that flips the default trips the test immediately.
+        assert!(
+            !AppState::default().screen_locked,
+            "AppState::default().screen_locked must be false so absent ScreenSaver daemon does not gate polling"
+        );
+    }
+
+    #[test]
+    fn is_screen_locked_returns_true_when_locked() {
+        let s = AppState {
+            screen_locked: true,
+            ..AppState::default()
+        };
+        assert!(is_screen_locked(&s));
+    }
+
+    #[test]
+    fn is_screen_locked_returns_false_when_unlocked() {
+        // Default-state path: should be unreachable in production
+        // (the watcher would have set `screen_locked = true`) but the
+        // helper must still return the right answer for any state.
+        let s = AppState::default();
+        assert!(!is_screen_locked(&s));
+    }
+
+    #[test]
+    fn is_screen_locked_does_not_mutate_state() {
+        // Pure read. Pin the fields that matter for the gate logic
+        // (offline + fail_streak + screen_locked); flipping any of
+        // them would change the orchestrator's behavior on the next
+        // pass.
+        let mut s = AppState::default();
+        s.offline = true;
+        s.fail_streak = 3;
+        let before = (s.offline, s.fail_streak, s.screen_locked);
+        let _ = is_screen_locked(&s);
+        assert_eq!(
+            (s.offline, s.fail_streak, s.screen_locked),
+            before,
+            "is_screen_locked must be a pure read",
+        );
+    }
+
+    #[test]
+    fn short_circuit_interval_equals_refresh_seconds_times_1000() {
+        let mut cfg = Config::default();
+        cfg.refresh_seconds = 120;
+        assert_eq!(short_circuit_interval(&cfg), 120_000);
+    }
+
+    #[test]
+    fn short_circuit_interval_scales_with_refresh_seconds() {
+        // Regression guard: if the gate ever switches to
+        // `compute_next_interval` (which clamps to
+        // `refresh_min_seconds` and applies backoff), a 30-second
+        // refresh_seconds would no longer yield a 30-second gate
+        // interval. Pinned so the divergence between "gate cadence"
+        // and "fetch cadence" stays explicit.
+        for secs in [1u64, 15, 30, 60, 120, 600, 3600] {
+            let cfg = Config {
+                refresh_seconds: secs,
+                refresh_min_seconds: 15,
+                refresh_max_backoff_seconds: 600,
+                ..Config::default()
+            };
+            assert_eq!(
+                short_circuit_interval(&cfg),
+                secs * 1000,
+                "short_circuit_interval must equal refresh_seconds * 1000 (secs={secs})",
+            );
+        }
+    }
+
+    #[test]
+    fn short_circuit_interval_does_not_apply_backoff() {
+        // Even with `refresh_min_seconds = 999` (which would force a
+        // 999-second minimum on backoff logic), the gate must
+        // return the raw `refresh_seconds * 1000`. This pins the
+        // divergence between gate cadence (raw) and fetch cadence
+        // (backoff-aware).
+        let cfg = Config {
+            refresh_seconds: 30,
+            refresh_min_seconds: 999,
+            refresh_max_backoff_seconds: 600,
+            ..Config::default()
+        };
+        assert_eq!(
+            short_circuit_interval(&cfg),
+            30_000,
+            "short_circuit_interval must ignore refresh_min_seconds (no backoff clamping)"
+        );
+    }
+
+    #[test]
+    fn clear_force_refresh_state_zeros_fail_streak() {
+        // Pre-seed a non-zero fail_streak — what we'd see after two
+        // failed fetches. The helper must clear it so the next fetch
+        // starts from zero (skip backoff), matching the gjs
+        // `refresh(true)` semantics.
+        let mut s = AppState::default();
+        s.fail_streak = 5;
+        clear_force_refresh_state(&mut s);
+        assert_eq!(s.fail_streak, 0, "must clear fail_streak");
+    }
+
+    #[test]
+    fn clear_force_refresh_state_clears_offline() {
+        // The whole point of the offline-override in this commit:
+        // a cached "we're offline" opinion must NOT prevent a
+        // force-refresh (user clicked Refresh, NM reconnected, screen
+        // unlocked) from making a fetch attempt. Pre-seed offline=true
+        // and confirm the helper flips it.
+        let mut s = AppState::default();
+        s.offline = true;
+        clear_force_refresh_state(&mut s);
+        assert!(!s.offline, "must clear offline (the override is the whole point)");
+    }
+
+    #[test]
+    fn clear_force_refresh_state_does_not_touch_screen_locked() {
+        // CRITICAL invariant. If `force_refresh_now` cleared
+        // `screen_locked`, it would race the screenlock watcher's
+        // own transitions (ScreenLock(true) → ScreenLock(false) →
+        // ForceRefresh arriving in mpsc order, but the watcher might
+        // be about to send another ScreenLock(true)). The lock flag
+        // is owned by the `screenlock` module's event stream, full
+        // stop. Pre-seed screen_locked = true (the locked state)
+        // and confirm the helper does NOT clear it. If the screen
+        // is locked, `do_refresh`'s own screen-lock gate handles
+        // the short-circuit — no need to second-guess the flag here.
+        let mut s = AppState::default();
+        s.screen_locked = true;
+        clear_force_refresh_state(&mut s);
+        assert!(
+            s.screen_locked,
+            "clear_force_refresh_state must NOT clear screen_locked — the screenlock watcher owns that flag"
+        );
+    }
+
+    #[test]
+    fn clear_force_refresh_state_does_not_touch_screen_locked_when_unlocked() {
+        // Mirror of the above, but for the default case. If the
+        // helper accidentally did `screen_locked = !screen_locked`,
+        // the default would flip to true and break graceful
+        // degradation (see `app_state_default_has_screen_locked_false`).
+        let mut s = AppState::default();
+        let before = s.screen_locked;
+        clear_force_refresh_state(&mut s);
+        assert_eq!(s.screen_locked, before);
+    }
+
+    #[test]
+    fn clear_force_refresh_state_is_idempotent() {
+        // Calling the helper twice in a row must leave state in the
+        // same end-state as one call. Guards against a regression
+        // that adds an unconditional mutation on the second call.
+        let mut s = AppState {
+            offline: true,
+            fail_streak: 7,
+            ..AppState::default()
+        };
+        clear_force_refresh_state(&mut s);
+        let snapshot = (
+            s.offline,
+            s.fail_streak,
+            s.screen_locked,
+            s.last_good_at,
+            s.polls_since_pricing_refresh,
+        );
+        clear_force_refresh_state(&mut s);
+        assert_eq!(
+            (
+                s.offline,
+                s.fail_streak,
+                s.screen_locked,
+                s.last_good_at,
+                s.polls_since_pricing_refresh,
+            ),
+            snapshot,
+            "clear_force_refresh_state must be idempotent"
+        );
+    }
+
+    #[test]
+    fn clear_force_refresh_state_clears_both_fields_atomically() {
+        // Regression guard: the original inline body was TWO lines
+        // (`s.fail_streak = 0; s.offline = false;`). The helper must
+        // still clear BOTH. A regression that drops one of the two
+        // lines would change behavior: clearing only `fail_streak`
+        // means the offline gate still short-circuits the fetch and
+        // the user clicks Refresh and nothing happens. Clearing
+        // only `offline` means a backoff build-up overrides the
+        // user's "no really, go now" intent.
+        let mut s = AppState {
+            offline: true,
+            fail_streak: 4,
+            ..AppState::default()
+        };
+        clear_force_refresh_state(&mut s);
+        assert_eq!(s.fail_streak, 0, "must zero fail_streak");
+        assert!(!s.offline, "must clear offline");
     }
 }

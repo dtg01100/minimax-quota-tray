@@ -42,6 +42,7 @@ mod portal_openuri;
 mod pricing;
 mod provider;
 mod scheduler;
+mod screenlock;
 mod sni;
 mod util;
 
@@ -109,6 +110,13 @@ struct AppState {
     http_client: Option<fetch::HttpClient>,
     /// Connectivity state — false = offline, skip polling.
     offline: bool,
+    /// Screen-lock state — true = screen is locked, skip polling.
+    /// Nobody is looking at the tray icon while the screen is locked,
+    /// so we pause the cadence entirely. The screenlock watcher
+    /// updates this and emits a ForceRefresh on unlock (see
+    /// `crate::screenlock`). The default is `false` (unlocked) so
+    /// headless / no-screenlock-daemon environments behave normally.
+    screen_locked: bool,
 
     /// Cached per-model price table (see `pricing.rs`). Populated
     /// at startup when `Config::pricing_endpoint` is `Some`;
@@ -282,6 +290,11 @@ async fn run() -> Result<()> {
     network::spawn_watcher(net_tx)
         .await
         .context("start network monitor")?;
+    // Channel for screen-lock events (ScreenLock, ForceRefresh on unlock).
+    let (lock_tx, lock_rx) = mpsc::channel::<screenlock::LockEvent>(8);
+    screenlock::spawn_watcher(lock_tx)
+        .await
+        .context("start screen-lock monitor")?;
     // Shutdown signal — orchestrator's Quit branch sends, main()
     // selects on this alongside SIGINT/SIGTERM so a menu-driven
     // quit cleanly tears down (the orchestrator task ends, then
@@ -296,6 +309,7 @@ async fn run() -> Result<()> {
         cmd_rx,
         net_rx,
         shutdown_tx,
+        lock_rx,
     ));
 
     // Wait for SIGINT/SIGTERM or a menu Quit.
@@ -308,14 +322,16 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Master orchestrator. Owns three input streams:
+/// Master orchestrator. Owns four input streams:
 ///
 ///   1. Refresh cadence (sleeps N ms, then do_refresh)
 ///   2. Menu commands (Refresh, OpenDashboard, SetApiKey, Quit)
 ///   3. Network events (Connectivity(bool), ForceRefresh)
+///   4. Screen-lock events (ScreenLock(bool), ForceRefresh on unlock)
 ///
-/// All three feed into the same refresh task. Menu Refresh and Net
-/// ForceRefresh collapse to the same operation (immediate refresh).
+/// All four feed into the same refresh task. Menu Refresh, Net
+/// ForceRefresh, and LockEvent::ForceRefresh collapse to the same
+/// operation (immediate refresh).
 async fn orchestrator(
     cfg: Arc<Config>,
     state: Arc<Mutex<AppState>>,
@@ -323,6 +339,7 @@ async fn orchestrator(
     cmd_rx: Arc<Mutex<mpsc::Receiver<MenuCommand>>>,
     mut net_rx: mpsc::Receiver<NetEvent>,
     shutdown_tx: mpsc::Sender<()>,
+    mut lock_rx: mpsc::Receiver<screenlock::LockEvent>,
 ) {
     // Loop state: `last_refresh_at` is when the previous fetch
     // finished (None before the first one); `next_interval_ms` is
@@ -370,11 +387,13 @@ async fn orchestrator(
                         // Single-flight invariant: while a fetch is in
                         // flight, additional Refresh commands queue in the
                         // mpsc channel and fire after it completes.
-                        {
-                            let mut s = state.lock().await;
-                            s.fail_streak = 0;
-                        }
-                        let returned_ms = do_refresh(&cfg, &state, &tray).await;
+                        //
+                        // The offline-override lives inside
+                        // `force_refresh_now` — a user click is a stronger
+                        // signal than the cached NetworkManager state. If
+                        // the network really is down the fetch itself
+                        // will fail and the normal error path takes over.
+                        let returned_ms = force_refresh_now(&cfg, &state, &tray).await;
                         last_refresh_at = Some(now_ms());
                         next_interval_ms = compute_next_interval(
                             returned_ms, cfg.refresh_max_backoff_seconds);
@@ -434,11 +453,38 @@ async fn orchestrator(
                         }
                     }
                     Some(NetEvent::ForceRefresh) => {
-                        {
-                            let mut s = state.lock().await;
-                            s.fail_streak = 0;
-                        }
-                        let returned_ms = do_refresh(&cfg, &state, &tray).await;
+                        // External trigger (reconnect, future wake-from-sleep,
+                        // unlock-after-lock, etc.) — the offline-override
+                        // semantics live inside `force_refresh_now`; a real
+                        // network outage will fail through the normal
+                        // error path.
+                        let returned_ms = force_refresh_now(&cfg, &state, &tray).await;
+                        last_refresh_at = Some(now_ms());
+                        next_interval_ms = compute_next_interval(
+                            returned_ms, cfg.refresh_max_backoff_seconds);
+                    }
+                    None => {}
+                }
+            }
+            // Screen-lock events.
+            evt = lock_rx.recv() => {
+                match evt {
+                    Some(screenlock::LockEvent::ScreenLock(locked)) => {
+                        let mut s = state.lock().await;
+                        s.screen_locked = locked;
+                        // Note: do NOT touch offline here. The screen-lock
+                        // signal is orthogonal to NM connectivity; an
+                        // offline-locked machine should still render the
+                        // offline icon on unlock.
+                    }
+                    Some(screenlock::LockEvent::ForceRefresh) => {
+                        // Unlock happened. Treat exactly like the
+                        // NetEvent::ForceRefresh arm — force_refresh_now
+                        // handles the offline/fail_streak clear and the
+                        // fetch. The do_refresh gate will see
+                        // screen_locked=false (set above by the preceding
+                        // ScreenLock event) and proceed.
+                        let returned_ms = force_refresh_now(&cfg, &state, &tray).await;
                         last_refresh_at = Some(now_ms());
                         next_interval_ms = compute_next_interval(
                             returned_ms, cfg.refresh_max_backoff_seconds);
@@ -448,6 +494,28 @@ async fn orchestrator(
             }
         }
     }
+}
+
+/// Force a refresh now. Shared by every "force" trigger — menu
+/// Refresh, NetEvent::ForceRefresh (NM reconnect, etc.), and
+/// LockEvent::ForceRefresh (screen unlock). Clears `fail_streak` and
+/// `offline` (the trigger is a stronger signal than cached state),
+/// runs `do_refresh`, and returns the new interval so the caller can
+/// re-arm its cadence. The single-flight invariant lives in the
+/// mpsc channel — concurrent force-refreshes queue and fire one at a
+/// time.
+async fn force_refresh_now(
+    cfg: &Config,
+    state: &Arc<Mutex<AppState>>,
+    tray: &Arc<Tray>,
+) -> u64 {
+    {
+        let mut s = state.lock().await;
+        s.fail_streak = 0;
+        s.offline = false;
+    }
+    let returned_ms = do_refresh(cfg, state, tray).await;
+    returned_ms
 }
 
 /// One refresh cycle: fetch → record samples → compute burn → render.
@@ -460,6 +528,20 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
         if s.offline {
             drop(s);
             render_out_of_menu(tray, cfg, true).await;
+            return cfg.refresh_seconds * 1000;
+        }
+    }
+
+    // Check screen-lock state. While the screen is locked there is
+    // nobody to read the tray icon, so we skip the fetch and let the
+    // next cadence tick (or the unlock event) drive the next attempt.
+    // Returning the normal interval keeps the schedule aligned with
+    // what we *would* have polled, so unlock-time ForceRefresh is the
+    // only behavior change.
+    {
+        let s = state.lock().await;
+        if s.screen_locked {
+            drop(s);
             return cfg.refresh_seconds * 1000;
         }
     }

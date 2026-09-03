@@ -234,24 +234,43 @@ async fn run() -> Result<()> {
     let initial_price_table = match cfg.pricing_endpoint.as_deref() {
         Some(url) => {
             log::info!("fetching pricing endpoint: {url}");
-            match tokio::task::spawn_blocking({
-                let client = http_client.clone();
-                let url = url.to_string();
-                move || pricing::fetch_pricing_blocking(&client, &url)
-            })
+            // Same budget as the periodic pricing refresh in
+            // `do_refresh` — see the comment there. Without a
+            // ceiling, a hung endpoint at boot delays `Tray::new`
+            // + the keyring probe + the first SNI signal emission
+            // indefinitely. The startup pricing fetch blocks
+            // the daemon from becoming interactive, so a 10s
+            // ceiling here protects the panel slot from going
+            // blank on the very first launch.
+            const PRICING_FETCH_BUDGET: Duration = Duration::from_secs(10);
+            match tokio::time::timeout(
+                PRICING_FETCH_BUDGET,
+                tokio::task::spawn_blocking({
+                    let client = http_client.clone();
+                    let url = url.to_string();
+                    move || pricing::fetch_pricing_blocking(&client, &url)
+                }),
+            )
             .await
             {
-                Ok(Ok(table)) => {
+                Ok(Ok(Ok(table))) => {
                     log::info!("loaded {} model prices", table.len());
                     Some(table)
                 }
-                Ok(Err(e)) => {
+                Ok(Ok(Err(e))) => {
                     log::warn!("pricing fetch failed: {e:#} -- continuing without cost fragments");
                     None
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     log::warn!(
                         "pricing fetch task panicked: {e} -- continuing without cost fragments"
+                    );
+                    None
+                }
+                Err(_elapsed) => {
+                    log::warn!(
+                        "pricing fetch timed out after {PRICING_FETCH_BUDGET:?}; \
+                         continuing without cost fragments"
                     );
                     None
                 }
@@ -660,69 +679,112 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("fetch task panicked: {e}")));
 
-    let mut s = state.lock().await;
+    // The success path does bookkeeping in two short critical
+    // sections (state lock held only across in-memory work) and
+    // drops the lock before any network I/O so the orchestrator's
+    // `select!` arms (menu commands, network events) never block
+    // on a hung pricing endpoint. The HTTP client + URL are cloned
+    // out under the lock, then we re-acquire briefly to commit
+    // `price_table` once the spawn_blocking future resolves.
     match result {
         Ok(windows) if !windows.is_empty() => {
-            // Primary window = windows[0] (drives the chip). The
-            // PlanShape declares the ordering, so the provider picks
-            // what "primary" means by listing it first (typically the
-            // rolling short-interval window, the one most likely to
-            // need urgent attention).
+            // Snapshot the in-memory state we need *before* we
+            // commit anything, so the lock-held region stays
+            // minimal. `primary` (windows[0]) drives the chip; the
+            // prev/new rank pair drives notification dedup.
             let primary = windows[0].clone();
-            let prev_rank = s
-                .last_good
-                .as_ref()
-                .and_then(|w| w.first())
-                .map(|w| BucketRank::from_remaining(w.remaining_pct))
-                .unwrap_or(BucketRank::NoData);
+            let prev_rank = {
+                let s = state.lock().await;
+                s.last_good
+                    .as_ref()
+                    .and_then(|w| w.first())
+                    .map(|w| BucketRank::from_remaining(w.remaining_pct))
+                    .unwrap_or(BucketRank::NoData)
+            };
             let new_rank = BucketRank::from_remaining(primary.remaining_pct);
 
-            s.fail_streak = 0;
-            s.last_good = Some(windows.clone());
-            s.last_good_at = now_ms();
-
-            // Periodic pricing refresh: gated on
-            // `cfg.pricing_refresh_polls`. `None` ⇒ fetch only once
-            // at startup (the table is already populated then).
-            // Failures keep the previous table — best-effort, no
-            // backoff or alerting. Cheap because the endpoint is
-            // usually unauthenticated (OpenRouter's /api/v1/models
-            // returns the full table on every call).
-            if let (Some(url), Some(interval)) =
-                (cfg.pricing_endpoint.as_deref(), cfg.pricing_refresh_polls)
-            {
-                s.polls_since_pricing_refresh += 1;
-                if s.polls_since_pricing_refresh >= interval.max(1) {
-                    s.polls_since_pricing_refresh = 0;
-                    if let Some(client) = s.http_client.clone() {
-                        let url = url.to_string();
-                        let new_table = tokio::task::spawn_blocking(move || {
-                            pricing::fetch_pricing_blocking(&client, &url)
-                        })
-                        .await;
-                        match new_table {
-                            Ok(Ok(table)) => {
-                                log::debug!("pricing refresh: {} models", table.len());
-                                s.price_table = Some(table);
-                            }
-                            Ok(Err(e)) => {
-                                log::warn!(
-                                    "pricing refresh failed: {e:#} -- keeping previous table"
-                                );
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "pricing refresh task panicked: {e} -- keeping previous table"
-                                );
-                            }
+            // Determine whether this tick triggers a pricing refresh
+            // and grab the artifacts needed for it. If so, do the
+            // network call WITHOUT the state lock; commit the new
+            // table back via a second short critical section.
+            let pricing_refresh = {
+                let mut s = state.lock().await;
+                s.fail_streak = 0;
+                s.last_good = Some(windows.clone());
+                s.last_good_at = now_ms();
+                pricing_refresh_artifact(cfg, &mut s)
+            };
+            // Pricing refresh outcome — `Some(table)` means "new table to
+            // commit"; `None` means "keep the previous table" (either
+            // the cadence wasn't due yet, the fetch failed, the join
+            // panicked, or the budget expired). The handler in this
+            // block always commits successfully or skips the commit
+            // step; never returns an Err to the caller.
+            let new_price_table: Option<pricing::PriceTable> = match pricing_refresh {
+                None => None,
+                Some(client_url) => {
+                    // Bound the pricing refresh too — the endpoint
+                    // is unauthenticated but a hung DNS / TCP
+                    // handshake shouldn't block the rest of the
+                    // orchestrator forever. We use a 10s budget:
+                    // short enough that a pathological endpoint can't
+                    // stall the menu render for more than one refresh
+                    // cycle's worth of user-visible delay, long enough
+                    // that a slow but working endpoint (OpenRouter
+                    // averages ~150ms; some rate-limited paths can
+                    // spike to multi-second) still completes. On
+                    // timeout the previous table stays in place —
+                    // best-effort, no alerting.
+                    const PRICING_REFRESH_BUDGET: Duration = Duration::from_secs(10);
+                    let timed = tokio::time::timeout(
+                        PRICING_REFRESH_BUDGET,
+                        tokio::task::spawn_blocking(move || {
+                            pricing::fetch_pricing_blocking(
+                                &client_url.client,
+                                &client_url.url,
+                            )
+                        }),
+                    )
+                    .await;
+                    let joined: Option<
+                        pricing::PriceTable,
+                    > = match timed {
+                        Ok(Ok(Ok(table))) => {
+                            log::debug!("pricing refresh: {} models", table.len());
+                            Some(table)
                         }
-                    }
+                        Ok(Ok(Err(e))) => {
+                            log::warn!(
+                                "pricing refresh failed: {e:#} -- keeping previous table"
+                            );
+                            None
+                        }
+                        Ok(Err(join_err)) => {
+                            log::warn!(
+                                "pricing refresh task panicked: {join_err} -- keeping previous table"
+                            );
+                            None
+                        }
+                        Err(_elapsed) => {
+                            log::warn!(
+                                "pricing refresh timed out after {PRICING_REFRESH_BUDGET:?}; \
+                                 keeping previous table"
+                            );
+                            None
+                        }
+                    };
+                    joined
                 }
+            };
+            if let Some(table) = new_price_table {
+                let mut s = state.lock().await;
+                s.price_table = Some(table);
             }
 
-            // Record a sample for each window, keyed by window.id so
-            // the burn-rate projection looks up the right slice.
+            // Record samples + compute burn rows. Each takes the
+            // lock just long enough to read/write its own slot.
             for w in &windows {
+                let mut s = state.lock().await;
                 let hist = s.histories.entry(w.id.clone()).or_insert_with(Vec::new);
                 record_sample(hist, w);
             }
@@ -734,8 +796,17 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
             let mut burn_results: Vec<Option<burn::BurnResult>> =
                 Vec::with_capacity(windows.len());
             for w in &windows {
-                let history = s.histories.get(&w.id).map(Vec::as_slice).unwrap_or(&[]);
-                burn_results.push(burn::decide_burn_row(Some(w), history, now_ms(), &cfg.burn_warning));
+                // Borrow the history slice just long enough to call
+                // `decide_burn_row`. The lock is dropped before we
+                // await anything that could yield — this is a short
+                // map lookup, not a long-held critical section.
+                let history_owned: Vec<Sample>;
+                let history_slice: &[Sample] = {
+                    let s = state.lock().await;
+                    history_owned = s.histories.get(&w.id).cloned().unwrap_or_default();
+                    &history_owned
+                };
+                burn_results.push(burn::decide_burn_row(Some(w), history_slice, now_ms(), &cfg.burn_warning));
             }
             let pair_refs: Vec<(&Window, Option<&burn::BurnResult>)> = windows
                 .iter()
@@ -746,14 +817,25 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
             let primary_burn = pair_refs.first().and_then(|(_, b)| *b);
             let pct = windows[0].remaining_pct;
 
+            // Snapshot the menu-shape inputs (last_good_at + price_table)
+            // under one short critical section, then drop the lock
+            // before the IPC calls — the chip/menu render takes no
+            // locks of its own but can take a few hundred ms and we
+            // don't want to starve the orchestrator's other arms.
+            let (last_good_age_ms, price_table_ref) = {
+                let s = state.lock().await;
+                let age = now_ms() - s.last_good_at;
+                (age, s.price_table.clone())
+            };
+
             let menu_state = build_menu_state(
                 &cfg.label,
                 &pair_refs,
                 None,
                 false,
-                now_ms() - s.last_good_at,
+                last_good_age_ms,
                 pct <= 0,
-                s.price_table.as_ref(),
+                price_table_ref.as_ref(),
             );
 
             let bucket = icon::bucket_for(
@@ -792,9 +874,10 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
                 0,
             );
 
-            // Drop the state lock before the IPC calls so the menu
-            // commands can proceed without deadlock.
-            drop(s);
+            // The state lock is already dropped — the chip/menu
+            // render takes no AppState locks, and the orchestrator's
+            // other `select!` arms can now make progress against
+            // this same AppState.
 
             // Apply chip + menu. Title is empty (gjs parity). The
             // tool_tip_desc carries the same string gjs passes as the
@@ -840,15 +923,20 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
             // chip but also don't render stale data.
             let err_str = "API returned no quota windows".to_string();
             log::warn!("{err_str}");
-            s.fail_streak = s.fail_streak.saturating_add(1);
-            let fail_streak = s.fail_streak;
-            let last_good = s.last_good.take();
-            let age_ms = if s.last_good_at > 0 {
-                now_ms() - s.last_good_at
-            } else {
-                0
+            // Snapshot fail_streak + stale-fallback data under a
+            // short critical section, then drop the lock before the
+            // IPC render — same pattern as the success path.
+            let (fail_streak, last_good, age_ms) = {
+                let mut s = state.lock().await;
+                s.fail_streak = s.fail_streak.saturating_add(1);
+                let last_good = s.last_good.take();
+                let age_ms = if s.last_good_at > 0 {
+                    now_ms() - s.last_good_at
+                } else {
+                    0
+                };
+                (s.fail_streak, last_good, age_ms)
             };
-            drop(s);
 
             render_error_with_stale(
                 tray,
@@ -871,21 +959,24 @@ async fn do_refresh(cfg: &Config, state: &Arc<Mutex<AppState>>, tray: &Arc<Tray>
             ) * 1000
         }
         Err(e) => {
-            s.fail_streak = s.fail_streak.saturating_add(1);
-            let fail_streak = s.fail_streak;
-            // The error-path interval calculation passes `100` to the
-            // scheduler (gjs parity — see the comment near the call
-            // site), so we don't need last_good's pct here. We only
-            // need the windows themselves for stale-menu display.
-            let last_good = s.last_good.clone().unwrap_or_default();
-            let age_ms = if s.last_good_at > 0 {
-                now_ms() - s.last_good_at
-            } else {
-                0
-            };
             let err_str = e.to_string();
             log::debug!("fetch failed: {e:#}");
-            drop(s);
+            // Same short-critical-section pattern as the other
+            // branches — read what we need under the lock, then drop
+            // it so the orchestrator's other `select!` arms can make
+            // progress against the same AppState while the error
+            // chip/menu render runs.
+            let (fail_streak, last_good, age_ms) = {
+                let mut s = state.lock().await;
+                s.fail_streak = s.fail_streak.saturating_add(1);
+                let last_good = s.last_good.clone().unwrap_or_default();
+                let age_ms = if s.last_good_at > 0 {
+                    now_ms() - s.last_good_at
+                } else {
+                    0
+                };
+                (s.fail_streak, last_good, age_ms)
+            };
 
             // Render the error chip + menu (stale fallback if we
             // have prior good data).
@@ -1179,6 +1270,36 @@ fn build_menu_state(
 /// Install a MenuInner's state into the live tray's menu.
 fn install_menu_into(target: &mut MenuInner, source: MenuInner) {
     *target = source;
+}
+
+/// Inputs needed to perform a periodic pricing refresh on a worker
+/// thread. Returned by `pricing_refresh_artifact` under the AppState
+/// lock; the caller then drops the lock and runs the HTTP fetch.
+struct PricingRefresh {
+    client: fetch::HttpClient,
+    url: String,
+}
+
+/// Decide whether this poll should trigger a pricing refresh, bump
+/// `polls_since_pricing_refresh`, and return the artifacts needed to
+/// perform the fetch. Called under the AppState lock — returns
+/// `None` when the refresh cadence isn't due yet, when no pricing
+/// endpoint is configured, or when `pricing_refresh_polls` is unset
+/// (meaning "fetch only at startup", and that already happened in
+/// `run()`).
+fn pricing_refresh_artifact(cfg: &Config, s: &mut AppState) -> Option<PricingRefresh> {
+    let url = cfg.pricing_endpoint.as_deref()?;
+    let interval = cfg.pricing_refresh_polls?;
+    s.polls_since_pricing_refresh += 1;
+    if s.polls_since_pricing_refresh < interval.max(1) {
+        return None;
+    }
+    s.polls_since_pricing_refresh = 0;
+    let client = s.http_client.clone()?;
+    Some(PricingRefresh {
+        client,
+        url: url.to_string(),
+    })
 }
 
 /// Append one sample to the history. Detect epoch rollover.
